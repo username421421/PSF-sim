@@ -1,0 +1,695 @@
+Electromagnetic diffraction
+of light focused through a stratified medium
+
+P. Török and P. Varga
+
+
+
+                                We consider the focusing of light by a high-aperture lens into a stratified medium. The solution is based
+                                on our previously obtained results @J. Opt. Soc. Am. A 12, 325 ~1995!#, where we represented the
+                                illumination incident upon a plane interface between media with mismatched refractive indices as a sum
+                                of plane waves. The present solution is obtained in terms of plane waves, and it satisfies Maxwell’s
+                                equations. The diffraction integrals are obtained in a form that is readily computable. We present
+                                numerical examples for some practical cases. © 1997 Optical Society of America
+
+
+
+
+1. Introduction                                                       rived just after the interface is used as the boundary
+Light propagation through stratified media is of par-                 condition for a second set of integral formulas corre-
+ticular interest mainly because of holography inves-                  sponding to a superposition of plane waves, which
+tigations1 and light-microscopy applications,2 the                    represent the field inside the Nth medium. In this
+former being less relevant to our present problem.                    way the diffraction problem is solved in a rigorous
+In light and especially in confocal microscopy, strat-                mathematical manner, and the solution satisfies
+ified media are frequently used as specimens, e.g.,                   Maxwell’s equations.
+integrated circuits, thin films, optoelectronic devices,                The construction of the paper is as follows. First
+etc. In this paper the primary objective is to deter-                 we derive the diffraction integrals in the Nth me-
+mine the electromagnetic field inside a stratified                    dium. We give a physical interpretation to our in-
+structure and to examine how spherical aberration,                    tegrals, after which numerical results are presented
+introduced by variations along the optical axis in the                on the distribution of the electric-energy density.
+refractive index, affects the localization of the probe.              These numerical results correspond to the case when
+   The purpose of this paper is to extend our previous                the point of observation is at a certain depth below
+treatment of the diffraction problem3 for the case                    the last interface and the specimen is axially scanned
+when an electromagnetic wave is focused through an                    with respect to the lens. We note that our procedure
+interface between media of mismatched refractive in-                  can directly be applied to the magnetic vector field,
+dices4 to the case when light is focused by a high-                   whose presentation is omitted for brevity.
+aperture system into a stratified medium. The
+starting point of our treatment is Wolf ’s integral for-              2. Integral Representation
+mulas,5,6 with which we derive the electromagnetic
+field just before the interface between the first two                 Consider an optical system of revolution with an op-
+media. The field is then traversed across the strat-                  tical axis z, as shown in Fig. 1. This system images
+ified medium by application of the Fresnel refraction                 a point source, which is situated in the object space at
+law to the individual plane waves. The field so de-                   z 5 2` and radiates a linearly polarized monochro-
+                                                                      matic and coherent electromagnetic wave. This
+                                                                      wave is incident on a lens of aperture S, which pro-
+  When this research was performed, P. Török was with the Multi-    duces an aberration-free convergent spherical wave
+Imaging Center, University of Cambridge, Downing Street, Cam-         in the image space. The origin O of the ~x, y, z!
+bridge CB2 3DY, UK; he is now with the Department of                  coordinate system is positioned at the Gaussian fo-
+Engineering Science, University of Oxford, Parks Road, Oxford         cus. The electric field is determined at the arbitrary
+OX1 3PJ, UK. P. Varga is with the Research Institute for Mate-
+                                                                      point P in the focal region. The aperture size and
+rials Science, P.O. Box 49, Budapest H-1525, Hungary.
+  Received 27 September 1996; revised manuscript received 2 De-
+                                                                      the distance of P from the aperture are taken to be
+cember 1996.                                                          large compared with the wavelength. In Fig. 1 and
+  0003-6935y97y112305-08$10.00y0                                      the following, ŝN 5 ~sNx, sNy, sNz! is the unit vector
+  © 1997 Optical Society of America                                   along a typical ray in the Nth medium and rp 5 ~x, y,
+
+                                                                           10 April 1997 y Vol. 36, No. 11 y APPLIED OPTICS         2305
+                                                                 electric field is given by
+
+
+                                                                 E~1!
+                                                                  1 ~x, y, 2h1! 5 2
+                                                                                      ik1
+                                                                                      2p    **   V1
+                                                                                                   a~s1x, s1y!
+                                                                                                      s1z
+
+                                                                                    3 exp@ik1~s1x x 1 s1yy 2 s1zh1!#ds1xds1y.
+
+                                                                                                                          (2)
+
+                                                                 To describe the field in the Nth medium we assume
+                                                                 that each plane-wave component refracting at the
+                                                                 interfaces obeys the Fresnel refraction law and the
+                                                                 resulting field in the Nth medium is constructed as a
+                                                                 superposition of refracted plane waves. If the am-
+                                                                 plitude of the plane waves incident on the interface is
+                                                                 described by W~ŝ1! 5 ays1z, then the amplitude of the
+                                                                 transmitted plane waves in the Nth medium is a
+Fig. 1. Diagram showing light focused by a lens into a single
+                                                                 linear function of W~ŝ1!, i.e., LW, where the tensor
+medium.
+                                                                 operator L is a function of the angle of incidence, the
+                                                                 thickness of the individual layers, and k1, k2, . . . , kN.
+z! is the position vector pointing from O to P. In the           The transmitted field in the Nth medium, at the close
+following we shall assume the usual time dependence              vicinity of the last interface, is given by
+of the electric field.
+
+                                                                                                **
+   In a homogeneous image space, the time-                                                ik1
+independent electric field can be represented as a               EN~x, y, 2hN21! 5 2                   LW~ŝ1!
+                                                                                          2p
+superposition of plane waves,7 and we use the form                                                V1
+developed by Wolf 5:
+                                                                                     3 exp@ik1~s1x x 1 s1yy 2 s1zhN21!#
+
+ E~P! 5 2
+             ik1
+             2p    **
+                    V
+                      a~s1x, s1y!
+                         s1z
+                                  exp@ik1ŝ1 z rp#ds1xds1y,
+                                                                                     3 ds1xds1y.
+
+                                                                 We represent the field inside the Nth medium again
+                                                                                                                          (3)
+
+                                                         (1)
+                                                                 as a superposition of plane waves. This representa-
+where a is the electric strength vector of the unper-            tion is a solution of the time-independent wave equa-
+turbed electric field in the exit aperture S, k1 is the          tion and can be written as
+wave number, and V is the solid angle formed by all
+
+                                                                                          **
+the geometrical optics rays.                                                        ikN
+   The case corresponding to Fig. 1, but for an image             EN~x, y, z! 5 2                F
+                                                                                    2p
+space consisting of the stratified medium with wave                                         VN
+numbers k1, k2, . . . , kN is shown in Fig. 2. The or-                          3 exp@ikN~sNx x 1 sNyy 2 sNz z!#dsNxdsNy.
+igin O is again positioned at the Gaussian focus. We
+reformulate Eq. ~1! as follows. In the first medium                                                                       (4)
+and at the first interface ~z 5 2h1!, the incident
+                                                                 We have to determine the function F, and for this we
+                                                                 shall make use of Eq. ~3!, which represents a bound-
+                                                                 ary condition for Eq. ~4!. First, however, we need to
+                                                                 establish the relation among ŝ1, ŝ2, and, in general,
+                                                                 ŝN.
+                                                                    It is evident from the vectorial law of refraction,
+
+                                                                          k2ŝ2 2 k1ŝ1 5 ~k2 cos u2 2 k1 cos u1!û,      (5)
+
+                                                                 where û represents the normal of the interface, u1 5
+                                                                 ~ŝ1, û!, and u2 5 ~ŝ2, û!, that
+
+                                                                               kNsNx 5 . . . 5 k2 s2x 5 k1s1x,
+
+                                                                               kNsNy 5 . . . 5 k2 s2y 5 k1s1y.            (6)
+Fig. 2. Diagram showing light focused by a lens into two media
+separated by a planar interface.                                 On expanding Eq. ~4! and expressing F, as shown in
+
+2306     APPLIED OPTICS y Vol. 36, No. 11 y 10 April 1997
+Ref. 3, we obtain the electric field in the Nth medium:           the refraction that occurs at the interface, it is con-
+                                                                  venient to decompose the electric vector into s- and
+EN~x, y, z! 5 2
+                  ik1
+                  2p    **
+                         V1
+                              LW~ŝ1!
+                                                                  p-polarized vector components, es and ep, respec-
+                                                                  tively, and to rotate the coordinate system so that the
+                                                                  new coordinate system will contain components in
+              3 exp@ik0~nNhN21sNz 2 n1h1s1z!#                     the ~ p, s, z! system. This coordinate system is de-
+                                                                  fined in such a way that ez 5 0. The electric vector
+              3 exp~ikNsNz z!exp@ik1~s1xx 1 s1y y!#ds1xds1y.      components e~ p,s,z! after the lens are then in the fol-
+                                                                  lowing form:
+                                                            (7)
+From the above it also follows that in Eq. ~7!                                          e~ p,s,z! 5 A~u1!P~1!LRe0,                        (11)
+
+
+                    F
+              slz 5 1 2
+                             k12
+                             kl2             G
+                                 ~s1x2 1 s1y2!
+                                                 1y2
+
+                                                       .    (8)   where A~u1! is an amplitude function ~defined below!,
+                                                                  the matrix R describes the coordinate transformation
+                                                                  for rotation around the z axis:
+For numerical purposes, however, Eq. ~8! cannot be
+
+
+                                                                                            F                                   G
+applied directly. This is because the stratified me-
+dium can contain interfaces at which refraction is not                                  cos f                  sin f          0
+ordinary ~i.e., total reflection or generation of evanes-                           R 5 2sin f                 cos f          0 ,         (12)
+cent waves!. We shall, therefore, use for numerical                                     0                      0              1
+purposes a successive computation, i.e., s1z 3 s2x
+3 . . . sNz. It is important to emphasize that, since             the matrix L describes the changes in the electric
+both the boundary condition represented by Eq. ~3!                field as it traverses the lens:
+and the integral representation Eq. ~4! are exact so-
+
+
+                                                                                            F                                   G
+lutions of Maxwell’s equations, our formulas for the                                  cos u1                   0          sin u1
+electric vector @Eq. ~7!# in the Nth medium also satisfy
+Maxwell’s equations. Therefore, we have success-                                   L5 0                        1          0      ,        (13)
+fully obtained a consistent extension of Wolf ’s solu-                                2sin u1                  0          cos u1
+tion in a stratified medium.
+                                                                  and the matrix P~l ! describes the coordinate-system
+3. Electric Strength Vector                                       rotation that generates es and ep components with ez
+Determination of the electric strength vector for a               5 0 in medium l:
+
+
+
+                                                                                                F                               G
+single and double medium of propagation was de-
+scribed previously by Richards and Wolf 6 and Török                                  cos ul                  0          2sin ul
+et al.3 Now we obtain these vectors for a plane po-                                  ~l !
+                                                                                   P 5 0                       1          0       .       (14)
+larized wave incident on the lens and a stratified
+                                                                                       sin ul                  0          cos ul
+medium. Individual layers of the stratified medium
+are taken to be isotropic and homogeneous and to
+have an optically smooth planar surface that is per-              The electric field in the Nth medium eN is given by
+pendicular to the optical axis. For our decomposi-
+tion, the usual assumptions are made, namely, that                                eN 5 @R#21@P~N!#21I~N21!e~ p,s,z!,                      (15)
+the electric vector maintains its direction with re-
+spect to a meridional plane and the electric vector               where the matrix I describes the effect of the strati-
+remains on the same side of a meridional plane on                 fied medium:
+passing through the system.
+
+
+                                                                                            F                                         G
+   For the optical system under consideration, the an-                                    T ~N21!          0                 0
+gle of incidence at the interface is denoted by u1 and                                      p
+
+the angle in the Nth medium by uN. The unit vector                            I ~N21!
+                                                                                        5 0                T ~N21!
+                                                                                                             s               0       .    (16)
+ŝN and position vector rp ~Fig. 2! are given in spher-                                   0                0                 T ~N21!
+                                                                                                                               p
+
+ical polar coordinates by
+                                                                  where T ~N21!
+                                                                            s,p  is the transmission coefficient of the
+ŝN 5 sin uN cos fı̂ 1 sin uN sin fĵ 1 cos uNk̂,           (9)   stratified medium describing the s- and p-polarized
+                                                                  light traversing N 2 1 media and is given in Appen-
+rp 5 rp~sin up cos fpı̂ 1 sin up sin fp ĵ 1 cos upk̂.     (10)   dix A:
+
+where ı̂, ĵ, and k̂ are the unit base vectors of the ~x, y,                                             N22
+
+z! orthogonal system and the spherical polar coordi-
+nates r, u, and f are defined so that r . 0, 0 # u , p,                            ~N21!
+                                                                                                t~N21!
+                                                                                                 m       ) t exp~ib !
+                                                                                                                   ~ j!
+                                                                                                                   m            j11
+                                                                               T            5            j51
+                                                                                                                                      ,   (17)
+                                                                                                           D~N21!
+                                                                                   m
+and 0 # f , 2p. The coordinate system is chosen so                                                          m
+that the y component of the incident electric vector is
+zero. We set for the incident electric vector e0 in               where bl 5 kl~hl21 2 hl!cos ul, m 5 p, s, D~N21! is
+front of the lens e0 5 ~e0, 0, 0!. For a treatment of             given in Appendix A, and t~lp !, t~ls ! and r~lp !, r~ls ! are the
+
+                                                                       10 April 1997 y Vol. 36, No. 11 y APPLIED OPTICS                   2307
+Fresnel coefficients for transmission and reflection,             the system obeys the sine condition @Eq. ~21!#, setting
+respectively8:                                                    a to be the angular semiaperture of the lens, and
+                                                                  carrying out the integration with respect to f, we
+                                  2nl cos ul                      obtain the following expression for the electric-field
+               t~ls ! 5                             ,
+                          nl cos ul 1 nn11 cos ul11               components:
+
+                                 2nl cos ul                                       ENx 5 2iK~I~N!  ~N!
+                                                                                             0 1 I2 cos 2fp!,
+               t~lp ! 5                             ,      (18)
+                          nl11 cos ul 1 nl cos ul11
+                                                                                  ENy 5 2iKI~N!
+                                                                                            2 sin 2fp,
+
+                          nl cos ul 2 nl11 cos ul11                               ENz 5 22KI~N!
+               r~ls ! 5                             ,                                       1 cos fp,                      (26)
+                          nl cos ul 1 nl11 cos ul11
+                                                                  where
+                   nl11 cos ul 2 nl cos ul11
+                 ~l !
+               r 5
+                 p                           .             (19)
+                   nl11 cos ul 1 nl cos ul11                                                      k1 fl0
+                                                                                             K5          ,
+  From Eqs. ~11!–~13! and ~15! we obtain the compo-                                                 2
+nents of the electric vector in the Nth medium on
+setting e0 5 1:                                                   and the integrals I~N!  ~N!      ~N!
+                                                                                     0 , I1 , and I2   are given by
+
+eN 5 A~u1!
+                                                                          *Î
+        F                                                    G
+                                                                            a
+
+         T   ~N21!
+             p      cos uN cos f 1 T
+                                   2       ~N21!
+                                          sin f
+                                           s
+                                                   2              I ~N!
+                                                                    0 5         cos u 1 sin u1 exp~ik0Ci !
+             ~N21!
+       3 T   p      cos uN sin f cos f 2 T ~N21!
+                                           s     sin f cos f .             0
+
+         2T    ~N21!
+               p      sin uN cos f                                        3 ~T ~N21!
+                                                                               s     1 T ~N21!
+                                                                                         p     cos uN!
+                                                                          3 J0~k1 sin u1rp sin up!exp~ikNrp cos up cos uN!du1,
+                                                           (20)
+
+                                                                          *Î
+                                                                            a
+Function A~u1! can be regarded as an apodization                  I ~N!         cos u 1 sin u1 exp~ik0Ci !T ~N21!
+                                                                    1 5                                     p     sin uN
+function that depends on the lens used in imaging.                         0
+Richards and Wolf 6 showed that, when the system
+obeys the Abbe sine condition, i.e., is aplanatic, then                   3 J1~k1 sin u1rp sin up!exp~ikNrp cos up cos uN!du1,
+
+
+                                                                          *Î
+                                                                            a
+                        A~u1! 5 fl0 cos1y2 u1,             (21)
+                                                                  I ~N!
+                                                                    2 5         cos u 1 sin u1 exp~ik0Ci !
+where f is the focal length of the lens and l0 is an                       0
+amplitude factor. Having derived the electric vector                      3 ~T ~N21! 2 T ~N21! cos uN!
+                                                                               s         p
+eN, we can write the electric strength vector as
+                                                                          3 J2~k1 sin u1rp sin up!exp~ikNrp cos up cos uN!du1,
+                               LW~ŝ1! 5 eN.               (22)
+                                                                                                                           (27)
+4. Electric-Field Vector
+First we formulate the expressions needed to simplify             where Jn is the Bessel function of the first kind, order
+Eq. ~7!. We transform the integral variables ds1x,                n. Equations ~26! and ~27! conclude our solution of
+ds1y to the spherical polar coordinate system and de-             the problem. It should be noted that, for N 5 1, k1
+fine                                                              5 kN 5 1 ~therefore uN 5 u1, hj 5 0, and d 5 0!, Eqs.
+                                                                  ~27! reduce to a set that is identical to the correspond-
+              k 5 k1 sin u1 sin up cos~f 2 fp!,            (23)   ing equations of Richards and Wolf.6 For N 5 2,
+                                                                  Eqs. ~26! and ~27! are simplified and yield the same
+             Ci 5 hN21nNsNz 2 n1h1s1z.                     (24)   result as our previous investigation for a single di-
+Ci shall be referred to in the following as the initial           electric interface.3 Therefore, our formulation of the
+aberration function. So far we have constructed the               vector diffraction theory for stratified media is con-
+quantities required to determine the electric vector.             sistent with previous results.
+With the help of the above results Eq. ~7! can be
+                                                                  5. Physical Interpretation
+rewritten to express the electric vector EN in the Nth
+medium:                                                           It is not difficult to see that, as we showed for the
+                                                                  problem of a single interface,3 Eq. ~7! represents the
+
+                    **
+              ik1                                                 Fourier transform of a function consisting of a defo-
+EN~rp! 5 2                     eN exp~irpk!exp~ik0Ci !            cus term, the electric strength vector, and the aber-
+              2p          V1                                      ration function. This is readily conceivable, as the
+            3 exp~ikNrp cos up cos uN!sin u1du1df.         (25)   present diffraction integral is essentially in the same
+                                                                  form as our previously obtained diffraction integral,3
+On substituting from Eqs. ~22! and ~20! into Eq. ~25!,            with a small difference in the aberration function,
+changing the integration limits and assuming that                 this being more complex for the stratified medium.
+
+2308    APPLIED OPTICS y Vol. 36, No. 11 y 10 April 1997
+It is, therefore, important to investigate the aberra-               ified structure that would cause nonordinary refrac-
+tion function in more detail.                                        tion:
+   It is clear that in Eqs. ~27! the aberration function
+consists of the initial aberration function @Eq. ~24!#                 C 5 2h1n1 Î1 2 r 2 sin2 a
+
+                                                                                  F SD G
+and the additional phase from T ~N21!
+                                    m    . As shown in                                                          2                   1y2
+                                                                                                       n1 2
+Appendix A, T ~N21!
+                 m     possesses a denominator that is                     1 hN21nN 1 2                   r sin2 a
+of rather complex structure. It is, however, possible,                                                 nN
+for certain cases, to consider this denominator as
+unity. For practical cases, primarily in the biologi-
+cal sciences, the specimen is constructed from layers
+                                                                            1
+                                                                                N21
+
+                                                                                (
+                                                                                j52
+                                                                                     F SD
+                                                                                      ~hj21 2 hj !nj 1 2
+                                                                                                                            n1 2
+                                                                                                                            nj
+                                                                                                                                2
+
+                                                                                                                               r sin2 a         G   1y2
+
+                                                                                                                                                          ,   (30)
+
+with close refractive indices. For such layers the                   where we have defined the normalized radial coordi-
+reflection coefficients are much smaller than unity.                 nate r 5 sin u1ysin a. Individual terms in Eq. ~30!
+For example, consider a glass–water interface for a 5                can be expanded to give
+0.9 rad. The reflection coefficients give 0.1 and 0.25
+~for the s and p directions, respectively!, whereas for                                    `
+                                                                                               1
+a water– glass interface these values are 0.05 and
+0.25, respectively. We shall therefore consider in
+                                                                        C 5 2h1n1      ( l! a r sin a
+                                                                                                   l
+                                                                                                       2l            2l
+
+
+
+
+                                                                                                       SD
+                                                                                       l50
+
+the following part of this section the denominator of                                  `                            2l21
+                                                                                     1       n1
+T ~N21!
+  m      as unity.                                                          1 hm      (
+                                                                                     l!
+                                                                                        aln1
+                                                                                             n
+                                                                                                                           r2l sin2l a
+   By recalling Eq. ~17!,
+
+                                                                                                                              SD
+                                                                                 l50          N
+                                                                                N21                         `                         2l21
+                                                                                                   1       n1
+                                    N22
+                                                                            1   (
+                                                                              j52
+                                                                                  ~hj21 2 hj !
+                                                                                               l50 l!
+                                                                                                      aln1  (
+                                                                                                           nj
+                                                                                                                                             r2l sin2l a,
+                           t~N21!
+                            m       ) t exp~ib !
+                                          ~ j!
+                                          m         j11                                                                                                       (31)
+           T ~N21! 5                j51
+                                                          ,
+                                       D~N21!
+             m
+                                        m                            from which it is shown that, as l 3 `, the higher-
+                                                                     order aberration coefficients are independent of the
+                                                                     wave numbers ~refractive indices! of the individual
+we find that, from the term exp~ibj11!, the addi-                    layers in the stratified medium if n1 , nj , j 5 2, 3,
+tional phase factor Ca of the aberration function is                 4, . . . .
+given by
+                                                                     6. Numerical Results
+                                                                     Undoubtedly the most important application of the
+   Ca 5 h1n2 cos u2 1 h2~n3 cos u3 2 n2 cos u2!                      above theory is in the biological sciences. Biological
+        1 . . . 1 hN22~nN21 cos uN21 2 nN22 cos uN22!                specimens are usually formed as two- or three-layer
+                                                                     stacks of different refractive-index media. Typically
+        2 hN21nN21 cos uN21.                                         dry or water- or oil-immersion objective lenses are
+                                                                     used to focus light through the coverglass and to form
+The above equation results, by use of Ci , in the over-              the probe in the usually watery specimen. When
+all aberration function:                                             oil-immersion lenses are used, there are practically
+                                                                     only two media present ~glass and water!, and thus
+                                                                     the previous theory3 and our results9,10 can readily be
+              N21
+                                                                     applied. When, however, water-immersion or dry
+         C5    ( h ~n
+               j51
+                       j     j11    cos uj11 2 nj cos uj !,   (28)   objective lenses are used, the above theory should be
+                                                                     applied to compute the electromagnetic field inside
+                                                                     the embedding medium. For this reason we shall in
+which can also be written as                                         the following confine our exact and general solutions
+                                                                     to the case of a three-layer stratified medium.
+                                                                        For this case, by using Eq. ~17!, we can write:
+          C 5 2h1n1 cos u1 1 hN21nN cos uN
+                                                                                                                s,p s,p
+                   N21                                                                                         t12  t23 exp~ib!
+               1     ( ~h
+                     l52
+                              l21   2 hl!nl cos ul.           (29)              T ~N21!
+                                                                                  s,p   5 ts,p 5
+                                                                                                            1 1 r12 r23 exp~2ib!
+                                                                                                                   s,p s,p       ,                            (32)
+
+                                                                     where b 5 2k2uh1 2 h2ucos u2. The time-averaged
+Equation ~29! means that the aberration function                     electric-energy density we is given from Eqs. ~26! by
+consists of individual terms that are responsible for
+the phase difference during propagation. It is shown                                                                 1
+that the phase of a ray in the jth medium is propor-                              ^we~rp, z, up!& 5                     ~EN z EN*!.                           (33)
+                                                                                                                    16p
+tional to the thickness of the layer and to the longi-
+tudinal projection of the wave vector, as one might                    For the numerical evaluation of Eq. ~33!, C11 pro-
+have anticipated. Expression ~29! can be rewritten                   grams were written and Numerical Recipes11 library
+if we assume that there are no interfaces in the strat-              routines were used. The programs were run on an
+
+                                                                         10 April 1997 y Vol. 36, No. 11 y APPLIED OPTICS                                     2309
+Fig. 3. Time-averaged electric-energy density distributions as         Fig. 4. Time-averaged electric-energy density distributions as
+functions of the scan position for a lens numerical aperture of 0.9    functions of the scan position for a lens numerical aperture of 0.9
+and for focusing from air ~n1 5 1! through a cover glass ~n2 5 1.54!   and for focusing from air ~n1 5 1! through a cover glass ~n2 5 1.54!
+into an aqueous medium ~n3 5 1.33!. The thicknesses of the cover       into an aqueous medium ~n3 5 1.33!. The thicknesses of the cover
+glasses are 120 ~solid curve!, 170 ~dashed curve!, and 220 mm          glasses are 120 ~solid curve!, 170 ~dashed curve!, and 220 mm
+~dashed-dotted curve! and the depth in the aqueous medium is 50        ~dashed-dotted curve! and the depth in the aqueous medium is 50
+mm. The lens is not corrected for the cover-glass thickness.           mm. The lens is corrected for a 170-mm cover glass.
+
+
+
+IBM PC-compatible 90-MHz Pentium computer run-                         interface from the unaberrated Gaussian focus! is
+ning the Linux operating system. Numerical results                     shown in Fig. 3~a! for a lens that is not corrected for
+were plotted by use of the SIGMAPLOT plotting software.                the cover glass. Focusing occurs from air ~n1 5 1!
+No post data processing was performed prior to data                    through the cover glass ~n2 5 1.54! and to the aque-
+visualization. The origin of the coordinate for all                    ous medium ~n3 5 1.33! of the specimen. Individual
+plots presented below was set to coincide with the                     curves correspond to 120- ~solid curve!, 170- ~dashed
+Gaussian focus, and the wavelength used in the com-                    curve!, and 220-mm ~dashed-dotted curve! cover-glass
+putations was 488 nm.                                                  thicknesses and a depth of 50 mm in the aqueous
+  The time-averaged electric-energy density as a                       medium. This figure shows that the spherical aber-
+function of scan position ~i.e., the specimen is scanned               ration associated with an increasing cover-glass
+and the horizontal axis shows the distance of the last                 thickness adversely affects the distributions. With
+
+2310     APPLIED OPTICS y Vol. 36, No. 11 y 10 April 1997
+                                                                        main two peaks are comparable both in peak value
+                                                                        and FWHM. We can thus conclude that imaging
+                                                                        with an exactly corrected lens deep from an aqueous
+                                                                        medium results in a worsened resolution compared
+                                                                        with that obtained when a thinner cover glass is used
+                                                                        in the experiment and the imaging occurs from
+                                                                        greater depths of the aqueous medium. This conclu-
+                                                                        sion has implications for biological microscopy and
+                                                                        more closely for biological confocal microscopy:
+                                                                        When the specimen ~whose refractive index is usually
+                                                                        close to that of water! is thick, the use of a thinner-
+                                                                        than-nominal cover-glass thickness could signifi-
+                                                                        cantly improve the resolution.
+                                                                        7. Conclusions
+                                                                        We have presented a new solution to electromagnetic
+                                                                        diffraction for the problem of light focused into a
+                                                                        stratified medium. We have solved the above dif-
+                                                                        fraction problem for the case of a multiple-planar
+                                                                        interface in a rigorous mathematical manner, and the
+                                                                        solution satisfies Maxwell’s equations and is there-
+Fig. 5. Time-averaged electric-energy density distributions as          fore valid everywhere except in the immediate vicin-
+functions of scan position for a lens numerical aperture of 0.9 and     ity of the aperture. The solution can be regarded as
+for focusing from air ~n1 5 1! through a cover glass ~n2 5 1.54! into   an extension of Wolf ’s integral formulas for focusing
+an aqueous medium ~n3 5 1.33!. The lens is corrected for a              into a single medium and is valid for high-aperture
+170-mm cover glass. The solid curve corresponds to a 0-mm depth         focusing. We have shown that, for our case, the ab-
+and a 170-mm cover-glass thickness, whereas the dashed curve            erration function is in a closed analytical form and
+corresponds to a 50-mm depth and a 120-mm cover-glass thickness.        the aberration introduced by the stratified medium
+                                                                        can be simply derived from aberration caused by in-
+                                                                        dividual layers.
+increasing spherical aberration the main peak energy                       We have also presented numerical examples appli-
+dramatically decreases. As shown in Fig. 3~b!, in                       cable to biological microscopy and shown that, when
+which the same distributions are plotted on a nor-                      imaging occurs from greater depths of an aqueous
+malized scale, the full width at half-maximum                           medium through a coverglass, it is more advanta-
+~FWHM! values of the distributions also increase                        geous to use a thinner-than-nominal coverglass to
+with increasing spherical aberration. There is a                        obtain better resolution.
+well-pronounced positive focus shift present on these                      The main advantages of our method are as follows:
+distributions.                                                          The solution is in a simple form that can be used
+  The time-averaged electric-energy density as a                        directly for numerical computation. The method for
+function of scan position is shown in Figs. 4~a! and                    obtaining the strength vectors is generally applica-
+4~b! for a lens that is corrected for a 170-mm cover-                   ble. Incident electric vectors, with directions other
+glass thickness. Focusing occurs from air ~n1 5 1!                      than perpendicular to the optical axis, can readily be
+through the cover glass ~n2 5 1.54! and to the aque-                    treated. The solution is consistent, and, for the spe-
+ous medium ~n3 5 1.33! of the specimen. Individual                      cial case of a single medium of propagation, it reduces
+curves correspond to 120- ~solid curve!, 170- ~dashed                   to the results published previously. Apart from the
+curve!, and 220-mm ~dashed-dotted curve! cover glass                    initial assumption of Wolf ’s integral formulas, no ap-
+thicknesses and a depth of 50 mm in the aqueous                         proximations are used.
+medium. This figure shows that, since the lens was
+corrected for a 170-mm cover glass, the distributions                   Appendix A
+become distorted for a depth of 50 mm in the aqueous                    Let us denote the amplitude of a plane wave incident
+medium. The least aberration is shown by the curve                      upon the first interface by A~1!. The amplitude of the
+corresponding to the 120-mm cover-glass thickness.                      plane wave refracted by the stratified medium is de-
+This is because the 120-mm cover glass and the ad-                      noted by B~N21!. The transmission coefficient of the
+ditional 50 mm of the aqueous medium cause a spher-                     stratified medium is defined as
+ical aberration slightly less than that which would be
+caused by a 170-mm glass and a 50-mm depth. In-                                                          B~N21!
+                                                                                                          m
+deed, when we compare the distributions correspond-                                          T ~N21! 5          ,              (A1)
+                                                                                                          A~1!
+                                                                                               m
+ing to a 120-mm cover glass and a 50-mm aqueous                                                             m
+medium ~dashed curve! to that of a 170-mm cover
+glass and 0-mm aqueous medium ~solid curve!, as                         where m 5 s, p denotes the TE and TM incident
+shown in Fig. 5, it is clearly seen that, although the                  waves, respectively.
+former exhibits an asymmetrical distribution, the                        The transmission coefficient of a stratified medium
+
+                                                                            10 April 1997 y Vol. 36, No. 11 y APPLIED OPTICS   2311
+is thus given by ~Ref. 8, Section 1.6!                                                    D~3!      ~1! ~2!            ~3!
+                                                                                           m 5 1 1 rm $rm exp~2ib2! 1 rm exp@2i~b2 1 b3!#%
+
+                                            2p~1!
+                                                m                                                1 r~2! ~3!
+                                                                                                    m rm exp~2ib3!,
+T ~N21! 5        ~N21!          ~N21! ~N!                    ~N21! ~N! ,
+                                        p #p~1!    ~N21!
+  m
+            @K           1K                 m 1 @K 21    1 K 22   pm #
+                 11             12    m
+                                                                                          D~4!      ~1! ~2!            ~3!
+                                                                                           m 5 1 1 rm $rm exp~2ib2! 1 rm exp@2i~b2 1 b3!#
+                                                                                   (A2)          1 r~4!                         ~2! ~3!
+where                                                                                               m exp@2i~b2 1 b3 1 b4!#% 1 rm $rm exp~2ib3!
+
+                                                                                                 1 r~4!                    ~3! ~4!
+                                                                                                    m exp@2i~b3 1 b4!#% 1 rm rm exp~2ib4!
+                                     1
+p~s j! 5 nj cos uj ,          p~pj! 5 cos uj ,                  j 5 1, 2, . . . , N,             1 r~1! ~2! ~3! ~4!
+                                                                                                    m rm rm rm exp@2i~b2 1 b4!#.                        (A9)
+                                     nj
+       ~N21!            ~N21!
+and K 11    , . . . , K 22    are the elements of matrix
+K~N21!
+        that satisfy the following recursion relation:                                       The authors wish to thank S. J. Hewlett of the
+                                                                                          University of Dublin, Ireland, for discussions, for
+            K~N21! 5 K~N22! z M~N21!~hN21 2 hN22!,                                 (A3)   helpful suggestions, and for writing and running the
+                                                                                          computer programs for numerical evaluation of our
+where the elements of matrix M are given by
+                                                                                          results. We are also grateful to V. Dhayalan of the
+
+
+            3                                                                 4
+                                i                                                         University of Bergen, Norway, for providing informa-
+         cos bN21          2 ~N21! sin bN21
+ ~N21!                       p                                                            tion on his research. P. Török acknowledges the
+M      5                       m            .
+         2ip~N21! sin bN21 cos bN21                                                       support from the Wellcome Trust, UK.
+             m
+                                                                                             P. Török is on leave from the Central Research
+                                                                                   (A4)   Institute for Physics, Hungarian Academy of Sci-
+We obtain from Eqs. ~A2! and ~A3!                                                         ences, Budapest.
+
+       2p~1!                                                                              References and Notes
+                                            M j~N21!
+           m        ~N22!   ~N21!     ~N22!
+               5 @K 1j    M j1    1 K 1j        2    p~N! ~1!
+                                                      m #pm
+       T ~N21!
+         m                                                                                 1. R. D. Vré and L. Hesselnik, “Analysis of photorefractive strat-
+                            ~N22!       ~N21!           ~N22!       ~N21! ~N!                 ified volume holography optical elements,” J. Opt. Soc. Am. B
+                  1 @K      2j      M   j1      1K      2j      M   j2    m p #,
+                                                                                              9, 1800 –1808 ~1994!.
+                                                                                   (A5)    2. C. J. R. Sheppard, T. J. Connolly, J. Lee, and C. J. Cogswell,
+                                                                                              “Confocal imaging of a stratified medium,” Appl. Opt. 33, 631–
+where at double indices a summation needs to be                                               640 ~1994!.
+performed. Now, substituting Eq. ~A4! into Eq. ~A5!                                        3. P. Török, P. Varga, Z. Laczik, and G. R. Booker, “Electromag-
+we obtain                                                                                     netic diffraction of light focused through a planar interface
+                                                                                              between materials of mismatched refractive indices: an inte-
+                                t~N21!
+                                 m     T ~N22!
+                                         m     exp~ibN21!                                     gral representation,” J. Opt. Soc. Am. A 12, 325–332 ~1995!.
+                 T ~N21!
+                   m     5                   ~N22!        ,                        (A6)
+                                           D                                               4. After submission of the present manuscript the authors were
+                                                                                              informed that a similarly rigorous theory appeared by V. Dhay-
+where                                                                                         alan, entitled “Focusing of electromagnetic waves,” Ph.D. dis-
+                                                 ~N21!                                        sertation ~University of Bergen, Norway, 1996!.
+                                              2p m
+                            t~N21!
+                             m     5         ~N21!     ~N!
+                                                                                           5. E. Wolf, “Electromagnetic diffraction in optical systems, I. An
+                                         p   m     1p  m                                      integral representation of the image field,” Proc. R. Soc. Lon-
+                                                                                              don Ser. A 253, 349 –357 ~1959!.
+is the transmissivity of the interface between layers
+                                                                                           6. B. Richards and E. Wolf, “Electromagnetic diffraction in optical
+N 2 1 and N and                                                                               systems, II. Structure of the image field in an aplanatic sys-
+                                                                                              tem,” Proc. R. Soc. London Ser. A 253, 358 –379 ~1959!.
+                     2 ~N21! ~N22!
+D~N22! 5 1 1             rm T          ~N22!
+                                   $@K 11             pm #p~1!
+                                                 ~N22! ~N21!
+                                             2 K 12                                        7. P. Debye, “Das Verhalten von Lichtwellen in der Nähe eines
+                    p~1!
+                                                             m
+                     m                                                                        Brennpunktes oder einer Brennlinie,” Ann. Phys. 30, 755–776
+                ~N22!     ~N22! ~N21!                                                         ~1909!.
+            1 K 21    2 K 22   pm %exp~2ibN21!,                                    (A7)
+                                                                                           8. M. Born and E. Wolf, Principles of Optics, 4th ed. ~Pergamon,
+where                                                                                         London, 1970!.
+                                                                                           9. P. Török, P. Varga, and G. R. Booker, “Electromagnetic dif-
+                                         p~N21!
+                                          m     2 p~N!
+                                                    m                                         fraction of light focused through a planar interface between
+                         r~N21! 5                  ~N! ,
+                                         p~N21!
+                          m
+                                          m     1 pm
+                                                                                              materials of mismatched refractive indices: structure of the
+                                                                                              electromagnetic field. I,” J. Opt. Soc. Am. A 12, 2136 –2144
+from which Eq. ~A6! can be written as                                                         ~1995!.
+                                         N22
+                                                                                          10. P. Török, P. Varga, A. Konkol, and G. R. Booker, “Electromag-
+
+
+                    ~N21!
+                                t~N21!
+                                 m        ) t exp~ib !
+                                                 ~ j!
+                                                 m              j11
+                                                                                              netic diffraction of light focused through a planar interface
+                                                                                              between materials of mismatched refractive indices: struc-
+                T           5             j51
+                                                                        ,          (A8)       ture of the electromagnetic field. II,” J. Opt. Soc. Am. A 13,
+                                                D~N21!
+                    m
+                                                 m
+                                                                                              2232–2238 ~1996!.
+where                                                                                     11. W. H. Press, S. A. Teukolsky, W. T. Vetterling, and B. P.
+                                                                                              Flannely, Numerical Recipes, 2nd ed. ~Cambridge U. Press,
+D~2!      ~1! ~2!
+ m 5 1 1 rm rm exp~2ib2!,                                                                     Cambridge, 1992!.
+
+
+
+2312       APPLIED OPTICS y Vol. 36, No. 11 y 10 April 1997
+
