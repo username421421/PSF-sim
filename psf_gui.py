@@ -3,6 +3,7 @@ import traceback
 import tkinter as tk
 import pickle
 import os
+import sys
 import json
 from tkinter import filedialog, messagebox, ttk
 
@@ -14,7 +15,6 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from matplotlib.patches import Circle
 from matplotlib.transforms import Bbox
-from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
 from mask_builder import MaskBuilderModel
 from PSF_simulator import CartesianPSFSimulator, SimulationStoppedError
@@ -43,12 +43,28 @@ except Exception:
     tifffile = None
 
 try:
-    from skimage import measure
+    import pyvista as pv
 
-    HAS_SKIMAGE = True
-except Exception:
-    HAS_SKIMAGE = False
-    measure = None
+    HAS_PYVISTA = True
+    PYVISTA_IMPORT_ERROR = ""
+except Exception as _pyvista_import_exc:
+    HAS_PYVISTA = False
+    PYVISTA_IMPORT_ERROR = str(_pyvista_import_exc)
+    pv = None
+
+try:
+    from PyQt5 import QtWidgets
+    from pyvistaqt import BackgroundPlotter
+
+    HAS_PYVISTA_QT = True
+    PYVISTA_QT_IMPORT_ERROR = ""
+except Exception as _pyvista_qt_import_exc:
+    HAS_PYVISTA_QT = False
+    PYVISTA_QT_IMPORT_ERROR = str(_pyvista_qt_import_exc)
+    QtWidgets = None
+    BackgroundPlotter = None
+
+HAS_PYVISTA_WINDOW = bool(HAS_PYVISTA and HAS_PYVISTA_QT)
 
 
 class PSFSimulatorApp:
@@ -86,6 +102,8 @@ class PSFSimulatorApp:
         self._surface_cache_max = 32
         self._max_3d_display_dim = 96
         self._max_3d_faces = 30000
+        self._qt_pump_interval_ms = 5
+        self._qt_pump_passes = 2
         self._cursor_axes_map = {}
         self._cursor_cid = None
         self._cursor_press_cid = None
@@ -106,9 +124,14 @@ class PSFSimulatorApp:
         self.opt_live_widths = None
         self._opt_live_refresh_job = None
         self._opt_live_preview_dirty = False
+        self._pyvista_plotter = None
+        self._pyvista_camera_position = None
+        self._qt_app = None
+        self._qt_pump_job = None
 
         self._setup_style()
         self._build_layout()
+        self.root.bind("<Destroy>", self._on_root_destroy, add="+")
         loaded_last_config = self._load_last_used_config()
         self._init_empty_plots()
         if loaded_last_config:
@@ -347,6 +370,7 @@ class PSFSimulatorApp:
         self.plot_mode_var = tk.StringVar(value="I")
         self.normalize_var = tk.BooleanVar(value=True)
         self.profile_cursor_enabled_var = tk.BooleanVar(value=False)
+        self.show_3d_grid_var = tk.BooleanVar(value=False)
         mode_row = ttk.Frame(display_group)
         mode_row.pack(fill="x")
         ttk.Label(mode_row, text="PSF mode:").pack(side=tk.LEFT)
@@ -373,6 +397,12 @@ class PSFSimulatorApp:
             variable=self.profile_cursor_enabled_var,
             command=self._on_profile_cursor_toggle,
         ).pack(anchor="w", pady=(6, 0))
+        ttk.Checkbutton(
+            display_group,
+            text="Show 3D coordinate grid",
+            variable=self.show_3d_grid_var,
+            command=self._on_3d_grid_toggle,
+        ).pack(anchor="w", pady=(4, 0))
 
         self.width_level_var = tk.DoubleVar(value=0.50)
         self.iso_level_var = tk.DoubleVar(value=0.50)
@@ -430,7 +460,10 @@ class PSFSimulatorApp:
         self.save_btn = ttk.Button(save_row, text="Save Result", command=self._save_result_dialog)
         self.save_btn.pack(side=tk.LEFT, fill="x", expand=True, padx=(0, 3))
         self.load_btn = ttk.Button(save_row, text="Load Result", command=self._load_result_dialog)
-        self.load_btn.pack(side=tk.LEFT, fill="x", expand=True, padx=(3, 0))
+        self.load_btn.pack(side=tk.LEFT, fill="x", expand=True, padx=3)
+        self.show_3d_btn = ttk.Button(save_row, text="Show 3D Window", command=self._show_3d_plot_window)
+        self.show_3d_btn.pack(side=tk.LEFT, fill="x", expand=True, padx=(3, 0))
+        self.show_3d_btn.configure(state="disabled")
 
         prog_row = ttk.Frame(parent)
         prog_row.pack(fill="x", pady=(6, 2))
@@ -610,11 +643,9 @@ class PSFSimulatorApp:
         self.notebook.pack(fill=tk.BOTH, expand=True)
 
         self.tab_2d = ttk.Frame(self.notebook)
-        self.tab_3d = ttk.Frame(self.notebook)
         self.tab_mask = ttk.Frame(self.notebook)
         self.tab_opt = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_2d, text="2D Results")
-        self.notebook.add(self.tab_3d, text="3D Isosurface")
         self.notebook.add(self.tab_mask, text="Mask Builder")
         self.notebook.add(self.tab_opt, text="Mask Optimization")
 
@@ -628,10 +659,6 @@ class PSFSimulatorApp:
         self._cursor_release_cid = self.canvas_2d.mpl_connect(
             "button_release_event", self._on_2d_canvas_button_release
         )
-
-        self.fig_3d = Figure(figsize=(9, 8), dpi=100)
-        self.canvas_3d = FigureCanvasTkAgg(self.fig_3d, master=self.tab_3d)
-        self.canvas_3d.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
         self._build_mask_builder_tab(self.tab_mask)
         self._build_optimization_tab(self.tab_opt)
@@ -891,6 +918,7 @@ class PSFSimulatorApp:
         self.opt_weight_x_var = tk.DoubleVar(value=1.0)
         self.opt_weight_y_var = tk.DoubleVar(value=1.0)
         self.opt_weight_z_var = tk.DoubleVar(value=1.0)
+        self.opt_weight_abs_xy_var = tk.DoubleVar(value=0.0)
         self.opt_n_starts_var = tk.IntVar(value=2)
         self.opt_maxiter_var = tk.IntVar(value=30)
         self.opt_ftol_var = tk.DoubleVar(value=1e-6)
@@ -935,13 +963,16 @@ class PSFSimulatorApp:
         self.opt_binary_structure_combo = ttk.Combobox(
             mode_group,
             textvariable=self.opt_binary_structure_var,
-            values=("pixel", "simple_ring_block"),
+            values=("pixel", "simple_ring_block", "simple_ellipse_block"),
             state="readonly",
         )
         self.opt_binary_structure_combo.pack(fill="x", pady=(0, 2))
         ttk.Label(
             mode_group,
-            text="simple_ring_block: optimize inner/outer blocked radii only.",
+            text=(
+                "simple_ring_block: optimize inner/outer blocked radii only.\n"
+                "simple_ellipse_block: optimize an elliptical ring with inner/outer x/y diameters."
+            ),
             wraplength=340,
         ).pack(fill="x", pady=(0, 2))
 
@@ -971,6 +1002,7 @@ class PSFSimulatorApp:
         self._entry(objective_group, "Weight X", self.opt_weight_x_var)
         self._entry(objective_group, "Weight Y", self.opt_weight_y_var)
         self._entry(objective_group, "Weight Z", self.opt_weight_z_var)
+        self._entry(objective_group, "abs(x-y)", self.opt_weight_abs_xy_var)
 
         solver_group = ttk.LabelFrame(controls, text="Solver Budget", padding=8)
         solver_group.pack(fill="x", pady=(0, 6))
@@ -1041,6 +1073,7 @@ class PSFSimulatorApp:
         self.opt_optimizer_category_var.trace_add("write", self._on_opt_optimizer_category_change)
         self.opt_mode_var.trace_add("write", self._on_opt_mode_change)
         self.opt_binary_amplitude_var.trace_add("write", self._on_opt_binary_options_change)
+        self.opt_binary_structure_var.trace_add("write", self._on_opt_binary_options_change)
         self._sync_optimizer_combo_to_category(preferred_optimizer=self.opt_optimizer_var.get())
         self._on_opt_mode_change()
         self._on_opt_binary_options_change()
@@ -1061,10 +1094,27 @@ class PSFSimulatorApp:
         mode = str(self.opt_mode_var.get()).strip().lower()
         binary_enabled = bool(self.opt_binary_amplitude_var.get()) if hasattr(self, "opt_binary_amplitude_var") else False
         allow_structure = (mode == "amplitude") and bool(binary_enabled)
+        structure = (
+            str(self.opt_binary_structure_var.get()).strip().lower()
+            if hasattr(self, "opt_binary_structure_var")
+            else "pixel"
+        )
         if hasattr(self, "opt_binary_structure_combo"):
             self.opt_binary_structure_combo.configure(state="readonly" if allow_structure else "disabled")
         if not allow_structure and hasattr(self, "opt_binary_structure_var"):
             self.opt_binary_structure_var.set("pixel")
+            structure = "pixel"
+        allow_axial_toggle = True
+        if structure == "simple_ring_block":
+            allow_axial_toggle = False
+            if hasattr(self, "opt_axial_symmetry_var"):
+                self.opt_axial_symmetry_var.set(True)
+        elif structure == "simple_ellipse_block":
+            allow_axial_toggle = False
+            if hasattr(self, "opt_axial_symmetry_var"):
+                self.opt_axial_symmetry_var.set(False)
+        if hasattr(self, "opt_axial_symmetry_chk"):
+            self.opt_axial_symmetry_chk.configure(state=("normal" if allow_axial_toggle else "disabled"))
 
     def _on_opt_controls_frame_configure(self, _event):
         if hasattr(self, "opt_controls_canvas"):
@@ -1422,13 +1472,8 @@ class PSFSimulatorApp:
         ax.axis("off")
         self.canvas_2d.draw()
 
-        self.fig_3d.clear()
-        ax3d = self.fig_3d.add_subplot(111, projection="3d")
-        ax3d.set_title("3D PSF Isosurface (run 3D first)")
-        ax3d.set_xlabel("X (um)")
-        ax3d.set_ylabel("Y (um)")
-        ax3d.set_zlabel("Z (um)")
-        self.canvas_3d.draw()
+        self._close_pyvista_window()
+        self._update_3d_window_button_state()
         self._refresh_mask_builder_plot()
         self._refresh_mask_input_preview()
         self._refresh_optimization_plot()
@@ -1443,6 +1488,8 @@ class PSFSimulatorApp:
         self.save_btn.configure(state=run_state)
         self.load_btn.configure(state=run_state)
         self.load_mask_btn.configure(state=run_state)
+        if hasattr(self, "show_3d_btn"):
+            self._update_3d_window_button_state()
         if hasattr(self, "remove_mask_btn"):
             self.remove_mask_btn.configure(state=run_state)
         self.rotate_cw_btn.configure(state=run_state)
@@ -1703,6 +1750,38 @@ class PSFSimulatorApp:
                             f"\nRing block radii (mm): "
                             f"inner={float(rin_mm):.4f}, outer={float(rout_mm):.4f}"
                         )
+                    if (
+                        bstruct == "simple_ellipse_block"
+                        and settings.get("ellipse_inner_diameter_x_mm") is not None
+                        and settings.get("ellipse_inner_diameter_y_mm") is not None
+                        and settings.get("ellipse_outer_diameter_x_mm") is not None
+                        and settings.get("ellipse_outer_diameter_y_mm") is not None
+                        and np.isfinite(float(settings.get("ellipse_inner_diameter_x_mm")))
+                        and np.isfinite(float(settings.get("ellipse_inner_diameter_y_mm")))
+                        and np.isfinite(float(settings.get("ellipse_outer_diameter_x_mm")))
+                        and np.isfinite(float(settings.get("ellipse_outer_diameter_y_mm")))
+                    ):
+                        ring_line = (
+                            "\nEllipse ring diameters (mm): "
+                            f"inner=({float(settings.get('ellipse_inner_diameter_x_mm')):.4f}, "
+                            f"{float(settings.get('ellipse_inner_diameter_y_mm')):.4f}), "
+                            f"outer=({float(settings.get('ellipse_outer_diameter_x_mm')):.4f}, "
+                            f"{float(settings.get('ellipse_outer_diameter_y_mm')):.4f})"
+                        )
+                    elif (
+                        bstruct == "simple_ellipse_block"
+                        and settings.get("ellipse_radius_x_mm") is not None
+                        and settings.get("ellipse_radius_y_mm") is not None
+                        and np.isfinite(float(settings.get("ellipse_radius_x_mm")))
+                        and np.isfinite(float(settings.get("ellipse_radius_y_mm")))
+                    ):
+                        ring_line = (
+                            f"\nEllipse block radii (mm): "
+                            f"x={float(settings.get('ellipse_radius_x_mm')):.4f}, "
+                            f"y={float(settings.get('ellipse_radius_y_mm')):.4f}"
+                        )
+                abs_before = abs(float(baseline["width_x_um"]) - float(baseline["width_y_um"]))
+                abs_after = abs(float(best["width_x_um"]) - float(best["width_y_um"]))
                 self.opt_summary_var.set(
                     "Last optimization (loaded)\n"
                     "Before (um): "
@@ -1713,6 +1792,7 @@ class PSFSimulatorApp:
                     f"X={float(best['width_x_um']):.4f}, "
                     f"Y={float(best['width_y_um']):.4f}, "
                     f"Z={float(best['width_z_um']):.4f}\n"
+                    f"abs(x-y) (um): {abs_before:.4f} -> {abs_after:.4f}\n"
                     f"Objective: {float(best_obj):.6f}"
                     f"{ring_line}"
                 )
@@ -1877,13 +1957,14 @@ class PSFSimulatorApp:
             "optimizer_category": str(self.opt_optimizer_category_var.get()).strip(),
             "optimizer_name": str(self.opt_optimizer_var.get()).strip(),
             "mode": str(self.opt_mode_var.get()).strip().lower(),
-            "axial_symmetry": True,
+            "axial_symmetry": bool(self.opt_axial_symmetry_var.get()),
             "binary_amplitude": bool(self.opt_binary_amplitude_var.get()),
             "binary_structure": str(self.opt_binary_structure_var.get()).strip().lower(),
             "width_level": float(self.opt_width_level_var.get()),
             "weight_x": float(self.opt_weight_x_var.get()),
             "weight_y": float(self.opt_weight_y_var.get()),
             "weight_z": float(self.opt_weight_z_var.get()),
+            "weight_abs_xy": float(self.opt_weight_abs_xy_var.get()),
             "n_starts": int(self.opt_n_starts_var.get()),
             "maxiter": int(self.opt_maxiter_var.get()),
             "ftol": float(self.opt_ftol_var.get()),
@@ -1983,7 +2064,11 @@ class PSFSimulatorApp:
         mode = str(values.get("mode", self.opt_mode_var.get())).strip().lower()
         if mode in {"amplitude", "phase", "amplitude_phase"}:
             self.opt_mode_var.set(mode)
-        self.opt_axial_symmetry_var.set(True)
+        if "axial_symmetry" in values:
+            try:
+                self.opt_axial_symmetry_var.set(bool(values["axial_symmetry"]))
+            except Exception:
+                pass
         if "binary_amplitude" in values:
             try:
                 self.opt_binary_amplitude_var.set(bool(values["binary_amplitude"]))
@@ -1992,7 +2077,7 @@ class PSFSimulatorApp:
         if "binary_structure" in values:
             try:
                 bstruct = str(values["binary_structure"]).strip().lower()
-                if bstruct in {"pixel", "simple_ring_block"}:
+                if bstruct in {"pixel", "simple_ring_block", "simple_ellipse_block"}:
                     self.opt_binary_structure_var.set(bstruct)
             except Exception:
                 pass
@@ -2001,6 +2086,7 @@ class PSFSimulatorApp:
         self._set_var_if_present(values, "weight_x", self.opt_weight_x_var, float, 1.0)
         self._set_var_if_present(values, "weight_y", self.opt_weight_y_var, float, 1.0)
         self._set_var_if_present(values, "weight_z", self.opt_weight_z_var, float, 1.0)
+        self._set_var_if_present(values, "weight_abs_xy", self.opt_weight_abs_xy_var, float, 1.0)
 
         self._set_var_if_present(values, "n_starts", self.opt_n_starts_var, int, 1.0)
         self._set_var_if_present(values, "maxiter", self.opt_maxiter_var, int, 1.0)
@@ -2234,11 +2320,12 @@ class PSFSimulatorApp:
         self.stop_requested = False
         self._set_progress(100.0, force=True)
         self._refresh_plots()
+        self._update_3d_window_button_state()
+        self.notebook.select(self.tab_2d)
         if self.results_3d is not None:
-            self.notebook.select(self.tab_3d)
-            self.status_var.set("Loaded saved result with 2D and 3D data.")
+            self._show_3d_plot_window()
+            self.status_var.set("Loaded saved result with 2D and 3D data. Opened the 3D PyVista window.")
         else:
-            self.notebook.select(self.tab_2d)
             self.status_var.set("Loaded saved result with 2D data.")
 
     def _collect_params(self):
@@ -2355,13 +2442,14 @@ class PSFSimulatorApp:
             "optimizer_category": str(self.opt_optimizer_category_var.get()).strip(),
             "optimizer_name": str(self.opt_optimizer_var.get()).strip(),
             "mode": str(self.opt_mode_var.get()).strip().lower(),
-            "axial_symmetry": True,
+            "axial_symmetry": bool(self.opt_axial_symmetry_var.get()),
             "binary_amplitude": bool(self.opt_binary_amplitude_var.get()),
             "binary_structure": str(self.opt_binary_structure_var.get()).strip().lower(),
             "width_level": float(self.opt_width_level_var.get()),
             "weight_x": float(self.opt_weight_x_var.get()),
             "weight_y": float(self.opt_weight_y_var.get()),
             "weight_z": float(self.opt_weight_z_var.get()),
+            "weight_abs_xy": float(self.opt_weight_abs_xy_var.get()),
             "n_starts": int(self.opt_n_starts_var.get()),
             "maxiter": int(self.opt_maxiter_var.get()),
             "ftol": float(self.opt_ftol_var.get()),
@@ -2386,23 +2474,35 @@ class PSFSimulatorApp:
                 settings["optimizer_category"] = inferred
         if settings["mode"] not in {"amplitude", "phase", "amplitude_phase"}:
             raise ValueError("Mode must be one of: amplitude, phase, amplitude_phase.")
-        if settings["binary_structure"] not in {"pixel", "simple_ring_block"}:
-            raise ValueError("Pass/block structure must be one of: pixel, simple_ring_block.")
+        if settings["binary_structure"] not in {"pixel", "simple_ring_block", "simple_ellipse_block"}:
+            raise ValueError(
+                "Pass/block structure must be one of: pixel, simple_ring_block, simple_ellipse_block."
+            )
         if settings["mode"] != "amplitude":
             settings["binary_amplitude"] = False
             settings["binary_structure"] = "pixel"
         if not settings["binary_amplitude"]:
             settings["binary_structure"] = "pixel"
+        if settings["binary_structure"] == "simple_ring_block":
+            settings["axial_symmetry"] = True
+        elif settings["binary_structure"] == "simple_ellipse_block":
+            settings["axial_symmetry"] = False
         if not np.isfinite(settings["width_level"]) or not (0.01 <= settings["width_level"] <= 0.99):
             raise ValueError("Width level must be in [0.01, 0.99].")
         if (
             settings["weight_x"] < 0
             or settings["weight_y"] < 0
             or settings["weight_z"] < 0
+            or settings["weight_abs_xy"] < 0
         ):
-            raise ValueError("X/Y/Z weights must be >= 0.")
-        if settings["weight_x"] + settings["weight_y"] + settings["weight_z"] <= 0:
-            raise ValueError("At least one of X/Y/Z weights must be > 0.")
+            raise ValueError("X/Y/Z/abs(x-y) weights must be >= 0.")
+        if (
+            settings["weight_x"]
+            + settings["weight_y"]
+            + settings["weight_z"]
+            + settings["weight_abs_xy"]
+        ) <= 0:
+            raise ValueError("At least one of X/Y/Z/abs(x-y) weights must be > 0.")
         if settings["n_starts"] < 1:
             raise ValueError("Multi-start count must be >= 1.")
         if settings["maxiter"] < 1:
@@ -2538,22 +2638,28 @@ class PSFSimulatorApp:
         width_x = info.get("width_x_um")
         width_y = info.get("width_y_um")
         width_z = info.get("width_z_um")
-        if (
-            width_x is not None
-            and width_y is not None
-            and width_z is not None
-            and np.isfinite(float(width_x))
-            and np.isfinite(float(width_y))
-            and np.isfinite(float(width_z))
-        ):
+        finite_x = width_x is not None and np.isfinite(float(width_x))
+        finite_y = width_y is not None and np.isfinite(float(width_y))
+        finite_z = width_z is not None and np.isfinite(float(width_z))
+        if finite_x and finite_y:
             self.opt_live_widths = (
                 float(width_x),
                 float(width_y),
-                float(width_z),
+                float(width_z) if finite_z else np.nan,
             )
+            abs_xy = info.get("abs_x_minus_y_um")
+            if abs_xy is None or (not np.isfinite(float(abs_xy))):
+                abs_xy = abs(float(width_x) - float(width_y))
+            width_parts = [
+                f"X={float(width_x):.4f}",
+                f"Y={float(width_y):.4f}",
+            ]
+            if finite_z:
+                width_parts.append(f"Z={float(width_z):.4f}")
             self.opt_summary_var.set(
                 "Current (um): "
-                f"X={float(width_x):.4f}, Y={float(width_y):.4f}, Z={float(width_z):.4f}\n"
+                + ", ".join(width_parts)
+                + f", abs(x-y)={float(abs_xy):.4f}\n"
                 f"Current objective: {float(self.opt_live_objective) if self.opt_live_objective is not None else np.nan:.6f}"
             )
 
@@ -2654,6 +2760,7 @@ class PSFSimulatorApp:
                     float(settings["weight_y"]),
                     float(settings["weight_z"]),
                 ),
+                weight_abs_xy=float(settings.get("weight_abs_xy", 0.0)),
                 n_starts=int(settings["n_starts"]),
                 maxiter=int(settings["maxiter"]),
                 ftol=float(settings["ftol"]),
@@ -2671,6 +2778,9 @@ class PSFSimulatorApp:
                     obj = info.get("objective")
                     if obj is not None and np.isfinite(obj):
                         parts.append(f"objective={float(obj):.4f}")
+                    abs_xy = info.get("abs_x_minus_y_um")
+                    if abs_xy is not None and np.isfinite(float(abs_xy)):
+                        parts.append(f"abs(x-y)={float(abs_xy):.4f}um")
                     side_pen = info.get("sidelobe_penalty")
                     if side_pen is not None and np.isfinite(float(side_pen)):
                         parts.append(f"sl_pen={float(side_pen):.4f}")
@@ -2703,6 +2813,53 @@ class PSFSimulatorApp:
                             parts.append(f"~{est_iter_s / 60.0:.1f} min/iter")
                         elif est_iter_s >= 1.0:
                             parts.append(f"~{est_iter_s:.1f} s/iter")
+                    ellipse_in_dx_mm = info.get("ellipse_inner_diameter_x_mm")
+                    ellipse_in_dy_mm = info.get("ellipse_inner_diameter_y_mm")
+                    ellipse_out_dx_mm = info.get("ellipse_outer_diameter_x_mm")
+                    ellipse_out_dy_mm = info.get("ellipse_outer_diameter_y_mm")
+                    if (
+                        ellipse_in_dx_mm is not None
+                        and ellipse_in_dy_mm is not None
+                        and ellipse_out_dx_mm is not None
+                        and ellipse_out_dy_mm is not None
+                        and np.isfinite(float(ellipse_in_dx_mm))
+                        and np.isfinite(float(ellipse_in_dy_mm))
+                        and np.isfinite(float(ellipse_out_dx_mm))
+                        and np.isfinite(float(ellipse_out_dy_mm))
+                    ):
+                        parts.append(
+                            "ellipse(mm)="
+                            f"in({float(ellipse_in_dx_mm):.4f},{float(ellipse_in_dy_mm):.4f}) "
+                            f"out({float(ellipse_out_dx_mm):.4f},{float(ellipse_out_dy_mm):.4f})"
+                        )
+                    else:
+                        ellipse_in_dx = info.get("ellipse_inner_diameter_x_norm")
+                        ellipse_in_dy = info.get("ellipse_inner_diameter_y_norm")
+                        ellipse_out_dx = info.get("ellipse_outer_diameter_x_norm")
+                        ellipse_out_dy = info.get("ellipse_outer_diameter_y_norm")
+                        if (
+                            ellipse_in_dx is not None
+                            and ellipse_in_dy is not None
+                            and ellipse_out_dx is not None
+                            and ellipse_out_dy is not None
+                            and np.isfinite(float(ellipse_in_dx))
+                            and np.isfinite(float(ellipse_in_dy))
+                            and np.isfinite(float(ellipse_out_dx))
+                            and np.isfinite(float(ellipse_out_dy))
+                        ):
+                            try:
+                                pd_mm = float(params["pupil_d"]) * 1e3
+                                parts.append(
+                                    "ellipse(mm)="
+                                    f"in({float(ellipse_in_dx)*pd_mm:.4f},{float(ellipse_in_dy)*pd_mm:.4f}) "
+                                    f"out({float(ellipse_out_dx)*pd_mm:.4f},{float(ellipse_out_dy)*pd_mm:.4f})"
+                                )
+                            except Exception:
+                                parts.append(
+                                    "ellipse(norm)="
+                                    f"in({float(ellipse_in_dx):.3f},{float(ellipse_in_dy):.3f}) "
+                                    f"out({float(ellipse_out_dx):.3f},{float(ellipse_out_dy):.3f})"
+                                )
                     ring_in_mm = info.get("ring_inner_radius_mm")
                     ring_out_mm = info.get("ring_outer_radius_mm")
                     if (
@@ -2806,13 +2963,36 @@ class PSFSimulatorApp:
                         f"\nRing block radii (mm): "
                         f"inner={float(rin)*pr_mm:.4f}, outer={float(rout)*pr_mm:.4f}"
                     )
+            elif bstruct == "simple_ellipse_block":
+                einx_mm = result.settings.get("ellipse_inner_diameter_x_mm")
+                einy_mm = result.settings.get("ellipse_inner_diameter_y_mm")
+                eoutx_mm = result.settings.get("ellipse_outer_diameter_x_mm")
+                eouty_mm = result.settings.get("ellipse_outer_diameter_y_mm")
+                if (
+                    einx_mm is not None
+                    and einy_mm is not None
+                    and eoutx_mm is not None
+                    and eouty_mm is not None
+                    and np.isfinite(float(einx_mm))
+                    and np.isfinite(float(einy_mm))
+                    and np.isfinite(float(eoutx_mm))
+                    and np.isfinite(float(eouty_mm))
+                ):
+                    ring_line = (
+                        "\nEllipse ring diameters (mm): "
+                        f"inner=({float(einx_mm):.4f}, {float(einy_mm):.4f}), "
+                        f"outer=({float(eoutx_mm):.4f}, {float(eouty_mm):.4f})"
+                    )
         except Exception:
             ring_line = ""
+        abs_before = abs(float(before["width_x_um"]) - float(before["width_y_um"]))
+        abs_after = abs(float(after["width_x_um"]) - float(after["width_y_um"]))
         self.opt_summary_var.set(
             "Before (um): "
             f"X={before['width_x_um']:.4f}, Y={before['width_y_um']:.4f}, Z={before['width_z_um']:.4f}\n"
             "After (um): "
             f"X={after['width_x_um']:.4f}, Y={after['width_y_um']:.4f}, Z={after['width_z_um']:.4f}\n"
+            f"abs(x-y) (um): {abs_before:.4f} -> {abs_after:.4f}\n"
             f"Objective: {result.best_objective:.6f}"
             f"{ring_line}"
         )
@@ -2940,9 +3120,13 @@ class PSFSimulatorApp:
                     live_text += f"Current objective: {float(self.opt_live_objective):.6f}\n"
                 if self.opt_live_widths is not None:
                     wx, wy, wz = self.opt_live_widths
+                    width_line = f"X={float(wx):.4f}, Y={float(wy):.4f}"
+                    if np.isfinite(float(wz)):
+                        width_line += f", Z={float(wz):.4f}"
                     live_text += (
                         "Current widths (um)\n"
-                        f"X={float(wx):.4f}, Y={float(wy):.4f}, Z={float(wz):.4f}\n"
+                        f"{width_line}\n"
+                        f"abs(x-y)={abs(float(wx) - float(wy)):.4f}\n"
                     )
                 if self.opt_is_running:
                     live_text += "\nStatus: optimizing..."
@@ -3004,6 +3188,9 @@ class PSFSimulatorApp:
             f"X: {before['width_x_um']:.4f} -> {after['width_x_um']:.4f}\n"
             f"Y: {before['width_y_um']:.4f} -> {after['width_y_um']:.4f}\n"
             f"Z: {before['width_z_um']:.4f} -> {after['width_z_um']:.4f}\n\n"
+            f"abs(x-y): {abs(float(before['width_x_um']) - float(before['width_y_um'])):.4f}"
+            f" -> {abs(float(after['width_x_um']) - float(after['width_y_um'])):.4f}\n"
+            "\n"
             f"Objective: {self.opt_result.best_objective:.6f}\n"
             f"Mode: {self.opt_result.settings.get('mode', '-')}\n"
             f"Optimizer: {self.opt_result.settings.get('optimizer_name', '-')}"
@@ -3023,6 +3210,27 @@ class PSFSimulatorApp:
                     "\n"
                     f"Ring block (mm): {float(rin_mm):.4f} -> {float(rout_mm):.4f}"
                 )
+            elif bstruct == "simple_ellipse_block":
+                einx_mm = self.opt_result.settings.get("ellipse_inner_diameter_x_mm")
+                einy_mm = self.opt_result.settings.get("ellipse_inner_diameter_y_mm")
+                eoutx_mm = self.opt_result.settings.get("ellipse_outer_diameter_x_mm")
+                eouty_mm = self.opt_result.settings.get("ellipse_outer_diameter_y_mm")
+                if (
+                    einx_mm is not None
+                    and einy_mm is not None
+                    and eoutx_mm is not None
+                    and eouty_mm is not None
+                    and np.isfinite(float(einx_mm))
+                    and np.isfinite(float(einy_mm))
+                    and np.isfinite(float(eoutx_mm))
+                    and np.isfinite(float(eouty_mm))
+                ):
+                    text += (
+                        "\n"
+                        "Ellipse ring (mm): "
+                        f"in=({float(einx_mm):.4f}, {float(einy_mm):.4f}) "
+                        f"out=({float(eoutx_mm):.4f}, {float(eouty_mm):.4f})"
+                    )
         except Exception:
             pass
         axes[1, 1].text(0.0, 1.0, text, ha="left", va="top", family="monospace")
@@ -3186,8 +3394,10 @@ class PSFSimulatorApp:
         self._save_last_used_config(params)
         self._clear_3d_render_cache()
         self._refresh_plots()
+        self._update_3d_window_button_state()
+        self.notebook.select(self.tab_2d)
         if ran_3d:
-            self.notebook.select(self.tab_3d)
+            self._show_3d_plot_window()
         dx_um = (params["size_x"] / params["nx"]) * 1e6
         dy_um = (params["size_y"] / params["ny"]) * 1e6
         trim_note = ""
@@ -3551,6 +3761,7 @@ class PSFSimulatorApp:
     def _clear_3d_render_cache(self):
         self._surface_cache.clear()
         self._surface_cache_order.clear()
+        self._pyvista_camera_position = None
         if self._iso_refresh_job is not None:
             try:
                 self.root.after_cancel(self._iso_refresh_job)
@@ -3621,6 +3832,357 @@ class PSFSimulatorApp:
             old = self._surface_cache_order.pop(0)
             self._surface_cache.pop(old, None)
 
+    def _on_root_destroy(self, event=None):
+        if event is not None and event.widget is not self.root:
+            return
+        if self._qt_pump_job is not None:
+            try:
+                self.root.after_cancel(self._qt_pump_job)
+            except Exception:
+                pass
+            self._qt_pump_job = None
+        self._close_pyvista_window()
+
+    def _update_3d_window_button_state(self):
+        if not hasattr(self, "show_3d_btn"):
+            return
+        enabled = bool(
+            HAS_PYVISTA_WINDOW
+            and (self.results_3d is not None)
+            and (not self.is_running)
+            and (not self.opt_is_running)
+        )
+        self.show_3d_btn.configure(state=("normal" if enabled else "disabled"))
+
+    def _ensure_qt_event_pump(self):
+        if self._qt_app is None or self._qt_pump_job is not None:
+            return
+        interval_ms = max(1, int(self._qt_pump_interval_ms))
+        self._qt_pump_job = self.root.after(interval_ms, self._pump_qt_events)
+
+    def _pump_qt_events(self):
+        self._qt_pump_job = None
+        if self._qt_app is None:
+            return
+        try:
+            self._qt_app.sendPostedEvents()
+        except Exception:
+            pass
+        try:
+            for _ in range(max(1, int(self._qt_pump_passes))):
+                self._qt_app.processEvents()
+        except Exception:
+            return
+        try:
+            if self.root.winfo_exists():
+                interval_ms = max(1, int(self._qt_pump_interval_ms))
+                self._qt_pump_job = self.root.after(interval_ms, self._pump_qt_events)
+        except Exception:
+            self._qt_pump_job = None
+
+    def _ensure_qt_app(self):
+        if not HAS_PYVISTA_WINDOW:
+            return None
+        if self._qt_app is None:
+            self._qt_app = QtWidgets.QApplication.instance()
+            if self._qt_app is None:
+                self._qt_app = QtWidgets.QApplication([sys.argv[0] or "psf_gui.py"])
+        self._ensure_qt_event_pump()
+        return self._qt_app
+
+    def _on_pyvista_window_destroyed(self, *_args):
+        self._pyvista_plotter = None
+
+    def _get_live_pyvista_plotter(self):
+        plotter = self._pyvista_plotter
+        if plotter is None:
+            return None
+        try:
+            plotter.windowTitle()
+        except Exception:
+            self._pyvista_plotter = None
+            return None
+        return plotter
+
+    def _has_open_pyvista_window(self):
+        plotter = self._get_live_pyvista_plotter()
+        if plotter is None:
+            return False
+        try:
+            return bool(plotter.isVisible())
+        except Exception:
+            self._pyvista_plotter = None
+            return False
+
+    def _close_pyvista_window(self):
+        plotter = self._get_live_pyvista_plotter()
+        self._pyvista_plotter = None
+        if plotter is None:
+            return
+        try:
+            plotter.close()
+        except Exception:
+            pass
+
+    def _ensure_pyvista_plotter(self):
+        if not HAS_PYVISTA_WINDOW:
+            return None
+        plotter = self._get_live_pyvista_plotter()
+        if plotter is not None and (not self._has_open_pyvista_window()):
+            self._close_pyvista_window()
+            plotter = None
+        if plotter is not None:
+            return plotter
+
+        self._ensure_qt_app()
+        plotter = BackgroundPlotter(
+            show=True,
+            app=self._qt_app,
+            window_size=(980, 760),
+            toolbar=True,
+            menu_bar=False,
+            editor=False,
+        )
+        plotter.setWindowTitle("3D PSF Surface")
+        try:
+            plotter.app_window.destroyed.connect(self._on_pyvista_window_destroyed)
+        except Exception:
+            pass
+        self._pyvista_plotter = plotter
+        try:
+            self._qt_app.processEvents()
+        except Exception:
+            pass
+        return plotter
+
+    def _raise_pyvista_window(self):
+        plotter = self._get_live_pyvista_plotter()
+        if plotter is None:
+            return
+        try:
+            plotter.show()
+            plotter.raise_()
+            plotter.activateWindow()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _axis_spacing(coords, default=1.0):
+        coords = np.asarray(coords, dtype=float)
+        if coords.size <= 1:
+            return float(default)
+        diffs = np.diff(coords)
+        valid = diffs[np.isfinite(diffs) & (np.abs(diffs) > 0)]
+        if valid.size == 0:
+            return float(default)
+        return float(np.mean(valid))
+
+    def _capture_pyvista_camera(self):
+        plotter = self._get_live_pyvista_plotter()
+        if plotter is None:
+            return None
+        try:
+            camera = plotter.camera
+            return {
+                "position": tuple(camera.GetPosition()),
+                "focal_point": tuple(camera.GetFocalPoint()),
+                "view_up": tuple(camera.GetViewUp()),
+                "view_angle": float(camera.GetViewAngle()),
+                "parallel_scale": float(camera.GetParallelScale()),
+                "clipping_range": tuple(camera.GetClippingRange()),
+            }
+        except Exception:
+            return None
+
+    def _restore_pyvista_camera(self, camera_state):
+        plotter = self._get_live_pyvista_plotter()
+        if plotter is None or camera_state is None:
+            return False
+        try:
+            camera = plotter.camera
+            camera.SetPosition(*camera_state["position"])
+            camera.SetFocalPoint(*camera_state["focal_point"])
+            camera.SetViewUp(*camera_state["view_up"])
+            camera.SetViewAngle(float(camera_state["view_angle"]))
+            camera.SetParallelScale(float(camera_state["parallel_scale"]))
+            camera.SetClippingRange(*camera_state["clipping_range"])
+            camera.OrthogonalizeViewUp()
+            return True
+        except Exception:
+            return False
+
+    def _current_3d_display_state(self):
+        if self.results_3d is None:
+            return None
+
+        r = self.results_3d
+        data = self._display_intensity(self._choose_result_array(r, "I_xyz", "I_xyz_norm"))
+        level = float(self.iso_level_var.get())
+        mode = self.plot_mode_var.get()
+
+        x_um = np.asarray(r["x_coords"], dtype=float) * 1e6
+        y_um = np.asarray(r["y_coords"], dtype=float) * 1e6
+        z_um = np.asarray(r["z_coords"], dtype=float) * 1e6
+        raw_shape = tuple(int(v) for v in np.asarray(r["I_xyz"]).shape)
+        data, x_um, y_um, z_um = self._downsample_3d_for_display(data, x_um, y_um, z_um)
+
+        data_max = float(np.max(data)) if data.size else 0.0
+        level_abs = level * data_max if data_max > 0 else level
+        ds_note = ""
+        if tuple(int(v) for v in data.shape) != raw_shape:
+            ds_note = f", display={data.shape[2]}x{data.shape[1]}x{data.shape[0]}"
+
+        return {
+            "data": data,
+            "x_um": x_um,
+            "y_um": y_um,
+            "z_um": z_um,
+            "level": level,
+            "level_abs": level_abs,
+            "mode": mode,
+            "ds_note": ds_note,
+        }
+
+    def _format_3d_title(self, display_state, plotted, backend):
+        if display_state is None:
+            return f"3D PSF Surface [{backend}]"
+
+        if plotted:
+            title = (
+                f"3D surface ({display_state['mode']} level={display_state['level']:.2f}"
+                f"{display_state['ds_note']})"
+            )
+        else:
+            title = f"No surface at level={display_state['level']:.2f}{display_state['ds_note']}"
+
+        if not bool(self.normalize_var.get()):
+            title += f", abs={display_state['level_abs']:.3g}"
+        return f"{title} [{backend}]"
+
+    def _get_pyvista_surface(self, display_state):
+        if display_state is None or not HAS_PYVISTA:
+            return None
+
+        cache_key = (
+            "pyvista",
+            int(id(self.results_3d)),
+            int(self._power()),
+            int(bool(self.normalize_var.get())),
+            tuple(int(v) for v in display_state["data"].shape),
+            round(float(display_state["level_abs"]), 6),
+        )
+        cached = self._get_surface_from_cache(cache_key)
+        if cached is not None:
+            return cached
+
+        x_um = display_state["x_um"]
+        y_um = display_state["y_um"]
+        z_um = display_state["z_um"]
+        data = np.asarray(display_state["data"], dtype=float)
+
+        grid = pv.ImageData()
+        grid.dimensions = (len(x_um), len(y_um), len(z_um))
+        grid.origin = (float(x_um[0]), float(y_um[0]), float(z_um[0]))
+        grid.spacing = (
+            self._axis_spacing(x_um),
+            self._axis_spacing(y_um),
+            self._axis_spacing(z_um),
+        )
+        grid.point_data["psf"] = np.ascontiguousarray(np.transpose(data, (2, 1, 0)).ravel(order="F"))
+
+        surface = grid.contour(isosurfaces=[float(display_state["level_abs"])], scalars="psf")
+        if surface.n_points < 1 or surface.n_cells < 1:
+            return None
+
+        self._put_surface_cache(cache_key, surface)
+        return surface
+
+    def _configure_pyvista_plotter(self, plotter, surface, title):
+        plotter.clear()
+        plotter.set_background("#f7f9fc")
+        plotter.setWindowTitle(title)
+        if surface is not None:
+            plotter.add_mesh(
+                surface,
+                color="tomato",
+                smooth_shading=True,
+                opacity=0.82,
+                specular=0.18,
+                show_edges=False,
+                render=False,
+            )
+            plotter.add_axes()
+            if bool(self.show_3d_grid_var.get()):
+                plotter.show_grid(
+                    xtitle="X (um)",
+                    ytitle="Y (um)",
+                    ztitle="Z (um)",
+                    color="#6b7280",
+                    location="outer",
+                    ticks="outside",
+                )
+            else:
+                plotter.add_bounding_box(color="#6b7280", line_width=1.0)
+            plotter.add_text(title, position="upper_edge", font_size=10, name="plot_title", render=False)
+        else:
+            plotter.add_text(title, position="upper_edge", font_size=10, name="plot_title", render=False)
+            plotter.add_text(
+                "No isosurface exists at the current level.\nTry lowering the 3D surface level.",
+                position="upper_left",
+                font_size=12,
+                name="plot_notice",
+                render=False,
+            )
+
+    def _show_3d_plot_window(self):
+        if self.results_3d is None:
+            self.status_var.set("No 3D result is available to display.")
+            return
+        if not HAS_PYVISTA_WINDOW:
+            backend_error = PYVISTA_IMPORT_ERROR if not HAS_PYVISTA else PYVISTA_QT_IMPORT_ERROR
+            message = "PyVista window rendering is unavailable."
+            if backend_error:
+                message = f"{message} {backend_error}"
+            messagebox.showerror("PyVista unavailable", message)
+            self.status_var.set(message)
+            return
+        self._refresh_3d_plot(show_window=True)
+
+    def _refresh_3d_plot_pyvista(self, show_window=False):
+        display_state = self._current_3d_display_state()
+        if display_state is None:
+            self._close_pyvista_window()
+            return
+
+        should_open = bool(show_window or self._has_open_pyvista_window())
+        if not should_open:
+            return
+
+        surface = self._get_pyvista_surface(display_state)
+        plotter = self._ensure_pyvista_plotter()
+        if plotter is None:
+            raise RuntimeError("PyVista window could not be created.")
+
+        camera_state = self._capture_pyvista_camera() or self._pyvista_camera_position
+        plotted = surface is not None
+        title = self._format_3d_title(display_state, plotted=plotted, backend="PyVista")
+        self._configure_pyvista_plotter(plotter, surface, title)
+
+        if plotted:
+            if camera_state and self._restore_pyvista_camera(camera_state):
+                pass
+            else:
+                plotter.view_isometric(render=False)
+                plotter.reset_camera(render=False)
+                try:
+                    plotter.camera.zoom(1.2)
+                except Exception:
+                    pass
+            self._pyvista_camera_position = self._capture_pyvista_camera()
+        plotter.render()
+        if show_window:
+            self._raise_pyvista_window()
+
     def _on_width_level(self, value):
         try:
             level = float(value)
@@ -3658,9 +4220,12 @@ class PSFSimulatorApp:
         self._on_iso_level(level)
         self._schedule_3d_refresh(delay_ms=0)
 
+    def _on_3d_grid_toggle(self):
+        self._refresh_3d_plot(show_window=False)
+
     def _refresh_plots(self):
         self._refresh_2d_plots()
-        self._refresh_3d_plot()
+        self._refresh_3d_plot(show_window=False)
 
     def _refresh_2d_plots(self):
         if self.results_2d is None:
@@ -3952,117 +4517,23 @@ class PSFSimulatorApp:
         self.fig_2d.tight_layout()
         self.canvas_2d.draw()
 
-    def _refresh_3d_plot(self):
-        self.fig_3d.clear()
-        ax = self.fig_3d.add_subplot(111, projection="3d")
-
+    def _refresh_3d_plot(self, show_window=False):
         if self.results_3d is None:
-            ax.set_title("3D PSF Isosurface (run 3D first)")
-            ax.set_xlabel("X (um)")
-            ax.set_ylabel("Y (um)")
-            ax.set_zlabel("Z (um)")
-            self.canvas_3d.draw()
+            self._close_pyvista_window()
             return
-
-        r = self.results_3d
-        data = self._display_intensity(self._choose_result_array(r, "I_xyz", "I_xyz_norm"))
-        level = float(self.iso_level_var.get())
-        mode = self.plot_mode_var.get()
-
-        x_um = r["x_coords"] * 1e6
-        y_um = r["y_coords"] * 1e6
-        z_um = r["z_coords"] * 1e6
-        data, x_um, y_um, z_um = self._downsample_3d_for_display(data, x_um, y_um, z_um)
-
-        data_max = float(np.max(data))
-        level_abs = level * data_max if data_max > 0 else level
-        ds_note = ""
-        if tuple(int(v) for v in data.shape) != tuple(int(v) for v in np.asarray(r["I_xyz"]).shape):
-            ds_note = f", display={data.shape[2]}x{data.shape[1]}x{data.shape[0]}"
-
-        plotted = False
-        if HAS_SKIMAGE and min(int(v) for v in data.shape) >= 3:
-            try:
-                dz = float(z_um[1] - z_um[0])
-                dy = float(y_um[1] - y_um[0])
-                dx = float(x_um[1] - x_um[0])
-                step_mc = max(1, int(np.ceil(max(data.shape) / 72)))
-                cache_key = (
-                    int(id(r)),
-                    int(self._power()),
-                    int(bool(self.normalize_var.get())),
-                    tuple(int(v) for v in data.shape),
-                    int(step_mc),
-                    round(float(level_abs), 6),
-                )
-                cached = self._get_surface_from_cache(cache_key)
-                if cached is None:
-                    verts, faces, _normals, _values = measure.marching_cubes(
-                        data,
-                        level=level_abs,
-                        spacing=(dz, dy, dx),
-                        step_size=step_mc,
-                    )
-                    verts[:, 0] += z_um[0]
-                    verts[:, 1] += y_um[0]
-                    verts[:, 2] += x_um[0]
-                    if faces.shape[0] > int(self._max_3d_faces):
-                        choose = np.linspace(0, faces.shape[0] - 1, int(self._max_3d_faces)).astype(int)
-                        faces = faces[choose]
-                    cached = (verts[:, [2, 1, 0]], faces)
-                    self._put_surface_cache(cache_key, cached)
-
-                verts_plot, faces = cached
-                mesh = Poly3DCollection(
-                    verts_plot[faces], alpha=0.80, linewidths=0.0, edgecolors="none"
-                )
-                mesh.set_facecolor("tomato")
-                ax.add_collection3d(mesh)
-                plotted = True
-            except Exception:
-                plotted = False
-
-        if not plotted:
-            tol = max(1e-12, 0.02 * data_max, 0.05 * level_abs)
-            idx = np.argwhere(np.abs(data - level_abs) <= tol)
-            if idx.size > 0:
-                if idx.shape[0] > 8000:
-                    choose = np.linspace(0, idx.shape[0] - 1, 8000).astype(int)
-                    idx = idx[choose]
-                zz = z_um[idx[:, 0]]
-                yy = y_um[idx[:, 1]]
-                xx = x_um[idx[:, 2]]
-                cc = data[idx[:, 0], idx[:, 1], idx[:, 2]]
-                ax.scatter(xx, yy, zz, c=cc, cmap="inferno", s=1.0, alpha=0.35, linewidths=0.0)
-                plotted = True
-
-        if plotted:
-            title = f"3D surface ({mode} level={level:.2f}{ds_note})"
-            if not bool(self.normalize_var.get()):
-                title += f", abs={level_abs:.3g}"
-            ax.set_title(title)
-        else:
-            title = f"No surface at level={level:.2f}{ds_note}"
-            if not bool(self.normalize_var.get()):
-                title += f", abs={level_abs:.3g}"
-            ax.set_title(title)
-            ax.text(
-                0.5 * (x_um[0] + x_um[-1]),
-                0.5 * (y_um[0] + y_um[-1]),
-                0.5 * (z_um[0] + z_um[-1]),
-                "Try lower level",
-                ha="center",
-                va="center",
-            )
-
-        ax.set_xlim(x_um[0], x_um[-1])
-        ax.set_ylim(y_um[0], y_um[-1])
-        ax.set_zlim(z_um[0], z_um[-1])
-        ax.set_box_aspect([1, 1, 1])
-        ax.set_xlabel("X (um)")
-        ax.set_ylabel("Y (um)")
-        ax.set_zlabel("Z (um)")
-        self.canvas_3d.draw()
+        if not HAS_PYVISTA_WINDOW:
+            if show_window:
+                backend_error = PYVISTA_IMPORT_ERROR if not HAS_PYVISTA else PYVISTA_QT_IMPORT_ERROR
+                message = "PyVista window rendering is unavailable."
+                if backend_error:
+                    message = f"{message} {backend_error}"
+                self.status_var.set(message)
+            return
+        try:
+            self._refresh_3d_plot_pyvista(show_window=show_window)
+        except Exception as exc:
+            traceback.print_exc()
+            self.status_var.set(f"PyVista window render failed: {exc}")
 
 
 def main():
