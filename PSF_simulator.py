@@ -740,6 +740,30 @@ class CartesianPSFSimulator:
         if stop_callback is not None and bool(stop_callback()):
             raise SimulationStoppedError("Simulation stopped by user.")
 
+    @staticmethod
+    def _emit_progress(progress_callback, stage, frac):
+        if progress_callback is None:
+            return
+        progress_callback(stage, float(min(1.0, max(0.0, frac))))
+
+    @staticmethod
+    def _coord_count(coords):
+        if torch.is_tensor(coords):
+            return int(coords.numel())
+        return int(np.asarray(coords).size)
+
+    @staticmethod
+    def _intensity_from_components(ex, ey, ez):
+        return torch.abs(ex) ** 2 + torch.abs(ey) ** 2 + torch.abs(ez) ** 2
+
+    def _make_scan_coords(self, range_x_m, range_y_m, range_z_m, num_points):
+        num_points = int(num_points)
+        return (
+            torch.linspace(-range_x_m, range_x_m, num_points, dtype=torch.float64, device=self.device),
+            torch.linspace(-range_y_m, range_y_m, num_points, dtype=torch.float64, device=self.device),
+            torch.linspace(-range_z_m, range_z_m, num_points, dtype=torch.float64, device=self.device),
+        )
+
     def prepare_pupil_field_from_input(
         self,
         input_intensity,
@@ -762,12 +786,8 @@ class CartesianPSFSimulator:
         Returns intermediate fields/intensities and coordinates for plotting.
         """
 
-        def emit(stage, frac):
-            if progress_callback is not None:
-                progress_callback(stage, float(min(1.0, max(0.0, frac))))
-
         self._check_stop(stop_callback)
-        emit("Validating input", 0.02)
+        self._emit_progress(progress_callback, "Validating input", 0.02)
         intensity = self._to_torch_float(input_intensity)
         if intensity.ndim != 2:
             raise ValueError("input_intensity must be a 2D array.")
@@ -783,7 +803,7 @@ class CartesianPSFSimulator:
             )
 
         self._check_stop(stop_callback)
-        emit("Applying source envelope", 0.18)
+        self._emit_progress(progress_callback, "Applying source envelope", 0.18)
         intensity_after_gaussian = intensity.clone()
         if use_gaussian_profile:
             if gaussian_waist_x is None or gaussian_waist_y is None:
@@ -799,7 +819,7 @@ class CartesianPSFSimulator:
             )
 
         self._check_stop(stop_callback)
-        emit("Applying masks", 0.33)
+        self._emit_progress(progress_callback, "Applying masks", 0.33)
         intensity_after_mask = intensity_after_gaussian.clone()
 
         if custom_mask is not None:
@@ -829,7 +849,7 @@ class CartesianPSFSimulator:
         intensity_after_mask = intensity_after_mask / max_masked
 
         self._check_stop(stop_callback)
-        emit("Propagating to entrance pupil", 0.52)
+        self._emit_progress(progress_callback, "Propagating to entrance pupil", 0.52)
         if isclose(fresnel_distance, 0.0):
             # z=0: skip propagation and keep the mask-plane field.
             field_after_fresnel = torch.sqrt(intensity_after_mask).to(torch.complex128)
@@ -839,7 +859,7 @@ class CartesianPSFSimulator:
             )
 
         self._check_stop(stop_callback)
-        emit("Applying entrance pupil", 0.74)
+        self._emit_progress(progress_callback, "Applying entrance pupil", 0.74)
         pupil_mask = self._to_torch_float(
             self.create_circular_pupil_mask(
             tuple(int(v) for v in intensity.shape),
@@ -889,7 +909,7 @@ class CartesianPSFSimulator:
             -size_y / 2, size_y / 2, ny, device=self.device
         )
 
-        emit("Pupil field ready", 1.0)
+        self._emit_progress(progress_callback, "Pupil field ready", 1.0)
         return {
             "input_intensity": self._to_numpy(intensity),
             "intensity_after_gaussian": self._to_numpy(intensity_after_gaussian),
@@ -1393,8 +1413,8 @@ class CartesianPSFSimulator:
         if verbose:
             print("XZ progress: vectorized contraction")
 
-        nz = int(z_coords.numel()) if torch.is_tensor(z_coords) else int(np.asarray(z_coords).size)
-        nx = int(x_coords.numel()) if torch.is_tensor(x_coords) else int(np.asarray(x_coords).size)
+        nz = self._coord_count(z_coords)
+        nx = self._coord_count(x_coords)
         i_xz = torch.empty((nz, nx), dtype=torch.float64, device=self.device)
 
         z_chunk_size = max(1, int(z_chunk_size))
@@ -1422,7 +1442,7 @@ class CartesianPSFSimulator:
             ex = field_chunk[0]
             ey = field_chunk[1]
             ez = field_chunk[2]
-            i_xz[start:end, :] = torch.abs(ex) ** 2 + torch.abs(ey) ** 2 + torch.abs(ez) ** 2
+            i_xz[start:end, :] = self._intensity_from_components(ex, ey, ez)
 
             if progress_callback is not None:
                 progress_callback(float(end) / float(nz))
@@ -1455,8 +1475,8 @@ class CartesianPSFSimulator:
         if verbose:
             print("XY progress: vectorized contraction")
 
-        ny = int(y_coords.numel()) if torch.is_tensor(y_coords) else int(np.asarray(y_coords).size)
-        nx = int(x_coords.numel()) if torch.is_tensor(x_coords) else int(np.asarray(x_coords).size)
+        ny = self._coord_count(y_coords)
+        nx = self._coord_count(x_coords)
         i_xy = torch.empty((ny, nx), dtype=torch.float64, device=self.device)
         y_chunk_size = max(1, int(y_chunk_size))
 
@@ -1474,7 +1494,7 @@ class CartesianPSFSimulator:
                 ex = field_chunk[0]
                 ey = field_chunk[1]
                 ez = field_chunk[2]
-                i_xy[start:end, :] = torch.abs(ex) ** 2 + torch.abs(ey) ** 2 + torch.abs(ez) ** 2
+                i_xy[start:end, :] = self._intensity_from_components(ex, ey, ez)
                 if progress_callback is not None:
                     progress_callback(float(end) / float(ny))
         else:
@@ -1492,7 +1512,7 @@ class CartesianPSFSimulator:
                 ex = field_chunk[0]
                 ey = field_chunk[1]
                 ez = field_chunk[2]
-                i_xy[start:end, :] = torch.abs(ex) ** 2 + torch.abs(ey) ** 2 + torch.abs(ez) ** 2
+                i_xy[start:end, :] = self._intensity_from_components(ex, ey, ez)
                 if progress_callback is not None:
                     progress_callback(float(end) / float(ny))
 
@@ -1520,8 +1540,8 @@ class CartesianPSFSimulator:
         if verbose:
             print("YZ progress: vectorized contraction")
 
-        nz = int(z_coords.numel()) if torch.is_tensor(z_coords) else int(np.asarray(z_coords).size)
-        ny = int(y_coords.numel()) if torch.is_tensor(y_coords) else int(np.asarray(y_coords).size)
+        nz = self._coord_count(z_coords)
+        ny = self._coord_count(y_coords)
         i_yz = torch.empty((nz, ny), dtype=torch.float64, device=self.device)
 
         z_chunk_size = max(1, int(z_chunk_size))
@@ -1549,7 +1569,7 @@ class CartesianPSFSimulator:
             ex = field_chunk[0]
             ey = field_chunk[1]
             ez = field_chunk[2]
-            i_yz[start:end, :] = torch.abs(ex) ** 2 + torch.abs(ey) ** 2 + torch.abs(ez) ** 2
+            i_yz[start:end, :] = self._intensity_from_components(ex, ey, ez)
 
             if progress_callback is not None:
                 progress_callback(float(end) / float(nz))
@@ -1584,9 +1604,9 @@ class CartesianPSFSimulator:
         if axial_by_z is None:
             axial_by_z = self._axial_phase_for_z(z_coords, tables)
 
-        nz = int(z_coords.numel()) if torch.is_tensor(z_coords) else int(np.asarray(z_coords).size)
-        ny = int(y_coords.numel()) if torch.is_tensor(y_coords) else int(np.asarray(y_coords).size)
-        nx = int(x_coords.numel()) if torch.is_tensor(x_coords) else int(np.asarray(x_coords).size)
+        nz = self._coord_count(z_coords)
+        ny = self._coord_count(y_coords)
+        nx = self._coord_count(x_coords)
         i_xyz = torch.empty((nz, ny, nx), dtype=torch.float64, device=self.device)
 
         z_chunk_size = max(1, int(z_chunk_size))
@@ -1637,7 +1657,7 @@ class CartesianPSFSimulator:
                 ex = field_chunk[0]
                 ey = field_chunk[1]
                 ez = field_chunk[2]
-                i_xyz[start:end, :, :] = torch.abs(ex) ** 2 + torch.abs(ey) ** 2 + torch.abs(ez) ** 2
+                i_xyz[start:end, :, :] = self._intensity_from_components(ex, ey, ez)
 
             if verbose:
                 pct = 100.0 * end / nz
@@ -1675,22 +1695,12 @@ class CartesianPSFSimulator:
             range_microns_y=range_microns_y,
             range_microns_z=range_microns_z,
         )
-        x_coords = torch.linspace(
-            -range_x_m, range_x_m, int(num_points), dtype=torch.float64, device=self.device
+        x_coords, y_coords, z_coords = self._make_scan_coords(
+            range_x_m, range_y_m, range_z_m, num_points
         )
-        y_coords = torch.linspace(
-            -range_y_m, range_y_m, int(num_points), dtype=torch.float64, device=self.device
-        )
-        z_coords = torch.linspace(
-            -range_z_m, range_z_m, int(num_points), dtype=torch.float64, device=self.device
-        )
-
-        def emit(stage, frac):
-            if progress_callback is not None:
-                progress_callback(stage, float(min(1.0, max(0.0, frac))))
 
         self._check_stop(stop_callback)
-        emit("Preparing 3D integration tables", 0.0)
+        self._emit_progress(progress_callback, "Preparing 3D integration tables", 0.0)
         tables = self._prepare_integration_tables(
             pupil_field,
             size_x=size_x,
@@ -1717,7 +1727,7 @@ class CartesianPSFSimulator:
         total_ops = max(1.0, table_ops + vol_ops + post_ops)
 
         self._check_stop(stop_callback)
-        emit("Computing 3D volume", table_ops / total_ops)
+        self._emit_progress(progress_callback, "Computing 3D volume", table_ops / total_ops)
 
         i_xyz = self._compute_xyz_volume(
             x_coords=x_coords,
@@ -1726,7 +1736,8 @@ class CartesianPSFSimulator:
             tables=tables,
             z_chunk_size=z_chunk_size,
             verbose=verbose,
-            progress_callback=lambda f: emit(
+            progress_callback=lambda f: self._emit_progress(
+                progress_callback,
                 "Computing 3D volume", (table_ops + vol_ops * float(f)) / total_ops
             ),
             stop_callback=stop_callback,
@@ -1736,7 +1747,7 @@ class CartesianPSFSimulator:
             axial_by_z=axial_by_z,
         )
         self._check_stop(stop_callback)
-        emit("Extracting 3D slices", (table_ops + vol_ops) / total_ops)
+        self._emit_progress(progress_callback, "Extracting 3D slices", (table_ops + vol_ops) / total_ops)
         i_xyz_norm = self._normalize_intensity(i_xyz.clone())
 
         max_flat_idx = int(torch.argmax(i_xyz).item())
@@ -1773,7 +1784,7 @@ class CartesianPSFSimulator:
             i_xy_norm=i_xy_norm_np,
             i_xz_norm=i_xz_norm_np,
         )
-        emit("Finalizing 3D results", 1.0)
+        self._emit_progress(progress_callback, "Finalizing 3D results", 1.0)
 
         return {
             "x_coords": x_coords_np,
@@ -1835,22 +1846,12 @@ class CartesianPSFSimulator:
             range_microns_y=range_microns_y,
             range_microns_z=range_microns_z,
         )
-        x_coords = torch.linspace(
-            -range_x_m, range_x_m, int(num_points), dtype=torch.float64, device=self.device
+        x_coords, y_coords, z_coords = self._make_scan_coords(
+            range_x_m, range_y_m, range_z_m, num_points
         )
-        y_coords = torch.linspace(
-            -range_y_m, range_y_m, int(num_points), dtype=torch.float64, device=self.device
-        )
-        z_coords = torch.linspace(
-            -range_z_m, range_z_m, int(num_points), dtype=torch.float64, device=self.device
-        )
-
-        def emit(stage, frac):
-            if progress_callback is not None:
-                progress_callback(stage, float(min(1.0, max(0.0, frac))))
 
         self._check_stop(stop_callback)
-        emit("Preparing 2D integration tables", 0.0)
+        self._emit_progress(progress_callback, "Preparing 2D integration tables", 0.0)
         tables = self._prepare_integration_tables(
             pupil_field,
             size_x=size_x,
@@ -1891,13 +1892,17 @@ class CartesianPSFSimulator:
 
         if compute_xz:
             self._check_stop(stop_callback)
-            emit("Computing XZ plane", done / total)
+            self._emit_progress(progress_callback, "Computing XZ plane", done / total)
             i_xz = self._compute_xz_plane(
                 x_coords,
                 z_coords,
                 tables,
                 verbose=verbose,
-                progress_callback=lambda f: emit("Computing XZ plane", (done + w_xz * float(f)) / total),
+                progress_callback=lambda f: self._emit_progress(
+                    progress_callback,
+                    "Computing XZ plane",
+                    (done + w_xz * float(f)) / total,
+                ),
                 stop_callback=stop_callback,
                 weighted_components=weighted_components,
                 exp_x=exp_x,
@@ -1912,13 +1917,17 @@ class CartesianPSFSimulator:
         # so z_focus can be inferred without computing the full XZ plane.
         if compute_yz and ((not compute_xy) or (z_focus is None)):
             self._check_stop(stop_callback)
-            emit("Computing YZ plane", done / total)
+            self._emit_progress(progress_callback, "Computing YZ plane", done / total)
             i_yz = self._compute_yz_plane(
                 y_coords,
                 z_coords,
                 tables,
                 verbose=verbose,
-                progress_callback=lambda f: emit("Computing YZ plane", (done + w_yz * float(f)) / total),
+                progress_callback=lambda f: self._emit_progress(
+                    progress_callback,
+                    "Computing YZ plane",
+                    (done + w_yz * float(f)) / total,
+                ),
                 stop_callback=stop_callback,
                 weighted_components=weighted_components,
                 exp_y=exp_y,
@@ -1953,14 +1962,18 @@ class CartesianPSFSimulator:
                 max_i_z = int(torch.argmin(torch.abs(z_coords - z_focus)).item())
 
             self._check_stop(stop_callback)
-            emit("Computing XY plane", done / total)
+            self._emit_progress(progress_callback, "Computing XY plane", done / total)
             i_xy = self._compute_xy_plane(
                 x_coords,
                 y_coords,
                 z_focus,
                 tables,
                 verbose=verbose,
-                progress_callback=lambda f: emit("Computing XY plane", (done + w_xy * float(f)) / total),
+                progress_callback=lambda f: self._emit_progress(
+                    progress_callback,
+                    "Computing XY plane",
+                    (done + w_xy * float(f)) / total,
+                ),
                 stop_callback=stop_callback,
                 weighted_components=weighted_components,
                 exp_x=exp_x,
@@ -1972,13 +1985,17 @@ class CartesianPSFSimulator:
         # If YZ has not yet been computed but is requested, do it now.
         if compute_yz and (i_yz is None):
             self._check_stop(stop_callback)
-            emit("Computing YZ plane", done / total)
+            self._emit_progress(progress_callback, "Computing YZ plane", done / total)
             i_yz = self._compute_yz_plane(
                 y_coords,
                 z_coords,
                 tables,
                 verbose=verbose,
-                progress_callback=lambda f: emit("Computing YZ plane", (done + w_yz * float(f)) / total),
+                progress_callback=lambda f: self._emit_progress(
+                    progress_callback,
+                    "Computing YZ plane",
+                    (done + w_yz * float(f)) / total,
+                ),
                 stop_callback=stop_callback,
                 weighted_components=weighted_components,
                 exp_y=exp_y,
@@ -2028,7 +2045,7 @@ class CartesianPSFSimulator:
                 "z_profile_at_x0": None,
             }
         done += w_post
-        emit("Finalizing 2D results", 1.0)
+        self._emit_progress(progress_callback, "Finalizing 2D results", 1.0)
 
         return {
             "x_coords": x_coords_np,
@@ -2074,10 +2091,6 @@ class CartesianPSFSimulator:
         progress_callback=None,
         stop_callback=None,
     ):
-        def emit(stage, frac):
-            if progress_callback is not None:
-                progress_callback(stage, float(min(1.0, max(0.0, frac))))
-
         in_arr = np.asarray(input_intensity)
         if in_arr.ndim != 2:
             raise ValueError("input_intensity must be a 2D array.")
@@ -2096,7 +2109,7 @@ class CartesianPSFSimulator:
         total_est = max(1.0, prep_est + psf_est)
         prep_share = prep_est / total_est
 
-        emit("Preparing pupil field", 0.0)
+        self._emit_progress(progress_callback, "Preparing pupil field", 0.0)
         prep = self.prepare_pupil_field_from_input(
             input_intensity=input_intensity,
             size_x=size_x,
@@ -2109,13 +2122,14 @@ class CartesianPSFSimulator:
             custom_mask=custom_mask,
             ring_inner_diameter=ring_inner_diameter,
             ring_outer_diameter=ring_outer_diameter,
-            progress_callback=lambda stage, frac: emit(
+            progress_callback=lambda stage, frac: self._emit_progress(
+                progress_callback,
                 f"Pupil prep: {stage}", prep_share * float(frac)
             ),
             stop_callback=stop_callback,
         )
 
-        emit("Computing PSF planes", prep_share)
+        self._emit_progress(progress_callback, "Computing PSF planes", prep_share)
         pupil_field_for_psf = prep.get("field_at_pupil_for_psf", prep["field_at_pupil"])
         size_x_for_psf = float(prep.get("size_x_for_psf", size_x))
         size_y_for_psf = float(prep.get("size_y_for_psf", size_y))
@@ -2130,14 +2144,15 @@ class CartesianPSFSimulator:
             range_microns_z=range_microns_z,
             num_points=num_points,
             verbose=verbose,
-            progress_callback=lambda stage, frac: emit(
+            progress_callback=lambda stage, frac: self._emit_progress(
+                progress_callback,
                 f"PSF planes: {stage}", prep_share + (1.0 - prep_share) * float(frac)
             ),
             stop_callback=stop_callback,
         )
 
         psf_results.update(prep)
-        emit("Done", 1.0)
+        self._emit_progress(progress_callback, "Done", 1.0)
 
         return psf_results
 
@@ -2300,14 +2315,8 @@ class AxialSymmetricPSFSimulator(CartesianPSFSimulator):
             range_microns_y=range_microns_y,
             range_microns_z=range_microns_z,
         )
-        x_coords = torch.linspace(
-            -range_x_m, range_x_m, int(num_points), dtype=torch.float64, device=self.device
-        )
-        y_coords = torch.linspace(
-            -range_y_m, range_y_m, int(num_points), dtype=torch.float64, device=self.device
-        )
-        z_coords = torch.linspace(
-            -range_z_m, range_z_m, int(num_points), dtype=torch.float64, device=self.device
+        x_coords, y_coords, z_coords = self._make_scan_coords(
+            range_x_m, range_y_m, range_z_m, num_points
         )
 
         theta = torch.linspace(

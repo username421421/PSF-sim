@@ -1725,79 +1725,15 @@ class PSFSimulatorApp:
         best = values.get("best_metrics_um")
         baseline = values.get("baseline_metrics_um")
         best_obj = values.get("best_objective")
-        if (
-            isinstance(best, dict)
-            and isinstance(baseline, dict)
-            and best_obj is not None
-            and all(k in best for k in ("width_x_um", "width_y_um", "width_z_um"))
-            and all(k in baseline for k in ("width_x_um", "width_y_um", "width_z_um"))
-        ):
-            try:
-                ring_line = ""
-                settings = values.get("settings") if isinstance(values, dict) else None
-                if isinstance(settings, dict):
-                    bstruct = str(settings.get("binary_structure", "")).strip().lower()
-                    rin_mm = settings.get("ring_inner_radius_mm")
-                    rout_mm = settings.get("ring_outer_radius_mm")
-                    if (
-                        bstruct == "simple_ring_block"
-                        and rin_mm is not None
-                        and rout_mm is not None
-                        and np.isfinite(float(rin_mm))
-                        and np.isfinite(float(rout_mm))
-                    ):
-                        ring_line = (
-                            f"\nRing block radii (mm): "
-                            f"inner={float(rin_mm):.4f}, outer={float(rout_mm):.4f}"
-                        )
-                    if (
-                        bstruct == "simple_ellipse_block"
-                        and settings.get("ellipse_inner_diameter_x_mm") is not None
-                        and settings.get("ellipse_inner_diameter_y_mm") is not None
-                        and settings.get("ellipse_outer_diameter_x_mm") is not None
-                        and settings.get("ellipse_outer_diameter_y_mm") is not None
-                        and np.isfinite(float(settings.get("ellipse_inner_diameter_x_mm")))
-                        and np.isfinite(float(settings.get("ellipse_inner_diameter_y_mm")))
-                        and np.isfinite(float(settings.get("ellipse_outer_diameter_x_mm")))
-                        and np.isfinite(float(settings.get("ellipse_outer_diameter_y_mm")))
-                    ):
-                        ring_line = (
-                            "\nEllipse ring diameters (mm): "
-                            f"inner=({float(settings.get('ellipse_inner_diameter_x_mm')):.4f}, "
-                            f"{float(settings.get('ellipse_inner_diameter_y_mm')):.4f}), "
-                            f"outer=({float(settings.get('ellipse_outer_diameter_x_mm')):.4f}, "
-                            f"{float(settings.get('ellipse_outer_diameter_y_mm')):.4f})"
-                        )
-                    elif (
-                        bstruct == "simple_ellipse_block"
-                        and settings.get("ellipse_radius_x_mm") is not None
-                        and settings.get("ellipse_radius_y_mm") is not None
-                        and np.isfinite(float(settings.get("ellipse_radius_x_mm")))
-                        and np.isfinite(float(settings.get("ellipse_radius_y_mm")))
-                    ):
-                        ring_line = (
-                            f"\nEllipse block radii (mm): "
-                            f"x={float(settings.get('ellipse_radius_x_mm')):.4f}, "
-                            f"y={float(settings.get('ellipse_radius_y_mm')):.4f}"
-                        )
-                abs_before = abs(float(baseline["width_x_um"]) - float(baseline["width_y_um"]))
-                abs_after = abs(float(best["width_x_um"]) - float(best["width_y_um"]))
-                self.opt_summary_var.set(
-                    "Last optimization (loaded)\n"
-                    "Before (um): "
-                    f"X={float(baseline['width_x_um']):.4f}, "
-                    f"Y={float(baseline['width_y_um']):.4f}, "
-                    f"Z={float(baseline['width_z_um']):.4f}\n"
-                    "After (um): "
-                    f"X={float(best['width_x_um']):.4f}, "
-                    f"Y={float(best['width_y_um']):.4f}, "
-                    f"Z={float(best['width_z_um']):.4f}\n"
-                    f"abs(x-y) (um): {abs_before:.4f} -> {abs_after:.4f}\n"
-                    f"Objective: {float(best_obj):.6f}"
-                    f"{ring_line}"
-                )
-            except Exception:
-                pass
+        formatted = self._format_optimizer_summary(
+            baseline,
+            best,
+            best_obj,
+            settings=values.get("settings"),
+            title="Last optimization (loaded)",
+        )
+        if formatted is not None:
+            self.opt_summary_var.set(formatted)
 
     def _set_var_if_present(self, params, key, var, cast, scale=1.0):
         if key not in params:
@@ -1809,6 +1745,155 @@ class PSFSimulatorApp:
             var.set(value)
         except Exception:
             return
+
+    @staticmethod
+    def _finite_float_or_none(value):
+        if value is None:
+            return None
+        try:
+            value = float(value)
+        except Exception:
+            return None
+        return value if np.isfinite(value) else None
+
+    def _set_bool_var_if_present(self, values, key, var):
+        if key not in values:
+            return
+        try:
+            var.set(bool(values[key]))
+        except Exception:
+            return
+
+    def _set_choice_var_if_valid(self, values, key, var, valid_values, lowercase=False):
+        if key not in values:
+            return
+        try:
+            choice = str(values[key]).strip()
+        except Exception:
+            return
+        if lowercase:
+            choice = choice.lower()
+        if choice in valid_values:
+            var.set(choice)
+
+    def _apply_value_specs(self, values, specs):
+        for key, var, cast, scale in specs:
+            self._set_var_if_present(values, key, var, cast, scale)
+
+    def _apply_axis_range_values(self, values):
+        loaded_axis_range = False
+        for key, var in (
+            ("range_x_um", self.range_x_um_var),
+            ("range_y_um", self.range_y_um_var),
+            ("range_z_um", self.range_z_um_var),
+        ):
+            if key in values:
+                self._set_var_if_present(values, key, var, float, 1.0)
+                loaded_axis_range = True
+        if loaded_axis_range:
+            return
+
+        r_um = self._finite_float_or_none(values.get("range_um"))
+        if r_um is None:
+            return
+        self.range_x_um_var.set(r_um)
+        self.range_y_um_var.set(r_um)
+        self.range_z_um_var.set(r_um)
+
+    def _optimizer_structure_summary_line(self, settings, params=None):
+        if not isinstance(settings, dict):
+            return ""
+
+        bstruct = str(settings.get("binary_structure", "")).strip().lower()
+        if bstruct == "simple_ring_block":
+            inner_mm = self._finite_float_or_none(settings.get("ring_inner_radius_mm"))
+            outer_mm = self._finite_float_or_none(settings.get("ring_outer_radius_mm"))
+            if inner_mm is None or outer_mm is None:
+                inner_norm = self._finite_float_or_none(settings.get("ring_inner_radius_norm"))
+                outer_norm = self._finite_float_or_none(settings.get("ring_outer_radius_norm"))
+                pupil_d = None
+                if isinstance(params, dict):
+                    pupil_d = self._finite_float_or_none(params.get("pupil_d"))
+                if inner_norm is None or outer_norm is None or pupil_d is None:
+                    return ""
+                pupil_radius_mm = 0.5 * pupil_d * 1e3
+                inner_mm = inner_norm * pupil_radius_mm
+                outer_mm = outer_norm * pupil_radius_mm
+            return f"\nRing block radii (mm): inner={inner_mm:.4f}, outer={outer_mm:.4f}"
+
+        if bstruct != "simple_ellipse_block":
+            return ""
+
+        ellipse_mm = tuple(
+            self._finite_float_or_none(settings.get(key))
+            for key in (
+                "ellipse_inner_diameter_x_mm",
+                "ellipse_inner_diameter_y_mm",
+                "ellipse_outer_diameter_x_mm",
+                "ellipse_outer_diameter_y_mm",
+            )
+        )
+        if all(value is not None for value in ellipse_mm):
+            inner_x_mm, inner_y_mm, outer_x_mm, outer_y_mm = ellipse_mm
+            return (
+                "\nEllipse ring diameters (mm): "
+                f"inner=({inner_x_mm:.4f}, {inner_y_mm:.4f}), "
+                f"outer=({outer_x_mm:.4f}, {outer_y_mm:.4f})"
+            )
+
+        radius_x_mm = self._finite_float_or_none(settings.get("ellipse_radius_x_mm"))
+        radius_y_mm = self._finite_float_or_none(settings.get("ellipse_radius_y_mm"))
+        if radius_x_mm is None or radius_y_mm is None:
+            return ""
+        return (
+            "\nEllipse block radii (mm): "
+            f"x={radius_x_mm:.4f}, y={radius_y_mm:.4f}"
+        )
+
+    def _format_optimizer_summary(
+        self,
+        before,
+        after,
+        objective,
+        *,
+        settings=None,
+        params=None,
+        title="",
+    ):
+        if not isinstance(before, dict) or not isinstance(after, dict):
+            return None
+        keys = ("width_x_um", "width_y_um", "width_z_um")
+        if not all(key in before for key in keys) or not all(key in after for key in keys):
+            return None
+
+        try:
+            abs_before = abs(float(before["width_x_um"]) - float(before["width_y_um"]))
+            abs_after = abs(float(after["width_x_um"]) - float(after["width_y_um"]))
+            title_prefix = "" if title == "" else f"{title}\n"
+            return (
+                f"{title_prefix}"
+                "Before (um): "
+                f"X={float(before['width_x_um']):.4f}, "
+                f"Y={float(before['width_y_um']):.4f}, "
+                f"Z={float(before['width_z_um']):.4f}\n"
+                "After (um): "
+                f"X={float(after['width_x_um']):.4f}, "
+                f"Y={float(after['width_y_um']):.4f}, "
+                f"Z={float(after['width_z_um']):.4f}\n"
+                f"abs(x-y) (um): {abs_before:.4f} -> {abs_after:.4f}\n"
+                f"Objective: {float(objective):.6f}"
+                f"{self._optimizer_structure_summary_line(settings, params=params)}"
+            )
+        except Exception:
+            return None
+
+    @staticmethod
+    def _pyvista_unavailable_message():
+        backend_error = PYVISTA_IMPORT_ERROR if not HAS_PYVISTA else PYVISTA_QT_IMPORT_ERROR
+        message = "PyVista window rendering is unavailable."
+        if backend_error:
+            message = f"{message} {backend_error}"
+        return message
 
     def _collect_objective_lens_values(self):
         return {
@@ -1976,61 +2061,46 @@ class PSFSimulatorApp:
         if not isinstance(values, dict):
             raise ValueError("values must be a dictionary.")
 
-        self._set_var_if_present(values, "wavelength_nm", self.wavelength_nm_var, float, 1.0)
-        self._set_var_if_present(values, "NA", self.na_var, float, 1.0)
-        self._set_var_if_present(values, "theta_samples", self.theta_samples_var, int, 1.0)
-        self._set_var_if_present(values, "phi_samples", self.phi_samples_var, int, 1.0)
-
-        if "torch_device" in values:
-            dev = str(values["torch_device"]).strip().lower()
-            if dev in {"auto", "cpu", "cuda"}:
-                self.torch_device_var.set(dev)
-
-        self._set_var_if_present(values, "nx", self.nx_var, int, 1.0)
-        self._set_var_if_present(values, "ny", self.ny_var, int, 1.0)
-        self._set_var_if_present(values, "size_x_mm", self.size_x_mm_var, float, 1.0)
-        self._set_var_if_present(values, "size_y_mm", self.size_y_mm_var, float, 1.0)
-        self._set_var_if_present(values, "pupil_d_mm", self.pupil_d_mm_var, float, 1.0)
-        self._set_var_if_present(values, "fresnel_z_m", self.fresnel_z_m_var, float, 1.0)
-        loaded_axis_range = False
-        if "range_x_um" in values:
-            self._set_var_if_present(values, "range_x_um", self.range_x_um_var, float, 1.0)
-            loaded_axis_range = True
-        if "range_y_um" in values:
-            self._set_var_if_present(values, "range_y_um", self.range_y_um_var, float, 1.0)
-            loaded_axis_range = True
-        if "range_z_um" in values:
-            self._set_var_if_present(values, "range_z_um", self.range_z_um_var, float, 1.0)
-            loaded_axis_range = True
-        if (not loaded_axis_range) and ("range_um" in values):
-            try:
-                r_um = float(values["range_um"])
-                if np.isfinite(r_um):
-                    self.range_x_um_var.set(r_um)
-                    self.range_y_um_var.set(r_um)
-                    self.range_z_um_var.set(r_um)
-            except Exception:
-                pass
-        self._set_var_if_present(values, "points_2d", self.points_2d_var, int, 1.0)
-        self._set_var_if_present(values, "points_3d", self.points_3d_var, int, 1.0)
-        self._set_var_if_present(values, "z_chunk", self.z_chunk_var, int, 1.0)
-
-        self._set_var_if_present(values, "n_i", self.exp_immersion_ri_var, float, 1.0)
-        self._set_var_if_present(values, "n_g", self.exp_coverslip_ri_var, float, 1.0)
-        self._set_var_if_present(values, "t_g_um", self.exp_coverslip_thickness_um_var, float, 1.0)
-        self._set_var_if_present(values, "n_s", self.exp_resin_ri_var, float, 1.0)
-        self._set_var_if_present(values, "t_s_um", self.exp_resin_thickness_um_var, float, 1.0)
-        self._set_var_if_present(values, "n_id", self.design_immersion_ri_var, float, 1.0)
-        self._set_var_if_present(values, "n_gd", self.design_coverslip_ri_var, float, 1.0)
-        self._set_var_if_present(values, "t_gd_um", self.design_coverslip_thickness_um_var, float, 1.0)
-        self._set_var_if_present(values, "n_sd", self.design_resin_ri_var, float, 1.0)
-
-        if "use_gaussian" in values:
-            self.use_gaussian_var.set(bool(values["use_gaussian"]))
-        self._set_var_if_present(values, "gauss_wx_mm", self.gauss_wx_mm_var, float, 1.0)
-        self._set_var_if_present(values, "gauss_wy_mm", self.gauss_wy_mm_var, float, 1.0)
-        self._set_var_if_present(values, "mask_offset_x_mm", self.mask_offset_x_mm_var, float, 1.0)
-        self._set_var_if_present(values, "mask_offset_y_mm", self.mask_offset_y_mm_var, float, 1.0)
+        self._apply_value_specs(
+            values,
+            (
+                ("wavelength_nm", self.wavelength_nm_var, float, 1.0),
+                ("NA", self.na_var, float, 1.0),
+                ("theta_samples", self.theta_samples_var, int, 1.0),
+                ("phi_samples", self.phi_samples_var, int, 1.0),
+                ("nx", self.nx_var, int, 1.0),
+                ("ny", self.ny_var, int, 1.0),
+                ("size_x_mm", self.size_x_mm_var, float, 1.0),
+                ("size_y_mm", self.size_y_mm_var, float, 1.0),
+                ("pupil_d_mm", self.pupil_d_mm_var, float, 1.0),
+                ("fresnel_z_m", self.fresnel_z_m_var, float, 1.0),
+                ("points_2d", self.points_2d_var, int, 1.0),
+                ("points_3d", self.points_3d_var, int, 1.0),
+                ("z_chunk", self.z_chunk_var, int, 1.0),
+                ("n_i", self.exp_immersion_ri_var, float, 1.0),
+                ("n_g", self.exp_coverslip_ri_var, float, 1.0),
+                ("t_g_um", self.exp_coverslip_thickness_um_var, float, 1.0),
+                ("n_s", self.exp_resin_ri_var, float, 1.0),
+                ("t_s_um", self.exp_resin_thickness_um_var, float, 1.0),
+                ("n_id", self.design_immersion_ri_var, float, 1.0),
+                ("n_gd", self.design_coverslip_ri_var, float, 1.0),
+                ("t_gd_um", self.design_coverslip_thickness_um_var, float, 1.0),
+                ("n_sd", self.design_resin_ri_var, float, 1.0),
+                ("gauss_wx_mm", self.gauss_wx_mm_var, float, 1.0),
+                ("gauss_wy_mm", self.gauss_wy_mm_var, float, 1.0),
+                ("mask_offset_x_mm", self.mask_offset_x_mm_var, float, 1.0),
+                ("mask_offset_y_mm", self.mask_offset_y_mm_var, float, 1.0),
+            ),
+        )
+        self._set_choice_var_if_valid(
+            values,
+            "torch_device",
+            self.torch_device_var,
+            {"auto", "cpu", "cuda"},
+            lowercase=True,
+        )
+        self._apply_axis_range_values(values)
+        self._set_bool_var_if_present(values, "use_gaussian", self.use_gaussian_var)
 
         self._update_sampling_info()
         self._refresh_mask_input_preview()
@@ -2061,38 +2131,36 @@ class PSFSimulatorApp:
             self.opt_optimizer_category_var.set(category)
         self._sync_optimizer_combo_to_category(preferred_optimizer=opt_name)
 
-        mode = str(values.get("mode", self.opt_mode_var.get())).strip().lower()
-        if mode in {"amplitude", "phase", "amplitude_phase"}:
-            self.opt_mode_var.set(mode)
-        if "axial_symmetry" in values:
-            try:
-                self.opt_axial_symmetry_var.set(bool(values["axial_symmetry"]))
-            except Exception:
-                pass
-        if "binary_amplitude" in values:
-            try:
-                self.opt_binary_amplitude_var.set(bool(values["binary_amplitude"]))
-            except Exception:
-                pass
-        if "binary_structure" in values:
-            try:
-                bstruct = str(values["binary_structure"]).strip().lower()
-                if bstruct in {"pixel", "simple_ring_block", "simple_ellipse_block"}:
-                    self.opt_binary_structure_var.set(bstruct)
-            except Exception:
-                pass
-
-        self._set_var_if_present(values, "width_level", self.opt_width_level_var, float, 1.0)
-        self._set_var_if_present(values, "weight_x", self.opt_weight_x_var, float, 1.0)
-        self._set_var_if_present(values, "weight_y", self.opt_weight_y_var, float, 1.0)
-        self._set_var_if_present(values, "weight_z", self.opt_weight_z_var, float, 1.0)
-        self._set_var_if_present(values, "weight_abs_xy", self.opt_weight_abs_xy_var, float, 1.0)
-
-        self._set_var_if_present(values, "n_starts", self.opt_n_starts_var, int, 1.0)
-        self._set_var_if_present(values, "maxiter", self.opt_maxiter_var, int, 1.0)
-        self._set_var_if_present(values, "ftol", self.opt_ftol_var, float, 1.0)
-        self._set_var_if_present(values, "gtol", self.opt_gtol_var, float, 1.0)
-
+        self._set_choice_var_if_valid(
+            values,
+            "mode",
+            self.opt_mode_var,
+            {"amplitude", "phase", "amplitude_phase"},
+            lowercase=True,
+        )
+        self._set_bool_var_if_present(values, "axial_symmetry", self.opt_axial_symmetry_var)
+        self._set_bool_var_if_present(values, "binary_amplitude", self.opt_binary_amplitude_var)
+        self._set_choice_var_if_valid(
+            values,
+            "binary_structure",
+            self.opt_binary_structure_var,
+            {"pixel", "simple_ring_block", "simple_ellipse_block"},
+            lowercase=True,
+        )
+        self._apply_value_specs(
+            values,
+            (
+                ("width_level", self.opt_width_level_var, float, 1.0),
+                ("weight_x", self.opt_weight_x_var, float, 1.0),
+                ("weight_y", self.opt_weight_y_var, float, 1.0),
+                ("weight_z", self.opt_weight_z_var, float, 1.0),
+                ("weight_abs_xy", self.opt_weight_abs_xy_var, float, 1.0),
+                ("n_starts", self.opt_n_starts_var, int, 1.0),
+                ("maxiter", self.opt_maxiter_var, int, 1.0),
+                ("ftol", self.opt_ftol_var, float, 1.0),
+                ("gtol", self.opt_gtol_var, float, 1.0),
+            ),
+        )
         if "seed" in values:
             try:
                 self.opt_seed_var.set(str(values["seed"]).strip())
@@ -2105,68 +2173,46 @@ class PSFSimulatorApp:
         if not isinstance(params, dict):
             raise ValueError("params must be a dictionary.")
 
-        self._set_var_if_present(params, "wavelength", self.wavelength_nm_var, float, 1e9)
-        self._set_var_if_present(params, "NA", self.na_var, float, 1.0)
-        self._set_var_if_present(params, "theta_samples", self.theta_samples_var, int, 1.0)
-        self._set_var_if_present(params, "phi_samples", self.phi_samples_var, int, 1.0)
-
-        if "torch_device" in params:
-            try:
-                dev = str(params["torch_device"]).strip().lower()
-                if dev in {"auto", "cpu", "cuda"}:
-                    self.torch_device_var.set(dev)
-            except Exception:
-                pass
-
-        self._set_var_if_present(params, "nx", self.nx_var, int, 1.0)
-        self._set_var_if_present(params, "ny", self.ny_var, int, 1.0)
-        self._set_var_if_present(params, "size_x", self.size_x_mm_var, float, 1e3)
-        self._set_var_if_present(params, "size_y", self.size_y_mm_var, float, 1e3)
-        self._set_var_if_present(params, "pupil_d", self.pupil_d_mm_var, float, 1e3)
-        self._set_var_if_present(params, "fresnel_z", self.fresnel_z_m_var, float, 1.0)
-        loaded_axis_range = False
-        if "range_x_um" in params:
-            self._set_var_if_present(params, "range_x_um", self.range_x_um_var, float, 1.0)
-            loaded_axis_range = True
-        if "range_y_um" in params:
-            self._set_var_if_present(params, "range_y_um", self.range_y_um_var, float, 1.0)
-            loaded_axis_range = True
-        if "range_z_um" in params:
-            self._set_var_if_present(params, "range_z_um", self.range_z_um_var, float, 1.0)
-            loaded_axis_range = True
-        if (not loaded_axis_range) and ("range_um" in params):
-            try:
-                r_um = float(params["range_um"])
-                if np.isfinite(r_um):
-                    self.range_x_um_var.set(r_um)
-                    self.range_y_um_var.set(r_um)
-                    self.range_z_um_var.set(r_um)
-            except Exception:
-                pass
-        self._set_var_if_present(params, "points_2d", self.points_2d_var, int, 1.0)
-        self._set_var_if_present(params, "points_3d", self.points_3d_var, int, 1.0)
-        self._set_var_if_present(params, "z_chunk", self.z_chunk_var, int, 1.0)
-
-        self._set_var_if_present(params, "n_i", self.exp_immersion_ri_var, float, 1.0)
-        self._set_var_if_present(params, "n_g", self.exp_coverslip_ri_var, float, 1.0)
-        self._set_var_if_present(params, "t_g", self.exp_coverslip_thickness_um_var, float, 1e6)
-        self._set_var_if_present(params, "n_s", self.exp_resin_ri_var, float, 1.0)
-        self._set_var_if_present(params, "t_s", self.exp_resin_thickness_um_var, float, 1e6)
-
-        self._set_var_if_present(params, "n_id", self.design_immersion_ri_var, float, 1.0)
-        self._set_var_if_present(params, "n_gd", self.design_coverslip_ri_var, float, 1.0)
-        self._set_var_if_present(params, "t_gd", self.design_coverslip_thickness_um_var, float, 1e6)
-        self._set_var_if_present(params, "n_sd", self.design_resin_ri_var, float, 1.0)
-
-        if "use_gaussian" in params:
-            try:
-                self.use_gaussian_var.set(bool(params["use_gaussian"]))
-            except Exception:
-                pass
-        self._set_var_if_present(params, "gauss_wx", self.gauss_wx_mm_var, float, 1e3)
-        self._set_var_if_present(params, "gauss_wy", self.gauss_wy_mm_var, float, 1e3)
-        self._set_var_if_present(params, "mask_offset_x", self.mask_offset_x_mm_var, float, 1e3)
-        self._set_var_if_present(params, "mask_offset_y", self.mask_offset_y_mm_var, float, 1e3)
+        self._apply_value_specs(
+            params,
+            (
+                ("wavelength", self.wavelength_nm_var, float, 1e9),
+                ("NA", self.na_var, float, 1.0),
+                ("theta_samples", self.theta_samples_var, int, 1.0),
+                ("phi_samples", self.phi_samples_var, int, 1.0),
+                ("nx", self.nx_var, int, 1.0),
+                ("ny", self.ny_var, int, 1.0),
+                ("size_x", self.size_x_mm_var, float, 1e3),
+                ("size_y", self.size_y_mm_var, float, 1e3),
+                ("pupil_d", self.pupil_d_mm_var, float, 1e3),
+                ("fresnel_z", self.fresnel_z_m_var, float, 1.0),
+                ("points_2d", self.points_2d_var, int, 1.0),
+                ("points_3d", self.points_3d_var, int, 1.0),
+                ("z_chunk", self.z_chunk_var, int, 1.0),
+                ("n_i", self.exp_immersion_ri_var, float, 1.0),
+                ("n_g", self.exp_coverslip_ri_var, float, 1.0),
+                ("t_g", self.exp_coverslip_thickness_um_var, float, 1e6),
+                ("n_s", self.exp_resin_ri_var, float, 1.0),
+                ("t_s", self.exp_resin_thickness_um_var, float, 1e6),
+                ("n_id", self.design_immersion_ri_var, float, 1.0),
+                ("n_gd", self.design_coverslip_ri_var, float, 1.0),
+                ("t_gd", self.design_coverslip_thickness_um_var, float, 1e6),
+                ("n_sd", self.design_resin_ri_var, float, 1.0),
+                ("gauss_wx", self.gauss_wx_mm_var, float, 1e3),
+                ("gauss_wy", self.gauss_wy_mm_var, float, 1e3),
+                ("mask_offset_x", self.mask_offset_x_mm_var, float, 1e3),
+                ("mask_offset_y", self.mask_offset_y_mm_var, float, 1e3),
+            ),
+        )
+        self._set_choice_var_if_valid(
+            params,
+            "torch_device",
+            self.torch_device_var,
+            {"auto", "cpu", "cuda"},
+            lowercase=True,
+        )
+        self._apply_axis_range_values(params)
+        self._set_bool_var_if_present(params, "use_gaussian", self.use_gaussian_var)
 
         self._update_sampling_info()
         self._refresh_mask_input_preview()
@@ -2931,71 +2977,15 @@ class PSFSimulatorApp:
         self.opt_result = result
         self.opt_last_params = self._clone_payload(params)
 
-        before = result.baseline_metrics_um
-        after = result.best_metrics_um
-        ring_line = ""
-        try:
-            bstruct = str(result.settings.get("binary_structure", "")).strip().lower()
-            rin_mm = result.settings.get("ring_inner_radius_mm")
-            rout_mm = result.settings.get("ring_outer_radius_mm")
-            if (
-                bstruct == "simple_ring_block"
-                and rin_mm is not None
-                and rout_mm is not None
-                and np.isfinite(float(rin_mm))
-                and np.isfinite(float(rout_mm))
-            ):
-                ring_line = (
-                    f"\nRing block radii (mm): "
-                    f"inner={float(rin_mm):.4f}, outer={float(rout_mm):.4f}"
-                )
-            elif bstruct == "simple_ring_block":
-                rin = result.settings.get("ring_inner_radius_norm")
-                rout = result.settings.get("ring_outer_radius_norm")
-                if (
-                    rin is not None
-                    and rout is not None
-                    and np.isfinite(float(rin))
-                    and np.isfinite(float(rout))
-                ):
-                    pr_mm = 0.5 * float(params["pupil_d"]) * 1e3
-                    ring_line = (
-                        f"\nRing block radii (mm): "
-                        f"inner={float(rin)*pr_mm:.4f}, outer={float(rout)*pr_mm:.4f}"
-                    )
-            elif bstruct == "simple_ellipse_block":
-                einx_mm = result.settings.get("ellipse_inner_diameter_x_mm")
-                einy_mm = result.settings.get("ellipse_inner_diameter_y_mm")
-                eoutx_mm = result.settings.get("ellipse_outer_diameter_x_mm")
-                eouty_mm = result.settings.get("ellipse_outer_diameter_y_mm")
-                if (
-                    einx_mm is not None
-                    and einy_mm is not None
-                    and eoutx_mm is not None
-                    and eouty_mm is not None
-                    and np.isfinite(float(einx_mm))
-                    and np.isfinite(float(einy_mm))
-                    and np.isfinite(float(eoutx_mm))
-                    and np.isfinite(float(eouty_mm))
-                ):
-                    ring_line = (
-                        "\nEllipse ring diameters (mm): "
-                        f"inner=({float(einx_mm):.4f}, {float(einy_mm):.4f}), "
-                        f"outer=({float(eoutx_mm):.4f}, {float(eouty_mm):.4f})"
-                    )
-        except Exception:
-            ring_line = ""
-        abs_before = abs(float(before["width_x_um"]) - float(before["width_y_um"]))
-        abs_after = abs(float(after["width_x_um"]) - float(after["width_y_um"]))
-        self.opt_summary_var.set(
-            "Before (um): "
-            f"X={before['width_x_um']:.4f}, Y={before['width_y_um']:.4f}, Z={before['width_z_um']:.4f}\n"
-            "After (um): "
-            f"X={after['width_x_um']:.4f}, Y={after['width_y_um']:.4f}, Z={after['width_z_um']:.4f}\n"
-            f"abs(x-y) (um): {abs_before:.4f} -> {abs_after:.4f}\n"
-            f"Objective: {result.best_objective:.6f}"
-            f"{ring_line}"
+        formatted = self._format_optimizer_summary(
+            result.baseline_metrics_um,
+            result.best_metrics_um,
+            result.best_objective,
+            settings=result.settings,
+            params=params,
         )
+        if formatted is not None:
+            self.opt_summary_var.set(formatted)
         self._refresh_optimization_plot()
         self._set_opt_progress(100.0, "Optimization completed.", force=True)
         self._set_opt_running(False, "Optimization completed.")
@@ -4139,10 +4129,7 @@ class PSFSimulatorApp:
             self.status_var.set("No 3D result is available to display.")
             return
         if not HAS_PYVISTA_WINDOW:
-            backend_error = PYVISTA_IMPORT_ERROR if not HAS_PYVISTA else PYVISTA_QT_IMPORT_ERROR
-            message = "PyVista window rendering is unavailable."
-            if backend_error:
-                message = f"{message} {backend_error}"
+            message = self._pyvista_unavailable_message()
             messagebox.showerror("PyVista unavailable", message)
             self.status_var.set(message)
             return
@@ -4523,11 +4510,7 @@ class PSFSimulatorApp:
             return
         if not HAS_PYVISTA_WINDOW:
             if show_window:
-                backend_error = PYVISTA_IMPORT_ERROR if not HAS_PYVISTA else PYVISTA_QT_IMPORT_ERROR
-                message = "PyVista window rendering is unavailable."
-                if backend_error:
-                    message = f"{message} {backend_error}"
-                self.status_var.set(message)
+                self.status_var.set(self._pyvista_unavailable_message())
             return
         try:
             self._refresh_3d_plot_pyvista(show_window=show_window)

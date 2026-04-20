@@ -740,6 +740,7 @@ class PostFresnelMaskOptimizer:
         for name in names
     }
     _VALID_BINARY_STRUCTURES = {"pixel", "simple_ring_block", "simple_ellipse_block"}
+
     def __init__(self, simulator: CartesianPSFSimulator, params: Dict[str, Any]):
         self.simulator = simulator
         self.params = dict(params)
@@ -784,6 +785,241 @@ class PostFresnelMaskOptimizer:
             if name in names:
                 return str(category)
         return None
+
+    @staticmethod
+    def _binary_structure_flags(
+        mode: str,
+        binary_amplitude: bool,
+        binary_structure: str,
+    ) -> Tuple[bool, bool, bool]:
+        structure = str(binary_structure).strip().lower()
+        binary_enabled = bool(binary_amplitude) and str(mode).strip().lower() == "amplitude"
+        use_simple_ring = bool(binary_enabled and structure == "simple_ring_block")
+        use_simple_ellipse = bool(binary_enabled and structure == "simple_ellipse_block")
+        use_binary_latent = bool(binary_enabled and (not use_simple_ring) and (not use_simple_ellipse))
+        return use_simple_ring, use_simple_ellipse, use_binary_latent
+
+    def _structure_info_from_vector(
+        self,
+        x_eval: np.ndarray,
+        *,
+        binary_structure: str,
+        use_simple_ring: bool,
+        use_simple_ellipse: bool,
+    ) -> Dict[str, Any]:
+        arr = np.asarray(x_eval, dtype=np.float64).ravel()
+        info: Dict[str, Any] = {
+            "binary_structure": str(binary_structure),
+        }
+        pupil_d_m = float(self.params.get("pupil_d", 0.0))
+        pupil_radius_m = 0.5 * pupil_d_m
+        if use_simple_ring and arr.size >= 2:
+            ring_r_in = float(min(float(arr[0]), float(arr[1])))
+            ring_r_out = float(max(float(arr[0]), float(arr[1])))
+            info.update(
+                {
+                    "ring_inner_radius_norm": ring_r_in,
+                    "ring_outer_radius_norm": ring_r_out,
+                    "ring_inner_radius_m": float(ring_r_in * pupil_radius_m),
+                    "ring_outer_radius_m": float(ring_r_out * pupil_radius_m),
+                    "ring_inner_radius_mm": float(ring_r_in * pupil_radius_m * 1e3),
+                    "ring_outer_radius_mm": float(ring_r_out * pupil_radius_m * 1e3),
+                }
+            )
+        elif use_simple_ellipse and arr.size >= 4:
+            ellipse_inner_dx = float(np.clip(arr[0], 0.0, 1.0))
+            ellipse_inner_dy = float(np.clip(arr[1], 0.0, 1.0))
+            ellipse_outer_dx = float(np.clip(arr[2], 0.0, 1.0))
+            ellipse_outer_dy = float(np.clip(arr[3], 0.0, 1.0))
+            info.update(
+                {
+                    "ellipse_inner_diameter_x_norm": ellipse_inner_dx,
+                    "ellipse_inner_diameter_y_norm": ellipse_inner_dy,
+                    "ellipse_outer_diameter_x_norm": ellipse_outer_dx,
+                    "ellipse_outer_diameter_y_norm": ellipse_outer_dy,
+                    "ellipse_inner_diameter_x_m": float(ellipse_inner_dx * pupil_d_m),
+                    "ellipse_inner_diameter_y_m": float(ellipse_inner_dy * pupil_d_m),
+                    "ellipse_outer_diameter_x_m": float(ellipse_outer_dx * pupil_d_m),
+                    "ellipse_outer_diameter_y_m": float(ellipse_outer_dy * pupil_d_m),
+                    "ellipse_inner_diameter_x_mm": float(ellipse_inner_dx * pupil_d_m * 1e3),
+                    "ellipse_inner_diameter_y_mm": float(ellipse_inner_dy * pupil_d_m * 1e3),
+                    "ellipse_outer_diameter_x_mm": float(ellipse_outer_dx * pupil_d_m * 1e3),
+                    "ellipse_outer_diameter_y_mm": float(ellipse_outer_dy * pupil_d_m * 1e3),
+                }
+            )
+        return info
+
+    def _trimmed_field_at_pupil_for_psf(
+        self,
+        base_field_after_fresnel: np.ndarray,
+        pupil_mask: np.ndarray,
+    ) -> np.ndarray:
+        base = np.asarray(base_field_after_fresnel, dtype=np.complex128)
+        pupil = np.asarray(pupil_mask, dtype=np.float64)
+        base_field_at_pupil = base * pupil
+
+        window = self._pupil_trim_window
+        if not (
+            isinstance(window, (list, tuple))
+            and len(window) == 4
+            and int(window[1]) > int(window[0])
+            and int(window[3]) > int(window[2])
+        ):
+            return base_field_at_pupil
+
+        row0, row1, col0, col1 = (
+            int(window[0]),
+            int(window[1]),
+            int(window[2]),
+            int(window[3]),
+        )
+        return base_field_at_pupil[row0:row1, col0:col1]
+
+    def _fastpath_common_kwargs(self, base_field_for_psf: np.ndarray) -> Dict[str, Any]:
+        range_um = float(self.params.get("range_um", self.params.get("range_z_um", 2.0)))
+        return {
+            "simulator": self.simulator,
+            "base_field_for_psf": base_field_for_psf,
+            "size_x": float(self._size_x_for_psf),
+            "size_y": float(self._size_y_for_psf),
+            "entrance_pupil_diameter": float(self.params["pupil_d"]),
+            "range_microns": range_um,
+            "range_microns_x": float(self.params.get("range_x_um", range_um)),
+            "range_microns_y": float(self.params.get("range_y_um", range_um)),
+            "range_microns_z": float(self.params.get("range_z_um", range_um)),
+            "num_points": int(self.params["points_2d"]),
+            "compute_xy": bool(self._compute_xy),
+            "compute_xz": bool(self._compute_xz),
+            "compute_yz": bool(self._compute_yz),
+        }
+
+    def _surrogate_stage_enabled(
+        self,
+        *,
+        mode: str,
+        axial_symmetry: bool,
+        binary_amplitude: bool,
+        binary_structure: str,
+    ) -> bool:
+        return bool(
+            (not bool(axial_symmetry))
+            and str(mode).strip().lower() == "amplitude"
+            and (not bool(binary_amplitude))
+            and str(binary_structure).strip().lower() == "pixel"
+            and bool(self._linear_fastpath_enabled)
+        )
+
+    def _stage_variable_count(
+        self,
+        *,
+        stage_shape: Tuple[int, int],
+        support_mask: np.ndarray,
+        mode: str,
+        axial_symmetry: bool,
+        binary_amplitude: bool,
+        binary_structure: str,
+    ) -> Tuple[int, int]:
+        use_simple_ring, use_simple_ellipse, _use_binary_latent = self._binary_structure_flags(
+            mode=mode,
+            binary_amplitude=binary_amplitude,
+            binary_structure=binary_structure,
+        )
+        n_support_pixels = int(np.count_nonzero(support_mask))
+        if use_simple_ring:
+            return 2, n_support_pixels
+        if use_simple_ellipse:
+            return 4, n_support_pixels
+        if bool(axial_symmetry):
+            radial = self._build_radial_parameterization(
+                stage_shape,
+                support_mask=support_mask,
+                n_bins=int(self._radial_bins),
+            )
+            n_vars = int(np.count_nonzero(np.asarray(radial["support_by_bin"], dtype=bool)))
+            if str(mode).strip().lower() == "amplitude_phase":
+                n_vars *= 2
+            return n_vars, n_support_pixels
+        n_vars = int(n_support_pixels)
+        if str(mode).strip().lower() == "amplitude_phase":
+            n_vars *= 2
+        return n_vars, n_support_pixels
+
+    @staticmethod
+    def _effective_optimizer_name(optimizer_name: str, surrogate_enabled: bool) -> str:
+        name = str(optimizer_name)
+        if surrogate_enabled and name not in {"L-BFGS-B", "SLSQP"}:
+            return "L-BFGS-B"
+        return name
+
+    def _prepare_fastpaths(
+        self,
+        *,
+        base_field_after_fresnel: np.ndarray,
+        pupil_mask: np.ndarray,
+        progress_callback=None,
+        stop_callback=None,
+    ) -> None:
+        if bool(self._config.axial_symmetry):
+            self._linear_fastpath = None
+            self._linear_fastpath_enabled = False
+            self._linear_fastpath_reason = "disabled: axial symmetry on"
+            if progress_callback is not None:
+                progress_callback("Preparing axial-symmetry precomputed field", 0.03, None)
+            self._initialize_axial_radial_fastpath(
+                base_field_after_fresnel=base_field_after_fresnel,
+                pupil_mask=pupil_mask,
+                stop_callback=stop_callback,
+            )
+            if progress_callback is not None:
+                progress_callback(
+                    (
+                        "Axial-symmetry fast path enabled"
+                        if self._axial_radial_fastpath_enabled
+                        else "Axial-symmetry fast path fallback"
+                    ),
+                    0.05,
+                    {
+                        "axial_fastpath_enabled": bool(self._axial_radial_fastpath_enabled),
+                        "axial_fastpath_reason": str(self._axial_radial_fastpath_reason),
+                        "radial_bins": int(self._radial_bins),
+                    },
+                )
+            return
+
+        self._axial_radial_fastpath = None
+        self._axial_radial_fastpath_enabled = False
+        self._axial_radial_fastpath_reason = "disabled: axial symmetry off"
+        if progress_callback is not None:
+            progress_callback(
+                "Preparing full-2D precomputed field",
+                0.03,
+                {
+                    "axial_fastpath_enabled": False,
+                    "axial_fastpath_reason": str(self._axial_radial_fastpath_reason),
+                    "radial_bins": int(self._radial_bins),
+                },
+            )
+        self._initialize_linear_fastpath(
+            base_field_after_fresnel=base_field_after_fresnel,
+            pupil_mask=pupil_mask,
+            stop_callback=stop_callback,
+        )
+        if progress_callback is not None:
+            progress_callback(
+                (
+                    "Full-2D linear fast path enabled"
+                    if self._linear_fastpath_enabled
+                    else "Full-2D linear fast path fallback"
+                ),
+                0.05,
+                {
+                    "axial_fastpath_enabled": False,
+                    "axial_fastpath_reason": str(self._axial_radial_fastpath_reason),
+                    "linear_fastpath_enabled": bool(self._linear_fastpath_enabled),
+                    "linear_fastpath_reason": str(self._linear_fastpath_reason),
+                    "radial_bins": int(self._radial_bins),
+                },
+            )
 
     @staticmethod
     def _sanitize_config(config: OptimizerConfig, full_shape: Tuple[int, int]) -> OptimizerConfig:
@@ -1762,41 +1998,12 @@ class PostFresnelMaskOptimizer:
 
         self._check_stop(stop_callback)
         try:
-            base = np.asarray(base_field_after_fresnel, dtype=np.complex128)
-            pupil = np.asarray(pupil_mask, dtype=np.float64)
-            base_field_at_pupil = base * pupil
-
-            window = self._pupil_trim_window
-            if (
-                isinstance(window, (list, tuple))
-                and len(window) == 4
-                and int(window[1]) > int(window[0])
-                and int(window[3]) > int(window[2])
-            ):
-                row0, row1, col0, col1 = (
-                    int(window[0]),
-                    int(window[1]),
-                    int(window[2]),
-                    int(window[3]),
-                )
-                base_field_for_psf = base_field_at_pupil[row0:row1, col0:col1]
-            else:
-                base_field_for_psf = base_field_at_pupil
-
+            base_field_for_psf = self._trimmed_field_at_pupil_for_psf(
+                base_field_after_fresnel=base_field_after_fresnel,
+                pupil_mask=pupil_mask,
+            )
             self._axial_radial_fastpath = _AxialSymmetricRadialFastPSF(
-                simulator=self.simulator,
-                base_field_for_psf=base_field_for_psf,
-                size_x=float(self._size_x_for_psf),
-                size_y=float(self._size_y_for_psf),
-                entrance_pupil_diameter=float(self.params["pupil_d"]),
-                range_microns=float(self.params.get("range_um", self.params.get("range_z_um", 2.0))),
-                range_microns_x=float(self.params.get("range_x_um", self.params.get("range_um", 2.0))),
-                range_microns_y=float(self.params.get("range_y_um", self.params.get("range_um", 2.0))),
-                range_microns_z=float(self.params.get("range_z_um", self.params.get("range_um", 2.0))),
-                num_points=int(self.params["points_2d"]),
-                compute_xy=bool(self._compute_xy),
-                compute_xz=bool(self._compute_xz),
-                compute_yz=bool(self._compute_yz),
+                **self._fastpath_common_kwargs(base_field_for_psf),
             )
             self._radial_bins = int(self._axial_radial_fastpath.radial_norm_axis.size)
             self._axial_radial_fastpath_enabled = True
@@ -1824,41 +2031,12 @@ class PostFresnelMaskOptimizer:
 
         self._check_stop(stop_callback)
         try:
-            base = np.asarray(base_field_after_fresnel, dtype=np.complex128)
-            pupil = np.asarray(pupil_mask, dtype=np.float64)
-            base_field_at_pupil = base * pupil
-
-            window = self._pupil_trim_window
-            if (
-                isinstance(window, (list, tuple))
-                and len(window) == 4
-                and int(window[1]) > int(window[0])
-                and int(window[3]) > int(window[2])
-            ):
-                row0, row1, col0, col1 = (
-                    int(window[0]),
-                    int(window[1]),
-                    int(window[2]),
-                    int(window[3]),
-                )
-                base_field_for_psf = base_field_at_pupil[row0:row1, col0:col1]
-            else:
-                base_field_for_psf = base_field_at_pupil
-
+            base_field_for_psf = self._trimmed_field_at_pupil_for_psf(
+                base_field_after_fresnel=base_field_after_fresnel,
+                pupil_mask=pupil_mask,
+            )
             self._linear_fastpath = _LinearizedFull2DFastPSF(
-                simulator=self.simulator,
-                base_field_for_psf=base_field_for_psf,
-                size_x=float(self._size_x_for_psf),
-                size_y=float(self._size_y_for_psf),
-                entrance_pupil_diameter=float(self.params["pupil_d"]),
-                range_microns=float(self.params.get("range_um", self.params.get("range_z_um", 2.0))),
-                range_microns_x=float(self.params.get("range_x_um", self.params.get("range_um", 2.0))),
-                range_microns_y=float(self.params.get("range_y_um", self.params.get("range_um", 2.0))),
-                range_microns_z=float(self.params.get("range_z_um", self.params.get("range_um", 2.0))),
-                num_points=int(self.params["points_2d"]),
-                compute_xy=bool(self._compute_xy),
-                compute_xz=bool(self._compute_xz),
-                compute_yz=bool(self._compute_yz),
+                **self._fastpath_common_kwargs(base_field_for_psf),
             )
             self._linear_fastpath_enabled = True
             self._linear_fastpath_reason = str(self._linear_fastpath.precompute_reason)
@@ -2419,10 +2597,11 @@ class PostFresnelMaskOptimizer:
         last_preview_ts = {"t": 0.0}
         binary_amplitude = bool(self._config.binary_amplitude and mode == "amplitude")
         binary_structure = str(getattr(self._config, "binary_structure", "pixel")).strip().lower()
-        use_simple_ring = bool(binary_amplitude and (binary_structure == "simple_ring_block"))
-        use_simple_ellipse = bool(binary_amplitude and (binary_structure == "simple_ellipse_block"))
-        use_binary_latent = bool(binary_amplitude and (not use_simple_ring) and (not use_simple_ellipse))
-        pupil_radius_m = 0.5 * float(self.params.get("pupil_d", 0.0))
+        use_simple_ring, use_simple_ellipse, use_binary_latent = self._binary_structure_flags(
+            mode=mode,
+            binary_amplitude=binary_amplitude,
+            binary_structure=binary_structure,
+        )
         axial_symmetry = bool(self._config.axial_symmetry)
         support_mask = self._pupil_support_for_shape(
             pupil_mask=pupil_mask,
@@ -2430,12 +2609,12 @@ class PostFresnelMaskOptimizer:
             threshold=0.5,
         )
         use_surrogate_gradient = bool(
-            (not axial_symmetry)
-            and str(mode).strip().lower() == "amplitude"
-            and (not bool(binary_amplitude))
-            and (not use_simple_ring)
-            and (not use_simple_ellipse)
-            and (self._linear_fastpath_enabled)
+            self._surrogate_stage_enabled(
+                mode=mode,
+                axial_symmetry=axial_symmetry,
+                binary_amplitude=binary_amplitude,
+                binary_structure=binary_structure,
+            )
             and (self._linear_fastpath is not None)
         )
         if use_surrogate_gradient:
@@ -2517,45 +2696,12 @@ class PostFresnelMaskOptimizer:
                 x_seed_arr = None
 
         def structure_info_from_x_eval(x_eval: np.ndarray) -> Dict[str, Any]:
-            arr = np.asarray(x_eval, dtype=np.float64).ravel()
-            info: Dict[str, Any] = {
-                "binary_structure": str(binary_structure),
-            }
-            if use_simple_ring and arr.size >= 2:
-                ring_r_in = float(min(float(arr[0]), float(arr[1])))
-                ring_r_out = float(max(float(arr[0]), float(arr[1])))
-                info.update(
-                    {
-                        "ring_inner_radius_norm": ring_r_in,
-                        "ring_outer_radius_norm": ring_r_out,
-                        "ring_inner_radius_m": float(ring_r_in * pupil_radius_m),
-                        "ring_outer_radius_m": float(ring_r_out * pupil_radius_m),
-                        "ring_inner_radius_mm": float(ring_r_in * pupil_radius_m * 1e3),
-                        "ring_outer_radius_mm": float(ring_r_out * pupil_radius_m * 1e3),
-                    }
-                )
-            elif use_simple_ellipse and arr.size >= 4:
-                ellipse_inner_dx = float(np.clip(arr[0], 0.0, 1.0))
-                ellipse_inner_dy = float(np.clip(arr[1], 0.0, 1.0))
-                ellipse_outer_dx = float(np.clip(arr[2], 0.0, 1.0))
-                ellipse_outer_dy = float(np.clip(arr[3], 0.0, 1.0))
-                info.update(
-                    {
-                        "ellipse_inner_diameter_x_norm": ellipse_inner_dx,
-                        "ellipse_inner_diameter_y_norm": ellipse_inner_dy,
-                        "ellipse_outer_diameter_x_norm": ellipse_outer_dx,
-                        "ellipse_outer_diameter_y_norm": ellipse_outer_dy,
-                        "ellipse_inner_diameter_x_m": float(ellipse_inner_dx * float(self.params.get("pupil_d", 0.0))),
-                        "ellipse_inner_diameter_y_m": float(ellipse_inner_dy * float(self.params.get("pupil_d", 0.0))),
-                        "ellipse_outer_diameter_x_m": float(ellipse_outer_dx * float(self.params.get("pupil_d", 0.0))),
-                        "ellipse_outer_diameter_y_m": float(ellipse_outer_dy * float(self.params.get("pupil_d", 0.0))),
-                        "ellipse_inner_diameter_x_mm": float(ellipse_inner_dx * float(self.params.get("pupil_d", 0.0)) * 1e3),
-                        "ellipse_inner_diameter_y_mm": float(ellipse_inner_dy * float(self.params.get("pupil_d", 0.0)) * 1e3),
-                        "ellipse_outer_diameter_x_mm": float(ellipse_outer_dx * float(self.params.get("pupil_d", 0.0)) * 1e3),
-                        "ellipse_outer_diameter_y_mm": float(ellipse_outer_dy * float(self.params.get("pupil_d", 0.0)) * 1e3),
-                    }
-                )
-            return info
+            return self._structure_info_from_vector(
+                x_eval,
+                binary_structure=binary_structure,
+                use_simple_ring=use_simple_ring,
+                use_simple_ellipse=use_simple_ellipse,
+            )
 
         def decode_vector_to_stage_maps(
             x_vec: np.ndarray, anneal_alpha: float
@@ -3056,66 +3202,12 @@ class PostFresnelMaskOptimizer:
             self._pupil_trim_window = None
         self._size_x_for_psf = float(prep.get("size_x_for_psf", self.params["size_x"]))
         self._size_y_for_psf = float(prep.get("size_y_for_psf", self.params["size_y"]))
-        if bool(self._config.axial_symmetry):
-            self._linear_fastpath = None
-            self._linear_fastpath_enabled = False
-            self._linear_fastpath_reason = "disabled: axial symmetry on"
-            if progress_callback is not None:
-                progress_callback("Preparing axial-symmetry precomputed field", 0.03, None)
-            self._initialize_axial_radial_fastpath(
-                base_field_after_fresnel=base_field_after_fresnel,
-                pupil_mask=pupil_mask,
-                stop_callback=stop_callback,
-            )
-            if progress_callback is not None:
-                progress_callback(
-                    (
-                        "Axial-symmetry fast path enabled"
-                        if self._axial_radial_fastpath_enabled
-                        else "Axial-symmetry fast path fallback"
-                    ),
-                    0.05,
-                    {
-                        "axial_fastpath_enabled": bool(self._axial_radial_fastpath_enabled),
-                        "axial_fastpath_reason": str(self._axial_radial_fastpath_reason),
-                        "radial_bins": int(self._radial_bins),
-                    },
-                )
-        else:
-            self._axial_radial_fastpath = None
-            self._axial_radial_fastpath_enabled = False
-            self._axial_radial_fastpath_reason = "disabled: axial symmetry off"
-            if progress_callback is not None:
-                progress_callback(
-                    "Preparing full-2D precomputed field",
-                    0.03,
-                    {
-                        "axial_fastpath_enabled": False,
-                        "axial_fastpath_reason": str(self._axial_radial_fastpath_reason),
-                        "radial_bins": int(self._radial_bins),
-                    },
-                )
-            self._initialize_linear_fastpath(
-                base_field_after_fresnel=base_field_after_fresnel,
-                pupil_mask=pupil_mask,
-                stop_callback=stop_callback,
-            )
-            if progress_callback is not None:
-                progress_callback(
-                    (
-                        "Full-2D linear fast path enabled"
-                        if self._linear_fastpath_enabled
-                        else "Full-2D linear fast path fallback"
-                    ),
-                    0.05,
-                    {
-                        "axial_fastpath_enabled": False,
-                        "axial_fastpath_reason": str(self._axial_radial_fastpath_reason),
-                        "linear_fastpath_enabled": bool(self._linear_fastpath_enabled),
-                        "linear_fastpath_reason": str(self._linear_fastpath_reason),
-                        "radial_bins": int(self._radial_bins),
-                    },
-                )
+        self._prepare_fastpaths(
+            base_field_after_fresnel=base_field_after_fresnel,
+            pupil_mask=pupil_mask,
+            progress_callback=progress_callback,
+            stop_callback=stop_callback,
+        )
 
         baseline_amp = np.ones(full_shape, dtype=np.float64)
         baseline_phase = np.zeros(full_shape, dtype=np.float64)
@@ -3154,48 +3246,25 @@ class PostFresnelMaskOptimizer:
                 var_shape=stage_shape,
                 threshold=0.5,
             )
-            n_support_pixels = int(np.count_nonzero(support))
-            use_simple_ring = bool(
-                str(self._config.mode).strip().lower() == "amplitude"
-                and bool(self._config.binary_amplitude)
-                and str(getattr(self._config, "binary_structure", "pixel")).strip().lower()
-                == "simple_ring_block"
+            n_vars, n_support_pixels = self._stage_variable_count(
+                stage_shape=stage_shape,
+                support_mask=support,
+                mode=self._config.mode,
+                axial_symmetry=self._config.axial_symmetry,
+                binary_amplitude=self._config.binary_amplitude,
+                binary_structure=getattr(self._config, "binary_structure", "pixel"),
             )
-            use_simple_ellipse = bool(
-                str(self._config.mode).strip().lower() == "amplitude"
-                and bool(self._config.binary_amplitude)
-                and str(getattr(self._config, "binary_structure", "pixel")).strip().lower()
-                == "simple_ellipse_block"
+            surrogate_enabled = self._surrogate_stage_enabled(
+                mode=self._config.mode,
+                axial_symmetry=self._config.axial_symmetry,
+                binary_amplitude=self._config.binary_amplitude,
+                binary_structure=getattr(self._config, "binary_structure", "pixel"),
             )
-            if use_simple_ring:
-                n_vars = 2
-            elif use_simple_ellipse:
-                n_vars = 4
-            elif bool(self._config.axial_symmetry):
-                radial = self._build_radial_parameterization(
-                    stage_shape,
-                    support_mask=support,
-                    n_bins=int(self._radial_bins),
-                )
-                n_active_bins = int(np.count_nonzero(np.asarray(radial["support_by_bin"], dtype=bool)))
-                n_vars = int(n_active_bins)
-                if self._config.mode == "amplitude_phase":
-                    n_vars = 2 * int(n_vars)
-            else:
-                n_vars = int(n_support_pixels)
-                if self._config.mode == "amplitude_phase":
-                    n_vars = 2 * int(n_vars)
-            surrogate_enabled = bool(
-                (not bool(self._config.axial_symmetry))
-                and str(self._config.mode).strip().lower() == "amplitude"
-                and (not bool(self._config.binary_amplitude))
-                and str(getattr(self._config, "binary_structure", "pixel")).strip().lower() == "pixel"
-                and bool(self._linear_fastpath_enabled)
+            effective_optimizer = self._effective_optimizer_name(
+                self._config.optimizer_name,
+                surrogate_enabled=surrogate_enabled,
             )
-            effective_optimizer = str(self._config.optimizer_name)
             if surrogate_enabled:
-                if effective_optimizer not in {"L-BFGS-B", "SLSQP"}:
-                    effective_optimizer = "L-BFGS-B"
                 est_per_iter = 1.0
             else:
                 est_per_iter = self._estimate_evals_per_iteration(
@@ -3254,17 +3323,10 @@ class PostFresnelMaskOptimizer:
             amp_out = np.asarray(amp_out >= 0.5, dtype=np.float64)
             phase_out = np.zeros_like(amp_out, dtype=np.float64)
         complex_out = amp_out * np.exp(1j * phase_out)
-        use_simple_ring = bool(
-            str(self._config.mode).strip().lower() == "amplitude"
-            and bool(self._config.binary_amplitude)
-            and str(getattr(self._config, "binary_structure", "pixel")).strip().lower()
-            == "simple_ring_block"
-        )
-        use_simple_ellipse = bool(
-            str(self._config.mode).strip().lower() == "amplitude"
-            and bool(self._config.binary_amplitude)
-            and str(getattr(self._config, "binary_structure", "pixel")).strip().lower()
-            == "simple_ellipse_block"
+        use_simple_ring, use_simple_ellipse, _use_binary_latent = self._binary_structure_flags(
+            mode=self._config.mode,
+            binary_amplitude=self._config.binary_amplitude,
+            binary_structure=getattr(self._config, "binary_structure", "pixel"),
         )
 
         settings = {
@@ -3317,35 +3379,15 @@ class PostFresnelMaskOptimizer:
                 "yz": bool(self._compute_yz),
             },
         }
-        if use_simple_ring and final_x is not None and int(np.asarray(final_x).size) >= 2:
-            ring_inner_norm = float(min(float(final_x[0]), float(final_x[1])))
-            ring_outer_norm = float(max(float(final_x[0]), float(final_x[1])))
-            ring_inner_m = float(ring_inner_norm * 0.5 * float(self.params.get("pupil_d", 0.0)))
-            ring_outer_m = float(ring_outer_norm * 0.5 * float(self.params.get("pupil_d", 0.0)))
-            settings["ring_inner_radius_norm"] = ring_inner_norm
-            settings["ring_outer_radius_norm"] = ring_outer_norm
-            settings["ring_inner_radius_m"] = ring_inner_m
-            settings["ring_outer_radius_m"] = ring_outer_m
-            settings["ring_inner_radius_mm"] = float(ring_inner_m * 1e3)
-            settings["ring_outer_radius_mm"] = float(ring_outer_m * 1e3)
-        elif use_simple_ellipse and final_x is not None and int(np.asarray(final_x).size) >= 4:
-            pupil_d_m = float(self.params.get("pupil_d", 0.0))
-            ellipse_inner_dx_norm = float(np.clip(final_x[0], 0.0, 1.0))
-            ellipse_inner_dy_norm = float(np.clip(final_x[1], 0.0, 1.0))
-            ellipse_outer_dx_norm = float(np.clip(final_x[2], 0.0, 1.0))
-            ellipse_outer_dy_norm = float(np.clip(final_x[3], 0.0, 1.0))
-            settings["ellipse_inner_diameter_x_norm"] = ellipse_inner_dx_norm
-            settings["ellipse_inner_diameter_y_norm"] = ellipse_inner_dy_norm
-            settings["ellipse_outer_diameter_x_norm"] = ellipse_outer_dx_norm
-            settings["ellipse_outer_diameter_y_norm"] = ellipse_outer_dy_norm
-            settings["ellipse_inner_diameter_x_m"] = float(ellipse_inner_dx_norm * pupil_d_m)
-            settings["ellipse_inner_diameter_y_m"] = float(ellipse_inner_dy_norm * pupil_d_m)
-            settings["ellipse_outer_diameter_x_m"] = float(ellipse_outer_dx_norm * pupil_d_m)
-            settings["ellipse_outer_diameter_y_m"] = float(ellipse_outer_dy_norm * pupil_d_m)
-            settings["ellipse_inner_diameter_x_mm"] = float(ellipse_inner_dx_norm * pupil_d_m * 1e3)
-            settings["ellipse_inner_diameter_y_mm"] = float(ellipse_inner_dy_norm * pupil_d_m * 1e3)
-            settings["ellipse_outer_diameter_x_mm"] = float(ellipse_outer_dx_norm * pupil_d_m * 1e3)
-            settings["ellipse_outer_diameter_y_mm"] = float(ellipse_outer_dy_norm * pupil_d_m * 1e3)
+        if final_x is not None:
+            settings.update(
+                self._structure_info_from_vector(
+                    final_x,
+                    binary_structure=str(getattr(self._config, "binary_structure", "pixel")),
+                    use_simple_ring=use_simple_ring,
+                    use_simple_ellipse=use_simple_ellipse,
+                )
+            )
 
         if progress_callback is not None:
             progress_callback("Optimization complete", 1.0, {"objective": float(final_obj)})
