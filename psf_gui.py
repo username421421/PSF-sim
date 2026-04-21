@@ -12,12 +12,19 @@ import torch
 import torch.nn.functional as F
 
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from matplotlib.figure import Figure
 from matplotlib.patches import Circle
 from matplotlib.transforms import Bbox
 
 from mask_builder import MaskBuilderModel
 from PSF_simulator import CartesianPSFSimulator, SimulationStoppedError
+from plot_style import (
+    add_compact_colorbar,
+    apply_publication_style,
+    intensity_norm,
+    make_figure,
+    style_image_axis,
+    style_profile_axis,
+)
 
 try:
     from psf_mask_optimizer import (
@@ -66,6 +73,8 @@ except Exception as _pyvista_qt_import_exc:
 
 HAS_PYVISTA_WINDOW = bool(HAS_PYVISTA and HAS_PYVISTA_QT)
 
+apply_publication_style()
+
 
 class PSFSimulatorApp:
     def __init__(self, root):
@@ -112,6 +121,12 @@ class PSFSimulatorApp:
         self._profile_cursor_artists = {}
         self._profile_drag_ax = None
         self._axes_export_map = {}
+        self._width_metrics_cache = {}
+        self._width_plot_artists = {}
+        self._width_level_step = 0.001
+        self._active_width_level = 0.50
+        self._width_level_source = "slider"
+        self._width_entry_job = None
         self.opt_is_running = False
         self.opt_stop_requested = False
         self.opt_result = None
@@ -278,7 +293,7 @@ class PSFSimulatorApp:
             mask_group, text="Mask Preview (orientation + offset)", padding=6
         )
         preview_group.pack(fill="x", pady=(4, 0))
-        self.fig_mask_input = Figure(figsize=(3.4, 2.9), dpi=100)
+        self.fig_mask_input = make_figure(figsize=(3.4, 2.8), dpi=150)
         self.canvas_mask_input = FigureCanvasTkAgg(self.fig_mask_input, master=preview_group)
         self.canvas_mask_input.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
@@ -404,25 +419,34 @@ class PSFSimulatorApp:
             command=self._on_3d_grid_toggle,
         ).pack(anchor="w", pady=(4, 0))
 
-        self.width_level_var = tk.DoubleVar(value=0.50)
+        self.width_level_var = tk.StringVar(value="0.5")
+        self.width_level_slider_var = tk.DoubleVar(value=self._active_width_level)
         self.iso_level_var = tk.DoubleVar(value=0.50)
+        self.width_ratio_var = tk.StringVar(value="Width ratios: z/x = N/A, z/y = N/A")
 
         ttk.Label(display_group, text="Peak width level (0..1)").pack(anchor="w", pady=(8, 0))
         width_row = ttk.Frame(display_group)
         width_row.pack(fill="x")
-        self.width_level_label = ttk.Label(width_row, text="0.50")
+        self.width_level_label = ttk.Label(width_row, text="0.5")
         self.width_level_label.pack(side=tk.LEFT)
         self.width_level_entry = ttk.Entry(width_row, width=8, textvariable=self.width_level_var)
         self.width_level_entry.pack(side=tk.RIGHT)
+        self.width_level_entry.bind("<KeyRelease>", self._on_width_level_entry_key_release)
         self.width_level_entry.bind("<Return>", self._on_width_level_entry)
         self.width_level_entry.bind("<FocusOut>", self._on_width_level_entry)
         ttk.Scale(
             display_group,
             from_=0.01,
             to=0.99,
-            variable=self.width_level_var,
+            variable=self.width_level_slider_var,
             command=self._on_width_level,
         ).pack(fill="x")
+        ttk.Label(
+            display_group,
+            textvariable=self.width_ratio_var,
+            justify=tk.LEFT,
+            wraplength=300,
+        ).pack(anchor="w", pady=(2, 0))
 
         ttk.Label(display_group, text="3D surface level (0..1)").pack(anchor="w", pady=(8, 0))
         iso_row = ttk.Frame(display_group)
@@ -571,28 +595,29 @@ class PSFSimulatorApp:
                 vmax=1.0,
                 extent=extent,
                 aspect="equal",
+                interpolation="nearest",
             )
-            ax.set_title(f"Effective mask ({mask.shape[0]} x {mask.shape[1]})")
-            ax.set_xlabel("x (mm)")
-            ax.set_ylabel("y (mm)")
+            style_image_axis(
+                ax,
+                title=f"Effective mask ({mask.shape[0]} x {mask.shape[1]})",
+                xlabel="x (mm)",
+                ylabel="y (mm)",
+            )
             pupil_d_mm = float(self.pupil_d_mm_var.get())
             if np.isfinite(pupil_d_mm) and pupil_d_mm > 0.0:
                 pupil_circle = Circle(
                     (0.0, 0.0),
                     radius=0.5 * pupil_d_mm,
                     fill=False,
-                    edgecolor="#00a7d1",
-                    linewidth=1.3,
-                    linestyle=(0, (4, 3)),
-                    alpha=0.95,
+                    edgecolor="#1B3B6F",
+                    linewidth=0.9,
+                    linestyle=(0, (3, 2)),
                 )
                 ax.add_patch(pupil_circle)
-            self.fig_mask_input.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            add_compact_colorbar(self.fig_mask_input, im, ax, "Mask value")
         except Exception as exc:
             ax.text(0.5, 0.5, f"Mask preview unavailable\n{exc}", ha="center", va="center")
             ax.axis("off")
-
-        self.fig_mask_input.tight_layout()
         self.canvas_mask_input.draw()
 
     def _update_sampling_info(self):
@@ -649,7 +674,7 @@ class PSFSimulatorApp:
         self.notebook.add(self.tab_mask, text="Mask Builder")
         self.notebook.add(self.tab_opt, text="Mask Optimization")
 
-        self.fig_2d = Figure(figsize=(12, 9), dpi=100)
+        self.fig_2d = make_figure(figsize=(10.6, 7.5), dpi=150)
         self.canvas_2d = FigureCanvasTkAgg(self.fig_2d, master=self.tab_2d)
         self.canvas_2d.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         self._cursor_cid = self.canvas_2d.mpl_connect("motion_notify_event", self._on_2d_cursor_move)
@@ -781,7 +806,7 @@ class PSFSimulatorApp:
             fill="x", pady=(4, 0)
         )
 
-        self.fig_mask = Figure(figsize=(9, 8), dpi=100)
+        self.fig_mask = make_figure(figsize=(6.2, 5.3), dpi=150)
         self.canvas_mask = FigureCanvasTkAgg(self.fig_mask, master=preview)
         self.canvas_mask.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         self._refresh_mask_builder_plot()
@@ -1066,7 +1091,7 @@ class PSFSimulatorApp:
             fill="x"
         )
 
-        self.fig_opt = Figure(figsize=(9, 8), dpi=100)
+        self.fig_opt = make_figure(figsize=(6.8, 5.6), dpi=150)
         self.canvas_opt = FigureCanvasTkAgg(self.fig_opt, master=preview)
         self.canvas_opt.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
@@ -1450,15 +1475,19 @@ class PSFSimulatorApp:
             vmax=1.0,
             extent=extent,
             aspect="equal",
+            interpolation="nearest",
         )
-        ax.set_title(f"Mask preview ({arr.shape[0]} x {arr.shape[1]})")
-        ax.set_xlabel("x (mm)")
-        ax.set_ylabel("y (mm)")
-        self.fig_mask.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        self.fig_mask.tight_layout()
+        style_image_axis(
+            ax,
+            title=f"Mask preview ({arr.shape[0]} x {arr.shape[1]})",
+            xlabel="x (mm)",
+            ylabel="y (mm)",
+        )
+        add_compact_colorbar(self.fig_mask, im, ax, "Mask value")
         self.canvas_mask.draw()
 
     def _init_empty_plots(self):
+        self._clear_2d_width_cache()
         self._cursor_axes_map = {}
         self._profile_axes_map = {}
         self._profile_cursor_artists = {}
@@ -2362,6 +2391,7 @@ class PSFSimulatorApp:
         self.last_simulator = simulator
         self.results_2d = self._clone_payload(results_2d)
         self.results_3d = self._clone_payload(results_3d) if results_3d is not None else None
+        self._clear_2d_width_cache()
         self._clear_3d_render_cache()
         self.stop_requested = False
         self._set_progress(100.0, force=True)
@@ -3078,51 +3108,71 @@ class PSFSimulatorApp:
                 mag2_live = amp_live * amp_live
 
                 axes = self.fig_opt.subplots(2, 2)
-                im0 = axes[0, 0].imshow(amp_live.T, origin="lower", cmap="gray", vmin=0.0, vmax=1.0)
-                axes[0, 0].set_title("Current amplitude (live)")
-                axes[0, 0].set_xlabel("x (px)")
-                axes[0, 0].set_ylabel("y (px)")
-                self.fig_opt.colorbar(im0, ax=axes[0, 0], fraction=0.046, pad=0.04)
+                im0 = axes[0, 0].imshow(
+                    amp_live.T,
+                    origin="lower",
+                    cmap="gray",
+                    vmin=0.0,
+                    vmax=1.0,
+                    aspect="equal",
+                    interpolation="nearest",
+                )
+                style_image_axis(axes[0, 0], title="Amplitude", xlabel="x (px)", ylabel="y (px)")
+                add_compact_colorbar(self.fig_opt, im0, axes[0, 0], "Amplitude")
 
                 im1 = axes[0, 1].imshow(
-                    phase_live.T, origin="lower", cmap="twilight", vmin=-np.pi, vmax=np.pi
+                    phase_live.T,
+                    origin="lower",
+                    cmap="twilight",
+                    vmin=-np.pi,
+                    vmax=np.pi,
+                    aspect="equal",
+                    interpolation="nearest",
                 )
-                axes[0, 1].set_title("Current phase (live)")
-                axes[0, 1].set_xlabel("x (px)")
-                axes[0, 1].set_ylabel("y (px)")
-                self.fig_opt.colorbar(im1, ax=axes[0, 1], fraction=0.046, pad=0.04)
+                style_image_axis(axes[0, 1], title="Phase", xlabel="x (px)", ylabel="y (px)")
+                add_compact_colorbar(
+                    self.fig_opt,
+                    im1,
+                    axes[0, 1],
+                    "Phase (rad)",
+                    ticks=[-np.pi, 0.0, np.pi],
+                )
 
-                im2 = axes[1, 0].imshow(mag2_live.T, origin="lower", cmap="inferno")
-                axes[1, 0].set_title("|Current complex mask|^2")
-                axes[1, 0].set_xlabel("x (px)")
-                axes[1, 0].set_ylabel("y (px)")
-                self.fig_opt.colorbar(im2, ax=axes[1, 0], fraction=0.046, pad=0.04)
+                im2 = axes[1, 0].imshow(
+                    mag2_live.T,
+                    origin="lower",
+                    cmap="magma",
+                    norm=intensity_norm(mag2_live, vmin=0.0),
+                    aspect="equal",
+                    interpolation="nearest",
+                )
+                style_image_axis(
+                    axes[1, 0],
+                    title="|M|^2",
+                    xlabel="x (px)",
+                    ylabel="y (px)",
+                )
+                add_compact_colorbar(self.fig_opt, im2, axes[1, 0], "Magnitude squared")
 
-                axes[1, 1].axis("off")
-                live_text = "Live optimization preview\n"
+                live_lines = ["Live optimization preview"]
                 if self.opt_live_full_shape is not None:
                     full_nx, full_ny = self.opt_live_full_shape
-                    live_text += (
-                        f"Full mask shape: {int(full_nx)} x {int(full_ny)}\n"
-                        f"Preview shape: {int(amp_live.shape[0])} x {int(amp_live.shape[1])}\n"
+                    live_lines.append(f"Full mask: {int(full_nx)} x {int(full_ny)} px")
+                    live_lines.append(
+                        f"Preview: {int(amp_live.shape[0])} x {int(amp_live.shape[1])} px"
                     )
                 if self.opt_live_objective is not None and np.isfinite(self.opt_live_objective):
-                    live_text += f"Current objective: {float(self.opt_live_objective):.6f}\n"
+                    live_lines.append(f"Objective: {float(self.opt_live_objective):.6f}")
                 if self.opt_live_widths is not None:
                     wx, wy, wz = self.opt_live_widths
-                    width_line = f"X={float(wx):.4f}, Y={float(wy):.4f}"
+                    width_line = f"Widths (um): X={float(wx):.4f}, Y={float(wy):.4f}"
                     if np.isfinite(float(wz)):
                         width_line += f", Z={float(wz):.4f}"
-                    live_text += (
-                        "Current widths (um)\n"
-                        f"{width_line}\n"
-                        f"abs(x-y)={abs(float(wx) - float(wy)):.4f}\n"
-                    )
+                    live_lines.append(width_line)
+                    live_lines.append(f"|X-Y| = {abs(float(wx) - float(wy)):.4f} um")
                 if self.opt_is_running:
-                    live_text += "\nStatus: optimizing..."
-                axes[1, 1].text(0.0, 1.0, live_text, ha="left", va="top", family="monospace")
-
-                self.fig_opt.tight_layout()
+                    live_lines.append("Status: optimizing...")
+                self._summary_text_artist(axes[1, 1], "\n".join(live_lines))
                 self.canvas_opt.draw()
                 return
 
@@ -3143,7 +3193,6 @@ class PSFSimulatorApp:
             )
             ax.set_title("Mask Optimization Preview")
             ax.axis("off")
-            self.fig_opt.tight_layout()
             self.canvas_opt.draw()
             return
 
@@ -3152,39 +3201,62 @@ class PSFSimulatorApp:
         mag2 = np.abs(np.asarray(self.opt_result.complex_mask, dtype=np.complex128)) ** 2
 
         axes = self.fig_opt.subplots(2, 2)
-        im0 = axes[0, 0].imshow(amp.T, origin="lower", cmap="gray", vmin=0.0, vmax=1.0)
-        axes[0, 0].set_title("Optimized amplitude")
-        axes[0, 0].set_xlabel("x (px)")
-        axes[0, 0].set_ylabel("y (px)")
-        self.fig_opt.colorbar(im0, ax=axes[0, 0], fraction=0.046, pad=0.04)
+        im0 = axes[0, 0].imshow(
+            amp.T,
+            origin="lower",
+            cmap="gray",
+            vmin=0.0,
+            vmax=1.0,
+            aspect="equal",
+            interpolation="nearest",
+        )
+        style_image_axis(axes[0, 0], title="Amplitude", xlabel="x (px)", ylabel="y (px)")
+        add_compact_colorbar(self.fig_opt, im0, axes[0, 0], "Amplitude")
 
-        im1 = axes[0, 1].imshow(phase.T, origin="lower", cmap="twilight", vmin=-np.pi, vmax=np.pi)
-        axes[0, 1].set_title("Optimized phase (rad)")
-        axes[0, 1].set_xlabel("x (px)")
-        axes[0, 1].set_ylabel("y (px)")
-        self.fig_opt.colorbar(im1, ax=axes[0, 1], fraction=0.046, pad=0.04)
+        im1 = axes[0, 1].imshow(
+            phase.T,
+            origin="lower",
+            cmap="twilight",
+            vmin=-np.pi,
+            vmax=np.pi,
+            aspect="equal",
+            interpolation="nearest",
+        )
+        style_image_axis(axes[0, 1], title="Phase", xlabel="x (px)", ylabel="y (px)")
+        add_compact_colorbar(
+            self.fig_opt,
+            im1,
+            axes[0, 1],
+            "Phase (rad)",
+            ticks=[-np.pi, 0.0, np.pi],
+        )
 
-        im2 = axes[1, 0].imshow(mag2.T, origin="lower", cmap="inferno")
-        axes[1, 0].set_title("|Complex mask|^2")
-        axes[1, 0].set_xlabel("x (px)")
-        axes[1, 0].set_ylabel("y (px)")
-        self.fig_opt.colorbar(im2, ax=axes[1, 0], fraction=0.046, pad=0.04)
+        im2 = axes[1, 0].imshow(
+            mag2.T,
+            origin="lower",
+            cmap="magma",
+            norm=intensity_norm(mag2, vmin=0.0),
+            aspect="equal",
+            interpolation="nearest",
+        )
+        style_image_axis(axes[1, 0], title="|M|^2", xlabel="x (px)", ylabel="y (px)")
+        add_compact_colorbar(self.fig_opt, im2, axes[1, 0], "Magnitude squared")
 
         before = self.opt_result.baseline_metrics_um
         after = self.opt_result.best_metrics_um
-        axes[1, 1].axis("off")
-        text = (
-            "Width summary (um)\n"
-            f"X: {before['width_x_um']:.4f} -> {after['width_x_um']:.4f}\n"
-            f"Y: {before['width_y_um']:.4f} -> {after['width_y_um']:.4f}\n"
-            f"Z: {before['width_z_um']:.4f} -> {after['width_z_um']:.4f}\n\n"
-            f"abs(x-y): {abs(float(before['width_x_um']) - float(before['width_y_um'])):.4f}"
-            f" -> {abs(float(after['width_x_um']) - float(after['width_y_um'])):.4f}\n"
-            "\n"
-            f"Objective: {self.opt_result.best_objective:.6f}\n"
-            f"Mode: {self.opt_result.settings.get('mode', '-')}\n"
-            f"Optimizer: {self.opt_result.settings.get('optimizer_name', '-')}"
-        )
+        summary_lines = [
+            "Width summary (um)",
+            f"X: {before['width_x_um']:.4f} -> {after['width_x_um']:.4f}",
+            f"Y: {before['width_y_um']:.4f} -> {after['width_y_um']:.4f}",
+            f"Z: {before['width_z_um']:.4f} -> {after['width_z_um']:.4f}",
+            "",
+            f"|X-Y|: {abs(float(before['width_x_um']) - float(before['width_y_um'])):.4f}"
+            f" -> {abs(float(after['width_x_um']) - float(after['width_y_um'])):.4f}",
+            "",
+            f"Objective: {self.opt_result.best_objective:.6f}",
+            f"Mode: {self.opt_result.settings.get('mode', '-')}",
+            f"Optimizer: {self.opt_result.settings.get('optimizer_name', '-')}",
+        ]
         try:
             bstruct = str(self.opt_result.settings.get("binary_structure", "")).strip().lower()
             rin_mm = self.opt_result.settings.get("ring_inner_radius_mm")
@@ -3196,10 +3268,7 @@ class PSFSimulatorApp:
                 and np.isfinite(float(rin_mm))
                 and np.isfinite(float(rout_mm))
             ):
-                text += (
-                    "\n"
-                    f"Ring block (mm): {float(rin_mm):.4f} -> {float(rout_mm):.4f}"
-                )
+                summary_lines.append(f"Ring block (mm): {float(rin_mm):.4f} -> {float(rout_mm):.4f}")
             elif bstruct == "simple_ellipse_block":
                 einx_mm = self.opt_result.settings.get("ellipse_inner_diameter_x_mm")
                 einy_mm = self.opt_result.settings.get("ellipse_inner_diameter_y_mm")
@@ -3215,17 +3284,14 @@ class PSFSimulatorApp:
                     and np.isfinite(float(eoutx_mm))
                     and np.isfinite(float(eouty_mm))
                 ):
-                    text += (
-                        "\n"
+                    summary_lines.append(
                         "Ellipse ring (mm): "
                         f"in=({float(einx_mm):.4f}, {float(einy_mm):.4f}) "
                         f"out=({float(eoutx_mm):.4f}, {float(eouty_mm):.4f})"
                     )
         except Exception:
             pass
-        axes[1, 1].text(0.0, 1.0, text, ha="left", va="top", family="monospace")
-
-        self.fig_opt.tight_layout()
+        self._summary_text_artist(axes[1, 1], "\n".join(summary_lines))
         self.canvas_opt.draw()
 
     def _run_2d(self):
@@ -3382,6 +3448,7 @@ class PSFSimulatorApp:
         self.results_2d = res2d
         self.results_3d = res3d if ran_3d else None
         self._save_last_used_config(params)
+        self._clear_2d_width_cache()
         self._clear_3d_render_cache()
         self._refresh_plots()
         self._update_3d_window_button_state()
@@ -3431,6 +3498,31 @@ class PSFSimulatorApp:
             return data / m if m > 0 else data
         return data
 
+    def _display_intensity_label(self, apply_power=True):
+        if bool(apply_power) and self._power() == 2:
+            return "Normalized 2-photon signal" if bool(self.normalize_var.get()) else "2-photon signal (a.u.)"
+        return "Normalized intensity" if bool(self.normalize_var.get()) else "Intensity (a.u.)"
+
+    @staticmethod
+    def _set_image_extent(ax, xlim, ylim):
+        ax.set_xlim(float(xlim[0]), float(xlim[1]))
+        ax.set_ylim(float(ylim[0]), float(ylim[1]))
+        ax.set_aspect("equal", adjustable="box", anchor="C")
+
+    @staticmethod
+    def _summary_text_artist(ax, text):
+        ax.axis("off")
+        ax.text(
+            0.0,
+            1.0,
+            text,
+            ha="left",
+            va="top",
+            fontsize=6,
+            linespacing=1.35,
+            transform=ax.transAxes,
+        )
+
     @staticmethod
     def _peak_scaled_level(profile, level):
         prof = np.asarray(profile, dtype=float)
@@ -3438,6 +3530,246 @@ class PSFSimulatorApp:
         if pmax <= 0:
             return float(level)
         return float(level) * pmax
+
+    @staticmethod
+    def _format_width_ratio(value):
+        return f"{float(value):.3f}" if np.isfinite(value) else "N/A"
+
+    @staticmethod
+    def _format_width_value(value):
+        return f"{float(value):.3f}" if np.isfinite(value) else "N/A"
+
+    @staticmethod
+    def _format_width_level(level):
+        text = f"{float(level):.6f}".rstrip("0").rstrip(".")
+        return text if text != "" else "0"
+
+    def _quantize_width_level(self, level):
+        level = min(0.99, max(0.01, float(level)))
+        step = float(self._width_level_step)
+        return round(round(level / step) * step, 3)
+
+    def _clear_2d_width_cache(self):
+        self._width_metrics_cache = {}
+        self._width_plot_artists = {}
+
+    def _current_width_level(self):
+        try:
+            level = float(self._active_width_level)
+        except Exception:
+            level = 0.50
+        return min(0.99, max(0.01, level))
+
+    def _set_width_level_controls(self, active_level, *, slider_level=None, update_entry=True):
+        active_level = min(0.99, max(0.01, float(active_level)))
+        if slider_level is None:
+            slider_level = self._quantize_width_level(active_level)
+        self.width_level_slider_var.set(float(slider_level))
+        if update_entry:
+            self.width_level_var.set(self._format_width_level(active_level))
+        self.width_level_label.configure(text=self._format_width_level(active_level))
+
+    def _cancel_width_entry_job(self):
+        if self._width_entry_job is None:
+            return
+        try:
+            self.root.after_cancel(self._width_entry_job)
+        except Exception:
+            pass
+        self._width_entry_job = None
+
+    def _parse_width_level_text(self, *, clamp=False, require_in_range=False):
+        text = str(self.width_level_var.get()).strip()
+        if text == "":
+            return None
+        try:
+            level = float(text)
+        except Exception:
+            return None
+        if not np.isfinite(level):
+            return None
+        if require_in_range and not (0.01 <= level <= 0.99):
+            return None
+        if clamp:
+            level = min(0.99, max(0.01, level))
+        return float(level)
+
+    def _apply_width_level(self, level, *, source, update_entry):
+        clamped_level = min(0.99, max(0.01, float(level)))
+        slider_level = self._quantize_width_level(clamped_level)
+        self._width_level_source = str(source)
+        self._active_width_level = slider_level if source == "slider" else clamped_level
+        self._set_width_level_controls(
+            self._active_width_level,
+            slider_level=slider_level,
+            update_entry=update_entry,
+        )
+        self._refresh_width_plots_only(
+            level=self._active_width_level,
+            exact=(self._width_level_source == "entry"),
+        )
+
+    def _current_width_metrics_cache_key(self):
+        if self.results_2d is None:
+            return None
+        return (id(self.results_2d), self._power(), int(bool(self.normalize_var.get())))
+
+    def _get_or_build_width_metrics_cache(self):
+        key = self._current_width_metrics_cache_key()
+        if key is None or self.last_simulator is None:
+            return None
+        cached = self._width_metrics_cache.get(key)
+        if cached is not None:
+            return cached
+
+        r = self.results_2d
+        i_xy = self._display_intensity(self._choose_result_array(r, "I_xy", "I_xy_norm"))
+        i_xz = self._display_intensity(self._choose_result_array(r, "I_xz", "I_xz_norm"))
+        i_yz = self._display_intensity(self._choose_result_array(r, "I_yz", "I_yz_norm"))
+        cached = self.last_simulator.precompute_peak_width_metrics(
+            x_coords=r["x_coords"],
+            y_coords=r["y_coords"],
+            z_coords=r["z_coords"],
+            i_xy_norm=i_xy,
+            i_xz_norm=i_xz,
+            i_yz_norm=i_yz,
+            level_min=0.01,
+            level_max=0.99,
+            level_step=self._width_level_step,
+        )
+        self._width_metrics_cache[key] = cached
+        return cached
+
+    def _resolve_width_metrics_and_profiles(self, level=None, exact=None):
+        if self.results_2d is None or self.last_simulator is None:
+            return None, None, None, None
+
+        if level is None:
+            level = self._current_width_level()
+        else:
+            level = min(0.99, max(0.01, float(level)))
+        if exact is None:
+            exact = bool(self._width_level_source == "entry")
+
+        width_cache = self._get_or_build_width_metrics_cache()
+        if width_cache is None:
+            r = self.results_2d
+            i_xy = self._display_intensity(self._choose_result_array(r, "I_xy", "I_xy_norm"))
+            i_xz = self._display_intensity(self._choose_result_array(r, "I_xz", "I_xz_norm"))
+            i_yz = self._display_intensity(self._choose_result_array(r, "I_yz", "I_yz_norm"))
+            width_metrics = self.last_simulator.compute_peak_width_metrics(
+                x_coords=r["x_coords"],
+                y_coords=r["y_coords"],
+                z_coords=r["z_coords"],
+                i_xy_norm=i_xy,
+                i_xz_norm=i_xz,
+                i_yz_norm=i_yz,
+                level=level,
+            )
+            return (
+                width_metrics,
+                np.asarray(width_metrics["x_profile_peak"], dtype=float),
+                np.asarray(width_metrics["y_profile_peak"], dtype=float),
+                np.asarray(width_metrics["z_profile_peak"], dtype=float),
+            )
+
+        if exact:
+            width_metrics = self.last_simulator.peak_width_metrics_from_profiles(
+                x_coords=self.results_2d["x_coords"],
+                y_coords=self.results_2d["y_coords"],
+                z_coords=self.results_2d["z_coords"],
+                x_profile=width_cache["x_profile_peak"],
+                y_profile=width_cache["y_profile_peak"],
+                z_profile=width_cache["z_profile_peak"],
+                level=level,
+                peak_x_index=width_cache["peak_x_index"],
+                peak_y_index=width_cache["peak_y_index"],
+            )
+        else:
+            width_metrics = self.last_simulator.peak_width_metrics_from_precomputed(width_cache, level)
+
+        return (
+            width_metrics,
+            np.asarray(width_cache["x_profile_peak"], dtype=float),
+            np.asarray(width_cache["y_profile_peak"], dtype=float),
+            np.asarray(width_cache["z_profile_peak"], dtype=float),
+        )
+
+    @staticmethod
+    def _format_profile_axis_title(axis_name):
+        return str(axis_name).strip().upper()
+
+    def _update_width_ratio_display(self, width_metrics=None):
+        mode = self.plot_mode_var.get()
+        focus_z_um = np.nan
+        if isinstance(self.results_2d, dict) and "z_focus" in self.results_2d:
+            try:
+                focus_z_um = float(self.results_2d["z_focus"]) * 1e6
+            except Exception:
+                focus_z_um = np.nan
+        if not isinstance(width_metrics, dict):
+            level_text = self._format_width_level(self._current_width_level())
+            self.width_ratio_var.set(
+                f"{mode} widths @{level_text}: X = N/A, Y = N/A, Z = N/A um | "
+                f"z/x = N/A, z/y = N/A"
+            )
+            return
+        level = float(width_metrics.get("level", self._current_width_level()))
+        level_text = self._format_width_level(level)
+        width_x = self._format_width_value(width_metrics.get("width_x_um", np.nan))
+        width_y = self._format_width_value(width_metrics.get("width_y_um", np.nan))
+        width_z = self._format_width_value(width_metrics.get("width_z_um", np.nan))
+        ratio_zx = self._format_width_ratio(width_metrics.get("width_ratio_zx", np.nan))
+        ratio_zy = self._format_width_ratio(width_metrics.get("width_ratio_zy", np.nan))
+        focus_text = (
+            f" | focus z = {focus_z_um:.3f} um" if np.isfinite(focus_z_um) else ""
+        )
+        self.width_ratio_var.set(
+            f"{mode} widths @{level_text}: X = {width_x}, Y = {width_y}, Z = {width_z} um\n"
+            f"z/x = {ratio_zx}, z/y = {ratio_zy}{focus_text}"
+        )
+
+    def _update_width_plot_artists(self, plot_state, width_metrics, x_prof, y_prof, z_prof):
+        plot_state["x_level_line"].set_ydata(
+            [self._peak_scaled_level(x_prof, width_metrics["level"])] * 2
+        )
+        plot_state["y_level_line"].set_ydata(
+            [self._peak_scaled_level(y_prof, width_metrics["level"])] * 2
+        )
+        plot_state["z_level_line"].set_ydata(
+            [self._peak_scaled_level(z_prof, width_metrics["level"])] * 2
+        )
+        plot_state["x_axis"].set_title(self._format_profile_axis_title("X"))
+        plot_state["y_axis"].set_title(self._format_profile_axis_title("Y"))
+        plot_state["z_axis"].set_title(self._format_profile_axis_title("Z"))
+
+    def _refresh_width_plots_only(self, level=None, exact=None):
+        if self.results_2d is None or self.last_simulator is None:
+            self._update_width_ratio_display()
+            return
+
+        plot_state = self._width_plot_artists
+        cache_key = self._current_width_metrics_cache_key()
+        if level is None:
+            level = self._current_width_level()
+        else:
+            level = min(0.99, max(0.01, float(level)))
+        if exact is None:
+            exact = bool(self._width_level_source == "entry")
+        if (not plot_state) or plot_state.get("cache_key") != cache_key:
+            self._refresh_2d_plots()
+            return
+
+        width_metrics, x_prof, y_prof, z_prof = self._resolve_width_metrics_and_profiles(
+            level=level,
+            exact=exact,
+        )
+        if width_metrics is None:
+            self._update_width_ratio_display()
+            return
+        self._update_width_ratio_display(width_metrics)
+        self._update_width_plot_artists(plot_state, width_metrics, x_prof, y_prof, z_prof)
+        self.canvas_2d.draw_idle()
 
     @staticmethod
     def _choose_result_array(result_dict, raw_key, norm_key):
@@ -3638,7 +3970,7 @@ class PSFSimulatorApp:
         else:
             plt.imsave(path, data, cmap="gray", vmin=0.0, vmax=1.0)
 
-    def _save_axis_snapshot(self, ax, path, dpi=300, extra_axes=None):
+    def _save_axis_snapshot(self, ax, path, dpi=None, extra_axes=None):
         fig = self.fig_2d
         fig.canvas.draw()
         renderer = fig.canvas.get_renderer()
@@ -3651,7 +3983,10 @@ class PSFSimulatorApp:
                 bboxes.append(extra.get_tightbbox(renderer))
         bbox = Bbox.union(bboxes)
         bbox_inches = bbox.transformed(fig.dpi_scale_trans.inverted())
-        fig.savefig(path, dpi=int(dpi), bbox_inches=bbox_inches)
+        save_kwargs = {"bbox_inches": bbox_inches}
+        if dpi is not None:
+            save_kwargs["dpi"] = int(dpi)
+        fig.savefig(path, **save_kwargs)
 
     def _show_2d_axis_context_menu(self, event):
         ax = getattr(event, "inaxes", None)
@@ -3663,8 +3998,35 @@ class PSFSimulatorApp:
 
         menu = tk.Menu(self.root, tearoff=0)
         menu.add_command(
-            label="Save plot as PNG (300 DPI)",
-            command=lambda ax=ax, info=info: self._save_plot_png_dialog(ax, info),
+            label="Save plot as PDF (vector)",
+            command=lambda ax=ax, info=info: self._save_plot_dialog(
+                ax,
+                info,
+                title_suffix="PDF",
+                defaultextension=".pdf",
+                filetypes=[("PDF (vector)", "*.pdf"), ("All files", "*.*")],
+            ),
+        )
+        menu.add_command(
+            label="Save plot as SVG (vector text)",
+            command=lambda ax=ax, info=info: self._save_plot_dialog(
+                ax,
+                info,
+                title_suffix="SVG",
+                defaultextension=".svg",
+                filetypes=[("SVG (editable text)", "*.svg"), ("All files", "*.*")],
+            ),
+        )
+        menu.add_command(
+            label="Save plot as PNG (600 DPI)",
+            command=lambda ax=ax, info=info: self._save_plot_dialog(
+                ax,
+                info,
+                title_suffix="PNG",
+                defaultextension=".png",
+                filetypes=[("PNG image (600 DPI)", "*.png"), ("All files", "*.*")],
+                dpi=600,
+            ),
         )
         if info.get("array_data") is not None:
             menu.add_command(
@@ -3690,15 +4052,12 @@ class PSFSimulatorApp:
         finally:
             menu.grab_release()
 
-    def _save_plot_png_dialog(self, ax, info):
+    def _save_plot_dialog(self, ax, info, title_suffix, defaultextension, filetypes, dpi=None):
         path = filedialog.asksaveasfilename(
-            title=f"Save {info['name']} plot as PNG",
+            title=f"Save {info['name']} plot as {title_suffix}",
             initialdir=self.saved_simulation_dir,
-            defaultextension=".png",
-            filetypes=[
-                ("PNG image (300 DPI)", "*.png"),
-                ("All files", "*.*"),
-            ],
+            defaultextension=defaultextension,
+            filetypes=filetypes,
         )
         if not path:
             return
@@ -3706,13 +4065,13 @@ class PSFSimulatorApp:
         ext = os.path.splitext(path)[1].lower()
         out_path = path
         if ext == "":
-            out_path = f"{path}.png"
+            out_path = f"{path}{defaultextension}"
 
         try:
             self._save_axis_snapshot(
                 ax=ax,
                 path=out_path,
-                dpi=300,
+                dpi=dpi,
                 extra_axes=info.get("extra_axes"),
             )
             self.status_var.set(f"Saved plot image for {info['name']}: {out_path}")
@@ -3825,6 +4184,7 @@ class PSFSimulatorApp:
     def _on_root_destroy(self, event=None):
         if event is not None and event.widget is not self.root:
             return
+        self._cancel_width_entry_job()
         if self._qt_pump_job is not None:
             try:
                 self.root.after_cancel(self._qt_pump_job)
@@ -4174,18 +4534,32 @@ class PSFSimulatorApp:
         try:
             level = float(value)
         except Exception:
-            level = 0.50
-        level = min(0.99, max(0.01, level))
-        self.width_level_var.set(level)
-        self.width_level_label.configure(text=f"{level:.2f}")
-        self._refresh_2d_plots()
+            level = self._current_width_level()
+        self._cancel_width_entry_job()
+        self._apply_width_level(level, source="slider", update_entry=True)
+
+    def _on_width_level_entry_key_release(self, _event=None):
+        self._cancel_width_entry_job()
+        self._width_entry_job = self.root.after(120, self._apply_width_level_from_entry_live)
+
+    def _apply_width_level_from_entry_live(self):
+        self._width_entry_job = None
+        level = self._parse_width_level_text(require_in_range=True)
+        if level is None:
+            return
+        self._apply_width_level(level, source="entry", update_entry=False)
 
     def _on_width_level_entry(self, _event=None):
-        try:
-            level = float(self.width_level_var.get())
-        except Exception:
-            level = 0.50
-        self._on_width_level(level)
+        self._cancel_width_entry_job()
+        level = self._parse_width_level_text(clamp=True)
+        if level is None:
+            self._set_width_level_controls(
+                self._current_width_level(),
+                slider_level=self._quantize_width_level(self._current_width_level()),
+                update_entry=True,
+            )
+            return
+        self._apply_width_level(level, source="entry", update_entry=True)
 
     def _on_iso_level(self, value):
         try:
@@ -4219,8 +4593,10 @@ class PSFSimulatorApp:
             self._cursor_axes_map = {}
             self._profile_axes_map = {}
             self._axes_export_map = {}
+            self._width_plot_artists = {}
             self._clear_profile_cursor_artists()
             self._profile_drag_ax = None
+            self._update_width_ratio_display()
             return
 
         r = self.results_2d
@@ -4237,20 +4613,13 @@ class PSFSimulatorApp:
         i_xz = self._display_intensity(self._choose_result_array(r, "I_xz", "I_xz_norm"))
         i_yz = self._display_intensity(self._choose_result_array(r, "I_yz", "I_yz_norm"))
 
-        level = float(self.width_level_var.get())
-        width_metrics = self.last_simulator.compute_peak_width_metrics(
-            x_coords=r["x_coords"],
-            y_coords=r["y_coords"],
-            z_coords=r["z_coords"],
-            i_xy_norm=i_xy,
-            i_xz_norm=i_xz,
-            i_yz_norm=i_yz,
-            level=level,
+        width_metrics, x_prof, y_prof, z_prof = self._resolve_width_metrics_and_profiles(
+            level=self._current_width_level(),
+            exact=bool(self._width_level_source == "entry"),
         )
-
-        x_prof = width_metrics["x_profile_peak"]
-        y_prof = width_metrics["y_profile_peak"]
-        z_prof = width_metrics["z_profile_peak"]
+        if width_metrics is None:
+            raise RuntimeError("Width metrics are unavailable for the current 2D result.")
+        self._update_width_ratio_display(width_metrics)
 
         mask_extent = [
             -0.5 * p["size_x"] * 1e3,
@@ -4263,8 +4632,32 @@ class PSFSimulatorApp:
         ep_y_mm = r["entrance_pupil_y_coords"] * 1e3
         ep_extent = [ep_x_mm[0], ep_x_mm[-1], ep_y_mm[0], ep_y_mm[-1]]
 
+        pupil_before = self._display_intensity(
+            self._choose_result_array(
+                r,
+                "intensity_at_entrance_pupil",
+                "intensity_at_entrance_pupil_norm",
+            ),
+            apply_power=False,
+        ).T
+        pupil_after = self._display_intensity(
+            self._choose_result_array(
+                r,
+                "intensity_after_pupil_mask",
+                "intensity_after_pupil_mask_norm",
+            ),
+            apply_power=False,
+        ).T
+        optical_norm = intensity_norm(np.stack([pupil_before, pupil_after]), vmin=0.0)
+        psf_vmax = max(
+            float(np.nanmax(i_xy)) if np.size(i_xy) else 0.0,
+            float(np.nanmax(i_xz)) if np.size(i_xz) else 0.0,
+            float(np.nanmax(i_yz)) if np.size(i_yz) else 0.0,
+            1.0,
+        )
+
         self.fig_2d.clear()
-        axes = self.fig_2d.subplots(3, 3)
+        axes = self.fig_2d.subplots(3, 3, gridspec_kw={"height_ratios": [1.0, 1.0, 0.7]})
 
         im0 = axes[0, 0].imshow(
             np.asarray(r["input_intensity"], dtype=float).T,
@@ -4274,122 +4667,139 @@ class PSFSimulatorApp:
             aspect="equal",
             vmin=0.0,
             vmax=1.0,
+            interpolation="nearest",
         )
-        axes[0, 0].set_title("Input mask")
-        axes[0, 0].set_xlabel("x (mm)")
-        axes[0, 0].set_ylabel("y (mm)")
-        cbar0 = self.fig_2d.colorbar(im0, ax=axes[0, 0], fraction=0.046, pad=0.04)
+        style_image_axis(axes[0, 0], title="Mask", xlabel="x (mm)", ylabel="y (mm)")
+        cbar0 = add_compact_colorbar(self.fig_2d, im0, axes[0, 0], "Mask value")
 
         im1 = axes[0, 1].imshow(
-            self._display_intensity(
-                self._choose_result_array(
-                    r,
-                    "intensity_at_entrance_pupil",
-                    "intensity_at_entrance_pupil_norm",
-                ),
-                apply_power=False,
-            ).T,
+            pupil_before,
             origin="lower",
-            cmap="inferno",
+            cmap="magma",
             extent=ep_extent,
             aspect="equal",
+            norm=optical_norm,
+            interpolation="nearest",
         )
-        axes[0, 1].set_title("After Fresnel")
-        axes[0, 1].set_xlabel("x (mm)")
-        axes[0, 1].set_ylabel("y (mm)")
-        cbar1 = self.fig_2d.colorbar(im1, ax=axes[0, 1], fraction=0.046, pad=0.04)
+        style_image_axis(axes[0, 1], title="Fresnel", xlabel="x (mm)", ylabel="y (mm)")
+        cbar1 = add_compact_colorbar(
+            self.fig_2d,
+            im1,
+            axes[0, 1],
+            self._display_intensity_label(apply_power=False),
+        )
 
         im2 = axes[0, 2].imshow(
-            self._display_intensity(
-                self._choose_result_array(
-                    r,
-                    "intensity_after_pupil_mask",
-                    "intensity_after_pupil_mask_norm",
-                ),
-                apply_power=False,
-            ).T,
+            pupil_after,
             origin="lower",
-            cmap="inferno",
+            cmap="magma",
             extent=ep_extent,
             aspect="equal",
+            norm=optical_norm,
+            interpolation="nearest",
         )
-        axes[0, 2].set_title("After entrance pupil")
-        axes[0, 2].set_xlabel("x (mm)")
-        axes[0, 2].set_ylabel("y (mm)")
-        cbar2 = self.fig_2d.colorbar(im2, ax=axes[0, 2], fraction=0.046, pad=0.04)
+        style_image_axis(axes[0, 2], title="Pupil", xlabel="x (mm)", ylabel="y (mm)")
+        cbar2 = add_compact_colorbar(
+            self.fig_2d,
+            im2,
+            axes[0, 2],
+            self._display_intensity_label(apply_power=False),
+        )
 
         im3 = axes[1, 0].imshow(
             i_xy,
             origin="lower",
-            cmap="inferno",
+            cmap="magma",
             extent=[x_lim[0], x_lim[1], y_lim[0], y_lim[1]],
             aspect="equal",
+            vmin=0.0,
+            vmax=psf_vmax,
+            interpolation="nearest",
         )
-        axes[1, 0].set_title(f"XY @ z={r['z_focus'] * 1e6:.3f} um")
-        axes[1, 0].set_xlabel("x (um)")
-        axes[1, 0].set_ylabel("y (um)")
-        axes[1, 0].set_xlim(x_lim[0], x_lim[1])
-        axes[1, 0].set_ylim(y_lim[0], y_lim[1])
-        axes[1, 0].set_aspect("equal", adjustable="box", anchor="C")
-        cbar3 = self.fig_2d.colorbar(im3, ax=axes[1, 0], fraction=0.046, pad=0.04)
+        style_image_axis(
+            axes[1, 0],
+            title="XY",
+            xlabel="x (um)",
+            ylabel="y (um)",
+        )
+        self._set_image_extent(axes[1, 0], x_lim, y_lim)
+        cbar3 = add_compact_colorbar(self.fig_2d, im3, axes[1, 0], self._display_intensity_label())
 
         im4 = axes[1, 1].imshow(
             i_xz,
             origin="lower",
-            cmap="inferno",
+            cmap="magma",
             extent=[x_lim[0], x_lim[1], z_lim[0], z_lim[1]],
             aspect="equal",
+            vmin=0.0,
+            vmax=psf_vmax,
+            interpolation="nearest",
         )
-        axes[1, 1].set_title("XZ")
-        axes[1, 1].set_xlabel("x (um)")
-        axes[1, 1].set_ylabel("z (um)")
-        axes[1, 1].set_xlim(x_lim[0], x_lim[1])
-        axes[1, 1].set_ylim(z_lim[0], z_lim[1])
-        axes[1, 1].set_aspect("equal", adjustable="box", anchor="C")
-        cbar4 = self.fig_2d.colorbar(im4, ax=axes[1, 1], fraction=0.046, pad=0.04)
+        style_image_axis(axes[1, 1], title="XZ", xlabel="x (um)", ylabel="z (um)")
+        self._set_image_extent(axes[1, 1], x_lim, z_lim)
+        cbar4 = add_compact_colorbar(self.fig_2d, im4, axes[1, 1], self._display_intensity_label())
 
         im5 = axes[1, 2].imshow(
             i_yz,
             origin="lower",
-            cmap="inferno",
+            cmap="magma",
             extent=[y_lim[0], y_lim[1], z_lim[0], z_lim[1]],
             aspect="equal",
+            vmin=0.0,
+            vmax=psf_vmax,
+            interpolation="nearest",
         )
-        axes[1, 2].set_title("YZ")
-        axes[1, 2].set_xlabel("y (um)")
-        axes[1, 2].set_ylabel("z (um)")
-        axes[1, 2].set_xlim(y_lim[0], y_lim[1])
-        axes[1, 2].set_ylim(z_lim[0], z_lim[1])
-        axes[1, 2].set_aspect("equal", adjustable="box", anchor="C")
-        cbar5 = self.fig_2d.colorbar(im5, ax=axes[1, 2], fraction=0.046, pad=0.04)
+        style_image_axis(axes[1, 2], title="YZ", xlabel="y (um)", ylabel="z (um)")
+        self._set_image_extent(axes[1, 2], y_lim, z_lim)
+        cbar5 = add_compact_colorbar(self.fig_2d, im5, axes[1, 2], self._display_intensity_label())
 
         norm_on = bool(self.normalize_var.get())
         y_label = "Normalized intensity" if norm_on else "Intensity (a.u.)"
 
-        x_line = self._peak_scaled_level(x_prof, level)
-        y_line = self._peak_scaled_level(y_prof, level)
-        z_line = self._peak_scaled_level(z_prof, level)
+        metric_level = float(width_metrics["level"])
+        x_line = self._peak_scaled_level(x_prof, metric_level)
+        y_line = self._peak_scaled_level(y_prof, metric_level)
+        z_line = self._peak_scaled_level(z_prof, metric_level)
 
-        axes[2, 0].plot(x_um, x_prof, "r-", linewidth=2)
-        axes[2, 0].axhline(x_line, color="k", linestyle="--", linewidth=1)
-        axes[2, 0].set_title(f"X width@{level:.2f} = {width_metrics['width_x_um']:.3f} um")
-        axes[2, 0].set_xlabel("x (um)")
-        axes[2, 0].set_ylabel(y_label)
-        axes[2, 0].grid(True, alpha=0.3)
+        axes[2, 0].plot(x_um, x_prof, color="#1B3B6F", linewidth=1.35, zorder=3)
+        x_level_line = axes[2, 0].axhline(
+            x_line, color="#4D4D4D", linestyle="--", linewidth=0.9, zorder=2
+        )
+        style_profile_axis(
+            axes[2, 0],
+            title=self._format_profile_axis_title("X"),
+            xlabel="x (um)",
+            ylabel=y_label,
+        )
 
-        axes[2, 1].plot(y_um, y_prof, "g-", linewidth=2)
-        axes[2, 1].axhline(y_line, color="k", linestyle="--", linewidth=1)
-        axes[2, 1].set_title(f"Y width@{level:.2f} = {width_metrics['width_y_um']:.3f} um")
-        axes[2, 1].set_xlabel("y (um)")
-        axes[2, 1].set_ylabel(y_label)
-        axes[2, 1].grid(True, alpha=0.3)
+        axes[2, 1].plot(y_um, y_prof, color="#D55E00", linewidth=1.35, zorder=3)
+        y_level_line = axes[2, 1].axhline(
+            y_line, color="#4D4D4D", linestyle="--", linewidth=0.9, zorder=2
+        )
+        style_profile_axis(
+            axes[2, 1],
+            title=self._format_profile_axis_title("Y"),
+            xlabel="y (um)",
+            ylabel=y_label,
+        )
 
-        axes[2, 2].plot(z_um, z_prof, "b-", linewidth=2)
-        axes[2, 2].axhline(z_line, color="k", linestyle="--", linewidth=1)
-        axes[2, 2].set_title(f"Z width@{level:.2f} = {width_metrics['width_z_um']:.3f} um")
-        axes[2, 2].set_xlabel("z (um)")
-        axes[2, 2].set_ylabel(y_label)
-        axes[2, 2].grid(True, alpha=0.3)
+        axes[2, 2].plot(z_um, z_prof, color="#007C73", linewidth=1.35, zorder=3)
+        z_level_line = axes[2, 2].axhline(
+            z_line, color="#4D4D4D", linestyle="--", linewidth=0.9, zorder=2
+        )
+        style_profile_axis(
+            axes[2, 2],
+            title=self._format_profile_axis_title("Z"),
+            xlabel="z (um)",
+            ylabel=y_label,
+        )
+
+        x_top = max(float(np.nanmax(x_prof)) if np.size(x_prof) else 0.0, float(x_line), 1e-6)
+        y_top = max(float(np.nanmax(y_prof)) if np.size(y_prof) else 0.0, float(y_line), 1e-6)
+        z_top = max(float(np.nanmax(z_prof)) if np.size(z_prof) else 0.0, float(z_line), 1e-6)
+        axes[2, 0].set_ylim(0.0, 1.05 * x_top)
+        axes[2, 1].set_ylim(0.0, 1.05 * y_top)
+        axes[2, 2].set_ylim(0.0, 1.05 * z_top)
 
         self._cursor_axes_map = {
             axes[1, 0]: {
@@ -4500,8 +4910,17 @@ class PSFSimulatorApp:
             axes[2, 1]: {"name": "Y intensity profile", "array_data": None, "extra_axes": []},
             axes[2, 2]: {"name": "Z intensity profile", "array_data": None, "extra_axes": []},
         }
+        self._width_plot_artists = {
+            "cache_key": self._current_width_metrics_cache_key(),
+            "x_axis": axes[2, 0],
+            "y_axis": axes[2, 1],
+            "z_axis": axes[2, 2],
+            "x_level_line": x_level_line,
+            "y_level_line": y_level_line,
+            "z_level_line": z_level_line,
+        }
 
-        self.fig_2d.tight_layout()
+        self.fig_2d.align_labels()
         self.canvas_2d.draw()
 
     def _refresh_3d_plot(self, show_window=False):

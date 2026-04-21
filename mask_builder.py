@@ -43,6 +43,19 @@ class MaskBuilderModel:
             raise ValueError("Mask contains NaN or Inf.")
         return np.clip(arr, 0.0, 1.0)
 
+    def _resize_to_current_geometry(self, arr):
+        old = np.asarray(arr, dtype=float)
+        if old.shape == (self.nx, self.ny):
+            return np.clip(old, 0.0, 1.0)
+
+        factors = (self.nx / old.shape[0], self.ny / old.shape[1])
+        resized = zoom(old, factors, order=1, mode="nearest", prefilter=False)
+        out = np.zeros((self.nx, self.ny), dtype=float)
+        nx_min = min(self.nx, resized.shape[0])
+        ny_min = min(self.ny, resized.shape[1])
+        out[:nx_min, :ny_min] = resized[:nx_min, :ny_min]
+        return np.clip(out, 0.0, 1.0)
+
     def set_geometry(self, nx, ny, size_x_mm, size_y_mm, preserve=True):
         nx_i, ny_i, sx, sy = self._validate_geometry(nx, ny, size_x_mm, size_y_mm)
         old = None if self.mask is None else np.asarray(self.mask, dtype=float)
@@ -56,17 +69,7 @@ class MaskBuilderModel:
             self.mask = np.zeros((self.nx, self.ny), dtype=float)
             return
 
-        if old.shape == (self.nx, self.ny):
-            self.mask = np.clip(old, 0.0, 1.0)
-            return
-
-        factors = (self.nx / old.shape[0], self.ny / old.shape[1])
-        resized = zoom(old, factors, order=1, mode="nearest", prefilter=False)
-        out = np.zeros((self.nx, self.ny), dtype=float)
-        nx_min = min(self.nx, resized.shape[0])
-        ny_min = min(self.ny, resized.shape[1])
-        out[:nx_min, :ny_min] = resized[:nx_min, :ny_min]
-        self.mask = np.clip(out, 0.0, 1.0)
+        self.mask = self._resize_to_current_geometry(old)
 
     def set_mask(self, mask_2d):
         arr = self._as_2d_float(mask_2d)
@@ -97,6 +100,10 @@ class MaskBuilderModel:
         y = np.linspace(-0.5 * self.size_y_mm, 0.5 * self.size_y_mm, self.ny, endpoint=False)
         return x[:, None], y[None, :]
 
+    def _offset_grids_mm(self, center_x_mm=0.0, center_y_mm=0.0):
+        xg, yg = self._coord_grids_mm()
+        return xg - float(center_x_mm), yg - float(center_y_mm)
+
     def _apply_region(self, region, mode, value=1.0):
         mode_norm = str(mode).strip().lower()
         if mode_norm not in {"add", "erase"}:
@@ -110,10 +117,8 @@ class MaskBuilderModel:
         r = float(radius_mm)
         if r <= 0:
             raise ValueError("Circle radius must be positive.")
-        cx = float(center_x_mm)
-        cy = float(center_y_mm)
-        xg, yg = self._coord_grids_mm()
-        region = (xg - cx) ** 2 + (yg - cy) ** 2 <= r * r
+        dx, dy = self._offset_grids_mm(center_x_mm, center_y_mm)
+        region = dx**2 + dy**2 <= r * r
         self._apply_region(region, mode=mode, value=value)
 
     def add_ring(
@@ -131,10 +136,8 @@ class MaskBuilderModel:
             raise ValueError("Ring inner radius must be >= 0.")
         if rout <= rin:
             raise ValueError("Ring outer radius must be greater than inner radius.")
-        cx = float(center_x_mm)
-        cy = float(center_y_mm)
-        xg, yg = self._coord_grids_mm()
-        d2 = (xg - cx) ** 2 + (yg - cy) ** 2
+        dx, dy = self._offset_grids_mm(center_x_mm, center_y_mm)
+        d2 = dx**2 + dy**2
         region = (d2 >= rin * rin) & (d2 <= rout * rout)
         self._apply_region(region, mode=mode, value=value)
 
@@ -143,8 +146,6 @@ class MaskBuilderModel:
         h = float(height_mm)
         if w <= 0 or h <= 0:
             raise ValueError("Rectangle width and height must be positive.")
-        cx = float(center_x_mm)
-        cy = float(center_y_mm)
-        xg, yg = self._coord_grids_mm()
-        region = (np.abs(xg - cx) <= 0.5 * w) & (np.abs(yg - cy) <= 0.5 * h)
+        dx, dy = self._offset_grids_mm(center_x_mm, center_y_mm)
+        region = (np.abs(dx) <= 0.5 * w) & (np.abs(dy) <= 0.5 * h)
         self._apply_region(region, mode=mode, value=value)

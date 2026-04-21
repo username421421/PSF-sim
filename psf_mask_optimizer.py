@@ -7,15 +7,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from scipy.optimize import minimize
-try:
-    from scipy.optimize import differential_evolution
-except Exception:
-    differential_evolution = None
-try:
-    from scipy.optimize import shgo
-except Exception:
-    shgo = None
-
 from PSF_simulator import AxialSymmetricPSFSimulator, CartesianPSFSimulator
 
 
@@ -56,6 +47,27 @@ class OptimizerResult:
     settings: Dict[str, Any]
     baseline_result_2d: Dict[str, Any]
     optimized_result_2d: Dict[str, Any]
+
+
+def _optional_scipy_optimizer(name: str):
+    try:
+        from scipy import optimize as scipy_optimize
+    except Exception:
+        return None
+    return getattr(scipy_optimize, name, None)
+
+
+def _metrics_um_dict(metrics: Dict[str, Any]) -> Dict[str, float]:
+    return {
+        "width_x_um": float(metrics["width_x_um"]),
+        "width_y_um": float(metrics["width_y_um"]),
+        "width_z_um": float(metrics["width_z_um"]),
+        "abs_x_minus_y_um": float(metrics.get("abs_x_minus_y_um", np.nan)),
+    }
+
+
+differential_evolution = _optional_scipy_optimizer("differential_evolution")
+shgo = _optional_scipy_optimizer("shgo")
 
 
 def _resize_map(arr: np.ndarray, out_shape: Tuple[int, int]) -> np.ndarray:
@@ -3395,18 +3407,8 @@ class PostFresnelMaskOptimizer:
         return OptimizerResult(
             best_objective=float(final_obj),
             baseline_objective=float(baseline_obj),
-            best_metrics_um={
-                "width_x_um": float(final_metrics["width_x_um"]),
-                "width_y_um": float(final_metrics["width_y_um"]),
-                "width_z_um": float(final_metrics["width_z_um"]),
-                "abs_x_minus_y_um": float(final_metrics.get("abs_x_minus_y_um", np.nan)),
-            },
-            baseline_metrics_um={
-                "width_x_um": float(baseline_metrics["width_x_um"]),
-                "width_y_um": float(baseline_metrics["width_y_um"]),
-                "width_z_um": float(baseline_metrics["width_z_um"]),
-                "abs_x_minus_y_um": float(baseline_metrics.get("abs_x_minus_y_um", np.nan)),
-            },
+            best_metrics_um=_metrics_um_dict(final_metrics),
+            baseline_metrics_um=_metrics_um_dict(baseline_metrics),
             amplitude_mask=amp_out,
             phase_mask_rad=phase_out,
             complex_mask=np.asarray(complex_out, dtype=np.complex128),

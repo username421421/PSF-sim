@@ -9,6 +9,14 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from plot_style import (
+    add_compact_colorbar,
+    add_panel_labels,
+    apply_publication_style,
+    style_image_axis,
+    style_profile_axis,
+)
+
 try:
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
@@ -17,6 +25,9 @@ except Exception:  # pragma: no cover - optional for headless runs
     filedialog = None
     messagebox = None
     ttk = None
+
+
+apply_publication_style()
 
 
 class SimulationStoppedError(RuntimeError):
@@ -507,6 +518,75 @@ class CartesianPSFSimulator:
     def _fwhm_1d(x, y):
         return CartesianPSFSimulator._width_at_level_1d(x, y, level=0.5)
 
+    @staticmethod
+    def _safe_width_ratio(numerator, denominator):
+        num = float(numerator)
+        den = float(denominator)
+        if (not np.isfinite(num)) or (not np.isfinite(den)) or den == 0.0:
+            return np.nan
+        return num / den
+
+    @staticmethod
+    def _pack_peak_width_metrics(
+        *,
+        level,
+        x_profile,
+        y_profile,
+        z_profile,
+        width_x_m,
+        width_y_m,
+        width_z_m,
+        peak_x_index,
+        peak_y_index,
+    ):
+        return {
+            "level": float(level),
+            "x_profile_peak": np.asarray(x_profile, dtype=float),
+            "y_profile_peak": np.asarray(y_profile, dtype=float),
+            "z_profile_peak": np.asarray(z_profile, dtype=float),
+            "width_x_m": float(width_x_m),
+            "width_y_m": float(width_y_m),
+            "width_z_m": float(width_z_m),
+            "width_x_um": float(width_x_m * 1e6) if np.isfinite(width_x_m) else np.nan,
+            "width_y_um": float(width_y_m * 1e6) if np.isfinite(width_y_m) else np.nan,
+            "width_z_um": float(width_z_m * 1e6) if np.isfinite(width_z_m) else np.nan,
+            "width_ratio_zx": CartesianPSFSimulator._safe_width_ratio(width_z_m, width_x_m),
+            "width_ratio_zy": CartesianPSFSimulator._safe_width_ratio(width_z_m, width_y_m),
+            "peak_x_index": int(peak_x_index),
+            "peak_y_index": int(peak_y_index),
+        }
+
+    @staticmethod
+    def _extract_peak_width_profiles(i_xy_norm, i_xz_norm, i_yz_norm=None):
+        i_xy_arr = np.asarray(i_xy_norm, dtype=float)
+        i_xz_arr = np.asarray(i_xz_norm, dtype=float)
+        i_yz_arr = None if i_yz_norm is None else np.asarray(i_yz_norm, dtype=float)
+
+        peak_y_idx, peak_x_idx = np.unravel_index(int(np.argmax(i_xy_arr)), i_xy_arr.shape)
+        x_profile = np.asarray(i_xy_arr[peak_y_idx, :], dtype=float)
+        use_yz = (
+            i_yz_arr is not None
+            and i_yz_arr.ndim == 2
+            and i_yz_arr.shape[0] > 0
+            and i_yz_arr.shape[1] > 0
+        )
+        if use_yz:
+            peak_z_idx_yz, peak_y_idx_yz = np.unravel_index(int(np.argmax(i_yz_arr)), i_yz_arr.shape)
+            y_profile = np.asarray(i_yz_arr[peak_z_idx_yz, :], dtype=float)
+            z_profile = np.asarray(i_yz_arr[:, peak_y_idx_yz], dtype=float)
+        else:
+            y_profile = np.asarray(i_xy_arr[:, peak_x_idx], dtype=float)
+            x_idx_for_z = min(max(int(peak_x_idx), 0), i_xz_arr.shape[1] - 1)
+            z_profile = np.asarray(i_xz_arr[:, x_idx_for_z], dtype=float)
+
+        return {
+            "x_profile_peak": x_profile,
+            "y_profile_peak": y_profile,
+            "z_profile_peak": z_profile,
+            "peak_x_index": int(peak_x_idx),
+            "peak_y_index": int(peak_y_idx),
+        }
+
     def _compute_fwhm_metrics(self, x_coords, y_coords, z_coords, i_xy_norm, i_xz_norm):
         center_idx = int(len(x_coords) // 2)
 
@@ -552,45 +632,143 @@ class CartesianPSFSimulator:
         level = float(level)
         level = min(1.0, max(0.0, level))
 
-        i_xy_norm = np.asarray(i_xy_norm)
-        i_xz_norm = np.asarray(i_xz_norm)
-        i_yz_arr = None if i_yz_norm is None else np.asarray(i_yz_norm)
-
-        peak_y_idx, peak_x_idx = np.unravel_index(int(np.argmax(i_xy_norm)), i_xy_norm.shape)
-        x_profile = i_xy_norm[peak_y_idx, :]
-        use_yz = (
-            i_yz_arr is not None
-            and i_yz_arr.ndim == 2
-            and i_yz_arr.shape[0] > 0
-            and i_yz_arr.shape[1] > 0
+        peak_profiles = self._extract_peak_width_profiles(
+            i_xy_norm=i_xy_norm,
+            i_xz_norm=i_xz_norm,
+            i_yz_norm=i_yz_norm,
         )
-        if use_yz:
-            peak_z_idx_yz, peak_y_idx_yz = np.unravel_index(int(np.argmax(i_yz_arr)), i_yz_arr.shape)
-            y_profile = i_yz_arr[peak_z_idx_yz, :]
-            z_profile = i_yz_arr[:, peak_y_idx_yz]
-        else:
-            y_profile = i_xy_norm[:, peak_x_idx]
-            x_idx_for_z = min(max(int(peak_x_idx), 0), i_xz_norm.shape[1] - 1)
-            z_profile = i_xz_norm[:, x_idx_for_z]
+        return self.peak_width_metrics_from_profiles(
+            x_coords=x_coords,
+            y_coords=y_coords,
+            z_coords=z_coords,
+            x_profile=peak_profiles["x_profile_peak"],
+            y_profile=peak_profiles["y_profile_peak"],
+            z_profile=peak_profiles["z_profile_peak"],
+            level=level,
+            peak_x_index=int(peak_profiles["peak_x_index"]),
+            peak_y_index=int(peak_profiles["peak_y_index"]),
+        )
+
+    def peak_width_metrics_from_profiles(
+        self,
+        x_coords,
+        y_coords,
+        z_coords,
+        x_profile,
+        y_profile,
+        z_profile,
+        level=0.5,
+        peak_x_index=0,
+        peak_y_index=0,
+    ):
+        level = float(level)
+        level = min(1.0, max(0.0, level))
+
+        x_profile = np.asarray(x_profile, dtype=float)
+        y_profile = np.asarray(y_profile, dtype=float)
+        z_profile = np.asarray(z_profile, dtype=float)
 
         width_x_m = self._width_at_level_1d(x_coords, x_profile, level=level)
         width_y_m = self._width_at_level_1d(y_coords, y_profile, level=level)
         width_z_m = self._width_at_level_1d(z_coords, z_profile, level=level)
+        return self._pack_peak_width_metrics(
+            level=level,
+            x_profile=x_profile,
+            y_profile=y_profile,
+            z_profile=z_profile,
+            width_x_m=width_x_m,
+            width_y_m=width_y_m,
+            width_z_m=width_z_m,
+            peak_x_index=peak_x_index,
+            peak_y_index=peak_y_index,
+        )
+
+    def precompute_peak_width_metrics(
+        self,
+        x_coords,
+        y_coords,
+        z_coords,
+        i_xy_norm,
+        i_xz_norm,
+        i_yz_norm=None,
+        level_min=0.01,
+        level_max=0.99,
+        level_step=0.001,
+    ):
+        level_min = float(level_min)
+        level_max = float(level_max)
+        level_step = float(level_step)
+        if level_step <= 0.0:
+            raise ValueError("level_step must be positive.")
+        if level_max < level_min:
+            raise ValueError("level_max must be >= level_min.")
+
+        peak_profiles = self._extract_peak_width_profiles(
+            i_xy_norm=i_xy_norm,
+            i_xz_norm=i_xz_norm,
+            i_yz_norm=i_yz_norm,
+        )
+        x_profile = peak_profiles["x_profile_peak"]
+        y_profile = peak_profiles["y_profile_peak"]
+        z_profile = peak_profiles["z_profile_peak"]
+
+        step_count = int(round((level_max - level_min) / level_step))
+        levels = level_min + level_step * np.arange(step_count + 1, dtype=np.float64)
+        levels = np.clip(np.round(levels, 6), level_min, level_max)
+
+        width_x_m = np.empty(levels.shape, dtype=np.float64)
+        width_y_m = np.empty(levels.shape, dtype=np.float64)
+        width_z_m = np.empty(levels.shape, dtype=np.float64)
+        for idx, level_value in enumerate(levels):
+            width_x_m[idx] = self._width_at_level_1d(x_coords, x_profile, level=float(level_value))
+            width_y_m[idx] = self._width_at_level_1d(y_coords, y_profile, level=float(level_value))
+            width_z_m[idx] = self._width_at_level_1d(z_coords, z_profile, level=float(level_value))
+
+        width_ratio_zx = np.full(levels.shape, np.nan, dtype=np.float64)
+        width_ratio_zy = np.full(levels.shape, np.nan, dtype=np.float64)
+        valid_zx = np.isfinite(width_z_m) & np.isfinite(width_x_m) & (width_x_m != 0.0)
+        valid_zy = np.isfinite(width_z_m) & np.isfinite(width_y_m) & (width_y_m != 0.0)
+        width_ratio_zx[valid_zx] = width_z_m[valid_zx] / width_x_m[valid_zx]
+        width_ratio_zy[valid_zy] = width_z_m[valid_zy] / width_y_m[valid_zy]
 
         return {
-            "level": level,
+            "levels": levels,
+            "level_min": level_min,
+            "level_max": level_max,
+            "level_step": level_step,
             "x_profile_peak": x_profile,
             "y_profile_peak": y_profile,
             "z_profile_peak": z_profile,
             "width_x_m": width_x_m,
             "width_y_m": width_y_m,
             "width_z_m": width_z_m,
-            "width_x_um": float(width_x_m * 1e6) if np.isfinite(width_x_m) else np.nan,
-            "width_y_um": float(width_y_m * 1e6) if np.isfinite(width_y_m) else np.nan,
-            "width_z_um": float(width_z_m * 1e6) if np.isfinite(width_z_m) else np.nan,
-            "peak_x_index": int(peak_x_idx),
-            "peak_y_index": int(peak_y_idx),
+            "width_x_um": width_x_m * 1e6,
+            "width_y_um": width_y_m * 1e6,
+            "width_z_um": width_z_m * 1e6,
+            "width_ratio_zx": width_ratio_zx,
+            "width_ratio_zy": width_ratio_zy,
+            "peak_x_index": int(peak_profiles["peak_x_index"]),
+            "peak_y_index": int(peak_profiles["peak_y_index"]),
         }
+
+    @staticmethod
+    def peak_width_metrics_from_precomputed(precomputed, level):
+        levels = np.asarray(precomputed["levels"], dtype=float).ravel()
+        if levels.size == 0:
+            raise ValueError("precomputed width metrics contain no levels.")
+        idx = int(np.argmin(np.abs(levels - float(level))))
+
+        return CartesianPSFSimulator._pack_peak_width_metrics(
+            level=levels[idx],
+            x_profile=precomputed["x_profile_peak"],
+            y_profile=precomputed["y_profile_peak"],
+            z_profile=precomputed["z_profile_peak"],
+            width_x_m=np.asarray(precomputed["width_x_m"], dtype=float)[idx],
+            width_y_m=np.asarray(precomputed["width_y_m"], dtype=float)[idx],
+            width_z_m=np.asarray(precomputed["width_z_m"], dtype=float)[idx],
+            peak_x_index=precomputed["peak_x_index"],
+            peak_y_index=precomputed["peak_y_index"],
+        )
 
     @staticmethod
     def apply_user_mask(intensity, mask):
@@ -2670,43 +2848,62 @@ if __name__ == "__main__":
     i_xz = results["I_xz_norm"]
     i_yz = results["I_yz_norm"]
 
-    fig, axes = plt.subplots(3, 3, figsize=(16, 13))
+    fig, axes = plt.subplots(
+        3,
+        3,
+        figsize=(7.2, 5.5),
+        constrained_layout=True,
+        gridspec_kw={"height_ratios": [1.0, 1.0, 0.72]},
+    )
+
+    add_panel_labels(axes)
 
     im_xy = axes[0, 0].imshow(
         i_xy,
         origin="lower",
-        cmap="inferno",
+        cmap="magma",
         extent=[x_um[0], x_um[-1], y_um[0], y_um[-1]],
         aspect="equal",
+        vmin=0.0,
+        vmax=1.0,
+        interpolation="nearest",
+        rasterized=True,
     )
-    axes[0, 0].set_title(f"XY plane at z={results['z_focus'] * 1e6:.3f} um")
-    axes[0, 0].set_xlabel("x (um)")
-    axes[0, 0].set_ylabel("y (um)")
-    fig.colorbar(im_xy, ax=axes[0, 0], fraction=0.046, pad=0.04)
+    style_image_axis(
+        axes[0, 0],
+        title="XY",
+        xlabel="x (um)",
+        ylabel="y (um)",
+    )
+    add_compact_colorbar(fig, im_xy, axes[0, 0], "Normalized intensity")
 
     im_xz = axes[0, 1].imshow(
         i_xz,
         origin="lower",
-        cmap="inferno",
+        cmap="magma",
         extent=[x_um[0], x_um[-1], z_um[0], z_um[-1]],
         aspect="equal",
+        vmin=0.0,
+        vmax=1.0,
+        interpolation="nearest",
+        rasterized=True,
     )
-    axes[0, 1].set_title("XZ plane")
-    axes[0, 1].set_xlabel("x (um)")
-    axes[0, 1].set_ylabel("z (um)")
-    fig.colorbar(im_xz, ax=axes[0, 1], fraction=0.046, pad=0.04)
+    style_image_axis(axes[0, 1], title="XZ", xlabel="x (um)", ylabel="z (um)")
+    add_compact_colorbar(fig, im_xz, axes[0, 1], "Normalized intensity")
 
     im_yz = axes[0, 2].imshow(
         i_yz,
         origin="lower",
-        cmap="inferno",
+        cmap="magma",
         extent=[y_um[0], y_um[-1], z_um[0], z_um[-1]],
         aspect="equal",
+        vmin=0.0,
+        vmax=1.0,
+        interpolation="nearest",
+        rasterized=True,
     )
-    axes[0, 2].set_title("YZ plane")
-    axes[0, 2].set_xlabel("y (um)")
-    axes[0, 2].set_ylabel("z (um)")
-    fig.colorbar(im_yz, ax=axes[0, 2], fraction=0.046, pad=0.04)
+    style_image_axis(axes[0, 2], title="YZ", xlabel="y (um)", ylabel="z (um)")
+    add_compact_colorbar(fig, im_yz, axes[0, 2], "Normalized intensity")
 
     ep_x_mm = results["entrance_pupil_x_coords"] * 1e3
     ep_y_mm = results["entrance_pupil_y_coords"] * 1e3
@@ -2715,89 +2912,111 @@ if __name__ == "__main__":
     im_ep_before = axes[1, 0].imshow(
         results["intensity_at_entrance_pupil_norm"],
         origin="lower",
-        cmap="inferno",
+        cmap="magma",
         extent=ep_extent,
         aspect="equal",
+        vmin=0.0,
+        vmax=1.0,
+        interpolation="nearest",
+        rasterized=True,
     )
-    axes[1, 0].set_title("Entrance pupil intensity (after Fresnel)")
-    axes[1, 0].set_xlabel("y (mm)")
-    axes[1, 0].set_ylabel("x (mm)")
-    fig.colorbar(im_ep_before, ax=axes[1, 0], fraction=0.046, pad=0.04)
+    style_image_axis(axes[1, 0], title="Fresnel", xlabel="y (mm)", ylabel="x (mm)")
+    add_compact_colorbar(fig, im_ep_before, axes[1, 0], "Normalized intensity")
 
     im_ep_after = axes[1, 1].imshow(
         results["intensity_after_pupil_mask_norm"],
         origin="lower",
-        cmap="inferno",
+        cmap="magma",
         extent=ep_extent,
         aspect="equal",
+        vmin=0.0,
+        vmax=1.0,
+        interpolation="nearest",
+        rasterized=True,
     )
-    axes[1, 1].set_title("Intensity after pupil mask")
-    axes[1, 1].set_xlabel("y (mm)")
-    axes[1, 1].set_ylabel("x (mm)")
-    fig.colorbar(im_ep_after, ax=axes[1, 1], fraction=0.046, pad=0.04)
+    style_image_axis(axes[1, 1], title="Pupil", xlabel="y (mm)", ylabel="x (mm)")
+    add_compact_colorbar(fig, im_ep_after, axes[1, 1], "Normalized intensity")
 
     axes[1, 2].axis("off")
     axes[1, 2].text(
-        0.02,
-        0.95,
-        "FWHM summary",
-        fontsize=12,
+        0.0,
+        1.0,
+        "Summary",
         fontweight="bold",
         va="top",
         ha="left",
+        transform=axes[1, 2].transAxes,
     )
     axes[1, 2].text(
-        0.02,
-        0.78,
+        0.0,
+        0.84,
+        f"Focus z = {results['z_focus'] * 1e6:.3f} um",
+        va="top",
+        ha="left",
+        transform=axes[1, 2].transAxes,
+    )
+    axes[1, 2].text(
+        0.0,
+        0.68,
         f"FWHM_x = {results['fwhm_x_um']:.3f} um",
-        fontsize=11,
         va="top",
         ha="left",
+        transform=axes[1, 2].transAxes,
     )
     axes[1, 2].text(
-        0.02,
-        0.62,
+        0.0,
+        0.52,
         f"FWHM_y = {results['fwhm_y_um']:.3f} um",
-        fontsize=11,
         va="top",
         ha="left",
+        transform=axes[1, 2].transAxes,
     )
     axes[1, 2].text(
-        0.02,
-        0.46,
+        0.0,
+        0.36,
         f"FWHM_z = {results['fwhm_z_um']:.3f} um",
-        fontsize=11,
         va="top",
         ha="left",
+        transform=axes[1, 2].transAxes,
     )
 
     x_profile = results["x_profile_at_y0"]
     y_profile = results["y_profile_at_x0"]
     z_profile = results["z_profile_at_x0"]
 
-    axes[2, 0].plot(x_um, x_profile, "r-", linewidth=2)
-    axes[2, 0].axhline(0.5, color="k", linestyle="--", linewidth=1)
-    axes[2, 0].set_title(f"X profile at y=0 (FWHM={results['fwhm_x_um']:.3f} um)")
-    axes[2, 0].set_xlabel("x (um)")
-    axes[2, 0].set_ylabel("Normalized intensity")
-    axes[2, 0].grid(True, alpha=0.3)
+    axes[2, 0].plot(x_um, x_profile, color="#1B3B6F", linewidth=1.35, zorder=3)
+    axes[2, 0].axhline(0.5, color="#4D4D4D", linestyle="--", linewidth=0.9, zorder=2)
+    style_profile_axis(
+        axes[2, 0],
+        title="X",
+        xlabel="x (um)",
+        ylabel="Normalized intensity",
+    )
+    axes[2, 0].set_ylim(0.0, 1.05)
 
-    axes[2, 1].plot(y_um, y_profile, "g-", linewidth=2)
-    axes[2, 1].axhline(0.5, color="k", linestyle="--", linewidth=1)
-    axes[2, 1].set_title(f"Y profile at x=0 (FWHM={results['fwhm_y_um']:.3f} um)")
-    axes[2, 1].set_xlabel("y (um)")
-    axes[2, 1].set_ylabel("Normalized intensity")
-    axes[2, 1].grid(True, alpha=0.3)
+    axes[2, 1].plot(y_um, y_profile, color="#D55E00", linewidth=1.35, zorder=3)
+    axes[2, 1].axhline(0.5, color="#4D4D4D", linestyle="--", linewidth=0.9, zorder=2)
+    style_profile_axis(
+        axes[2, 1],
+        title="Y",
+        xlabel="y (um)",
+        ylabel="Normalized intensity",
+    )
+    axes[2, 1].set_ylim(0.0, 1.05)
 
-    axes[2, 2].plot(z_um, z_profile, "b-", linewidth=2)
-    axes[2, 2].axhline(0.5, color="k", linestyle="--", linewidth=1)
-    axes[2, 2].set_title(f"Z profile at x=0 (FWHM={results['fwhm_z_um']:.3f} um)")
-    axes[2, 2].set_xlabel("z (um)")
-    axes[2, 2].set_ylabel("Normalized intensity")
-    axes[2, 2].grid(True, alpha=0.3)
+    axes[2, 2].plot(z_um, z_profile, color="#007C73", linewidth=1.35, zorder=3)
+    axes[2, 2].axhline(0.5, color="#4D4D4D", linestyle="--", linewidth=0.9, zorder=2)
+    style_profile_axis(
+        axes[2, 2],
+        title="Z",
+        xlabel="z (um)",
+        ylabel="Normalized intensity",
+    )
+    axes[2, 2].set_ylim(0.0, 1.05)
 
-    plt.tight_layout()
+    fig.align_labels()
     if "agg" in matplotlib.get_backend().lower():
-        plt.savefig("psf_demo.png", dpi=160)
+        plt.savefig("psf_demo.pdf")
+        plt.savefig("psf_demo.png")
     else:
         plt.show()
