@@ -675,6 +675,7 @@ class _AxialSymmetricRadialFastPSF:
             self.axial_simulator._to_numpy(self.precomputed["radial_norm_axis"]),
             dtype=np.float64,
         )
+        self.device = self.axial_simulator.device
 
     @staticmethod
     def _check_stop(stop_callback):
@@ -725,6 +726,62 @@ class _AxialSymmetricRadialFastPSF:
             compute_xz=bool(self.compute_xz),
             compute_yz=bool(self.compute_yz),
         )
+
+    def simulate_surrogate_planes_from_profile_tensors(
+        self,
+        amplitude_profile,
+        phase_profile=None,
+        *,
+        need_xz: bool,
+        need_yz: bool,
+        stop_callback=None,
+    ) -> Dict[str, Any]:
+        self._check_stop(stop_callback)
+        mx_x = self.precomputed["mx_x"]
+        mz_x = self.precomputed["mz_x"]
+        mx_y = self.precomputed["mx_y"]
+        mz_y = self.precomputed["mz_y"]
+        axial_by_z = self.precomputed["axial_by_z"]
+        n_theta = int(axial_by_z.shape[0])
+
+        amp = self.axial_simulator._to_torch_float(amplitude_profile).reshape(-1)
+        if int(amp.numel()) != int(n_theta):
+            raise ValueError(
+                f"Axial surrogate amplitude-profile length mismatch: got {int(amp.numel())}, expected {n_theta}."
+            )
+        amp = torch.clamp(amp, 0.0, 1.0)
+
+        if phase_profile is None:
+            phase = torch.zeros((n_theta,), dtype=torch.float64, device=self.device)
+        else:
+            phase = self.axial_simulator._to_torch_float(phase_profile).reshape(-1)
+            if int(phase.numel()) != int(n_theta):
+                raise ValueError(
+                    f"Axial surrogate phase-profile length mismatch: got {int(phase.numel())}, expected {n_theta}."
+                )
+            phase = torch.clamp(phase, -np.pi, np.pi)
+
+        modulation = amp.to(torch.complex128) * torch.exp(1j * phase.to(torch.complex128))
+        wz_t = (modulation[:, None] * axial_by_z).permute(1, 0).contiguous()
+
+        i_xz = None
+        i_yz = None
+        if bool(need_xz):
+            ex_xz = torch.matmul(wz_t, mx_x)
+            ez_xz = torch.matmul(wz_t, mz_x)
+            i_xz = torch.abs(ex_xz) ** 2 + torch.abs(ez_xz) ** 2
+        if bool(need_yz):
+            ex_yz = torch.matmul(wz_t, mx_y)
+            ez_yz = torch.matmul(wz_t, mz_y)
+            i_yz = torch.abs(ex_yz) ** 2 + torch.abs(ez_yz) ** 2
+
+        return {
+            "x_coords": self.precomputed["x_coords"],
+            "y_coords": self.precomputed["y_coords"],
+            "z_coords": self.precomputed["z_coords"],
+            "I_xz": i_xz,
+            "I_yz": i_yz,
+        }
 
 
 class PostFresnelMaskOptimizer:
@@ -913,12 +970,21 @@ class PostFresnelMaskOptimizer:
         binary_amplitude: bool,
         binary_structure: str,
     ) -> bool:
+        mode_name = str(mode).strip().lower()
+        if mode_name not in self._VALID_MODES:
+            return False
+        if bool(binary_amplitude):
+            return False
+        if str(binary_structure).strip().lower() != "pixel":
+            return False
+        if bool(axial_symmetry):
+            return bool(
+                self._axial_radial_fastpath_enabled
+                and (self._axial_radial_fastpath is not None)
+            )
         return bool(
-            (not bool(axial_symmetry))
-            and str(mode).strip().lower() == "amplitude"
-            and (not bool(binary_amplitude))
-            and str(binary_structure).strip().lower() == "pixel"
-            and bool(self._linear_fastpath_enabled)
+            self._linear_fastpath_enabled
+            and (self._linear_fastpath is not None)
         )
 
     def _stage_variable_count(
@@ -962,6 +1028,63 @@ class PostFresnelMaskOptimizer:
         if surrogate_enabled and name not in {"L-BFGS-B", "SLSQP"}:
             return "L-BFGS-B"
         return name
+
+    @staticmethod
+    def _surrogate_free_bounds(mode: str, n_active: int) -> List[Tuple[float, float]]:
+        n = int(max(0, n_active))
+        if mode == "amplitude":
+            return [(0.0, 1.0)] * n
+        if mode == "phase":
+            return [(-np.pi, np.pi)] * n
+        if mode == "amplitude_phase":
+            return ([(0.0, 1.0)] * n) + ([(-np.pi, np.pi)] * n)
+        raise ValueError("Unsupported surrogate mode.")
+
+    @staticmethod
+    def _extract_surrogate_seed(
+        x_seed: Optional[np.ndarray],
+        *,
+        mode: str,
+        total_count: int,
+        active_indices: np.ndarray,
+    ) -> Optional[np.ndarray]:
+        if x_seed is None:
+            return None
+        try:
+            seed_arr = np.asarray(x_seed, dtype=np.float64).ravel()
+        except Exception:
+            return None
+
+        total = int(total_count)
+        active = np.asarray(active_indices, dtype=np.int64).ravel()
+        n_active = int(active.size)
+
+        if mode == "amplitude":
+            if int(seed_arr.size) == total:
+                return np.clip(seed_arr[active], 0.0, 1.0)
+            if int(seed_arr.size) == n_active:
+                return np.clip(seed_arr, 0.0, 1.0)
+            return None
+
+        if mode == "phase":
+            if int(seed_arr.size) == total:
+                return np.clip(seed_arr[active], -np.pi, np.pi)
+            if int(seed_arr.size) == n_active:
+                return np.clip(seed_arr, -np.pi, np.pi)
+            return None
+
+        if mode == "amplitude_phase":
+            if int(seed_arr.size) == 2 * total:
+                amp = np.clip(seed_arr[:total][active], 0.0, 1.0)
+                phase = np.clip(seed_arr[total:][active], -np.pi, np.pi)
+                return np.concatenate((amp, phase), axis=0)
+            if int(seed_arr.size) == 2 * n_active:
+                amp = np.clip(seed_arr[:n_active], 0.0, 1.0)
+                phase = np.clip(seed_arr[n_active:], -np.pi, np.pi)
+                return np.concatenate((amp, phase), axis=0)
+            return None
+
+        raise ValueError("Unsupported surrogate mode.")
 
     def _prepare_fastpaths(
         self,
@@ -2243,6 +2366,8 @@ class PostFresnelMaskOptimizer:
         self,
         *,
         stage_name: str,
+        mode: str,
+        axial_symmetry: bool,
         base_field_after_fresnel: np.ndarray,
         pupil_mask: np.ndarray,
         optimizer_name: str,
@@ -2257,21 +2382,40 @@ class PostFresnelMaskOptimizer:
         progress_callback=None,
         stop_callback=None,
     ) -> Tuple[np.ndarray, float, Dict[str, float], Dict[str, Any], np.ndarray, np.ndarray]:
-        if self._linear_fastpath is None or (not self._linear_fastpath_enabled):
-            raise RuntimeError("Surrogate stage requires the full-2D linear fast path.")
+        mode_name = str(mode).strip().lower()
+        if mode_name not in self._VALID_MODES:
+            raise RuntimeError(f"Unsupported surrogate mode: {mode_name}.")
 
         rng = np.random.default_rng(seed)
         support = np.asarray(support_mask, dtype=bool)
-        active_flat = np.flatnonzero(support.ravel())
+        device = self.simulator.device
+        total_params = int(full_shape[0] * full_shape[1])
+        radial = None
+        support_active = support
+
+        if bool(axial_symmetry):
+            if self._axial_radial_fastpath is None or (not self._axial_radial_fastpath_enabled):
+                raise RuntimeError("Surrogate stage requires the axial-radial fast path.")
+            radial = self._build_radial_parameterization(
+                full_shape,
+                support_mask=support,
+                n_bins=int(self._radial_bins),
+            )
+            support_active = np.asarray(radial["support_by_bin"], dtype=bool)
+            total_params = int(radial["n_bins"])
+        else:
+            if self._linear_fastpath is None or (not self._linear_fastpath_enabled):
+                raise RuntimeError("Surrogate stage requires the full-2D linear fast path.")
+
+        active_flat = np.flatnonzero(np.asarray(support_active, dtype=bool).ravel())
         if int(active_flat.size) <= 0:
             raise RuntimeError("Surrogate stage found no active in-pupil pixels to optimize.")
-
-        device = self.simulator.device
         active_idx_t = torch.as_tensor(active_flat, dtype=torch.int64, device=device)
-        total_pixels = int(full_shape[0] * full_shape[1])
+
         window = self._pupil_trim_window
         if (
-            isinstance(window, (list, tuple))
+            (not bool(axial_symmetry))
+            and isinstance(window, (list, tuple))
             and len(window) == 4
             and int(window[1]) > int(window[0])
             and int(window[3]) > int(window[2])
@@ -2290,35 +2434,73 @@ class PostFresnelMaskOptimizer:
             if str(optimizer_name).strip() in {"L-BFGS-B", "SLSQP"}
             else "L-BFGS-B"
         )
+        surrogate_path_label = (
+            "axial-radial fast path" if bool(axial_symmetry) else "full-2D linear fast path"
+        )
         self._surrogate_loss_used = True
         self._surrogate_optimizer_name = surrogate_optimizer_name
         if surrogate_optimizer_name == str(optimizer_name).strip():
             self._surrogate_loss_reason = (
-                "enabled: smooth width surrogate with analytic gradient on the full-2D linear fast path"
+                "enabled: smooth width surrogate with analytic gradient on the "
+                f"{surrogate_path_label}"
             )
         else:
             self._surrogate_loss_reason = (
-                "enabled: smooth width surrogate with analytic gradient on the full-2D linear fast path "
+                "enabled: smooth width surrogate with analytic gradient on the "
+                f"{surrogate_path_label} "
                 f"(optimizer overridden from {str(optimizer_name).strip()} to {surrogate_optimizer_name})"
             )
 
-        x_seed_arr = None
-        if x_seed is not None:
-            try:
-                seed_arr = np.asarray(x_seed, dtype=np.float64).ravel()
-                if int(seed_arr.size) == int(total_pixels):
-                    x_seed_arr = np.clip(seed_arr[active_flat], 0.0, 1.0)
-                elif int(seed_arr.size) == int(active_flat.size):
-                    x_seed_arr = np.clip(seed_arr, 0.0, 1.0)
-            except Exception:
-                x_seed_arr = None
+        x_seed_arr = self._extract_surrogate_seed(
+            x_seed,
+            mode=mode_name,
+            total_count=int(total_params),
+            active_indices=active_flat,
+        )
 
-        def decode_free_vector(x_vec: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-            x_eval = np.clip(np.asarray(x_vec, dtype=np.float64).ravel(), 0.0, 1.0)
-            amp_full_flat = np.ones((total_pixels,), dtype=np.float64)
-            amp_full_flat[active_flat] = x_eval
-            amp_full = amp_full_flat.reshape(full_shape)
-            return x_eval, amp_full
+        def decode_free_vector(
+            x_vec: np.ndarray,
+        ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
+            arr = np.asarray(x_vec, dtype=np.float64).ravel()
+            n_active = int(active_flat.size)
+
+            if mode_name == "amplitude":
+                amp_active = np.clip(arr, 0.0, 1.0)
+                phase_active = None
+                x_eval = amp_active
+            elif mode_name == "phase":
+                amp_active = None
+                phase_active = np.clip(arr, -np.pi, np.pi)
+                x_eval = phase_active
+            else:
+                amp_active = np.clip(arr[:n_active], 0.0, 1.0)
+                phase_active = np.clip(arr[n_active:], -np.pi, np.pi)
+                x_eval = np.concatenate((amp_active, phase_active), axis=0)
+
+            if bool(axial_symmetry):
+                amp_profile = np.ones((int(total_params),), dtype=np.float64)
+                phase_profile = np.zeros((int(total_params),), dtype=np.float64)
+                if amp_active is not None:
+                    amp_profile[active_flat] = amp_active
+                if phase_active is not None:
+                    phase_profile[active_flat] = phase_active
+                amp_var = self._radial_profile_to_map(amp_profile, radial["bin_map"])
+                phase_var = self._radial_profile_to_map(phase_profile, radial["bin_map"])
+                return x_eval, amp_var, phase_var, amp_profile, phase_profile
+
+            amp_full_flat = np.ones((int(total_params),), dtype=np.float64)
+            phase_full_flat = np.zeros((int(total_params),), dtype=np.float64)
+            if amp_active is not None:
+                amp_full_flat[active_flat] = amp_active
+            if phase_active is not None:
+                phase_full_flat[active_flat] = phase_active
+            return (
+                x_eval,
+                amp_full_flat.reshape(full_shape),
+                phase_full_flat.reshape(full_shape),
+                None,
+                None,
+            )
 
         best_x = None
         best_obj = np.inf
@@ -2334,11 +2516,49 @@ class PostFresnelMaskOptimizer:
             self._check_stop(stop_callback)
             if x_seed_arr is not None and int(start_idx) == 0:
                 x0 = np.asarray(x_seed_arr, dtype=np.float64).copy()
-            elif int(start_idx) == 0:
-                x0 = np.ones((int(active_flat.size),), dtype=np.float64)
             else:
-                x0 = rng.uniform(0.05, 0.95, size=int(active_flat.size)).astype(np.float64)
-            x0 = np.clip(x0, 0.0, 1.0)
+                n_active = int(active_flat.size)
+                if mode_name == "amplitude":
+                    if int(start_idx) == 0:
+                        x0 = np.ones((n_active,), dtype=np.float64)
+                    else:
+                        x0 = rng.uniform(0.05, 0.95, size=n_active).astype(np.float64)
+                elif mode_name == "phase":
+                    if int(start_idx) == 0:
+                        x0 = np.zeros((n_active,), dtype=np.float64)
+                    else:
+                        x0 = rng.uniform(-np.pi, np.pi, size=n_active).astype(np.float64)
+                else:
+                    if int(start_idx) == 0:
+                        x0 = np.concatenate(
+                            (
+                                np.ones((n_active,), dtype=np.float64),
+                                np.zeros((n_active,), dtype=np.float64),
+                            ),
+                            axis=0,
+                        )
+                    else:
+                        x0 = np.concatenate(
+                            (
+                                rng.uniform(0.05, 0.95, size=n_active).astype(np.float64),
+                                rng.uniform(-np.pi, np.pi, size=n_active).astype(np.float64),
+                            ),
+                            axis=0,
+                        )
+
+            if mode_name == "amplitude":
+                x0 = np.clip(x0, 0.0, 1.0)
+            elif mode_name == "phase":
+                x0 = np.clip(x0, -np.pi, np.pi)
+            else:
+                n_active = int(active_flat.size)
+                x0 = np.concatenate(
+                    (
+                        np.clip(x0[:n_active], 0.0, 1.0),
+                        np.clip(x0[n_active:], -np.pi, np.pi),
+                    ),
+                    axis=0,
+                )
 
             iter_counter = {"count": 0}
             n_variables = int(x0.size)
@@ -2366,24 +2586,94 @@ class PostFresnelMaskOptimizer:
             def objective_with_grad(x):
                 nonlocal eval_counter
                 self._check_stop(stop_callback)
-                x_eval = np.clip(np.asarray(x, dtype=np.float64).ravel(), 0.0, 1.0)
-                amp_free_t = torch.as_tensor(x_eval, dtype=torch.float64, device=device)
-                amp_free_t.requires_grad_(True)
-                amp_full_flat_t = torch.ones((total_pixels,), dtype=torch.float64, device=device)
-                amp_full_flat_t = amp_full_flat_t.scatter(0, active_idx_t, amp_free_t)
-                amp_full_t = amp_full_flat_t.reshape(full_shape)
-                complex_mask_t = amp_full_t.to(torch.complex128)[row0:row1, col0:col1]
-                res_torch = self._linear_fastpath.simulate_surrogate_planes_from_complex_mask_tensor(
-                    complex_mask_t,
-                    need_xz=bool(self._need_x or self._need_z),
-                    need_yz=bool(self._need_y or self._need_z),
-                    stop_callback=stop_callback,
-                )
+                x_arr = np.asarray(x, dtype=np.float64).ravel()
+                n_active = int(active_flat.size)
+                amp_free_t = None
+                phase_free_t = None
+
+                amp_full_t = None
+                phase_full_t = None
+                amp_profile_t = None
+                phase_profile_t = None
+
+                if mode_name == "amplitude":
+                    amp_vals = np.clip(x_arr, 0.0, 1.0)
+                    amp_free_t = torch.as_tensor(amp_vals, dtype=torch.float64, device=device)
+                    amp_free_t.requires_grad_(True)
+                    x_eval = amp_vals
+                elif mode_name == "phase":
+                    phase_vals = np.clip(x_arr, -np.pi, np.pi)
+                    phase_free_t = torch.as_tensor(phase_vals, dtype=torch.float64, device=device)
+                    phase_free_t.requires_grad_(True)
+                    x_eval = phase_vals
+                else:
+                    amp_vals = np.clip(x_arr[:n_active], 0.0, 1.0)
+                    phase_vals = np.clip(x_arr[n_active:], -np.pi, np.pi)
+                    amp_free_t = torch.as_tensor(amp_vals, dtype=torch.float64, device=device)
+                    phase_free_t = torch.as_tensor(phase_vals, dtype=torch.float64, device=device)
+                    amp_free_t.requires_grad_(True)
+                    phase_free_t.requires_grad_(True)
+                    x_eval = np.concatenate((amp_vals, phase_vals), axis=0)
+
+                if bool(axial_symmetry):
+                    amp_profile_t = torch.ones((int(total_params),), dtype=torch.float64, device=device)
+                    phase_profile_t = torch.zeros((int(total_params),), dtype=torch.float64, device=device)
+                    if amp_free_t is not None:
+                        amp_profile_t = amp_profile_t.scatter(0, active_idx_t, amp_free_t)
+                    if phase_free_t is not None:
+                        phase_profile_t = phase_profile_t.scatter(0, active_idx_t, phase_free_t)
+                    res_torch = self._axial_radial_fastpath.simulate_surrogate_planes_from_profile_tensors(
+                        amplitude_profile=amp_profile_t,
+                        phase_profile=phase_profile_t,
+                        need_xz=bool(self._need_x or self._need_z),
+                        need_yz=bool(self._need_y or self._need_z),
+                        stop_callback=stop_callback,
+                    )
+                else:
+                    amp_full_flat_t = torch.ones((int(total_params),), dtype=torch.float64, device=device)
+                    phase_full_flat_t = torch.zeros((int(total_params),), dtype=torch.float64, device=device)
+                    if amp_free_t is not None:
+                        amp_full_flat_t = amp_full_flat_t.scatter(0, active_idx_t, amp_free_t)
+                    if phase_free_t is not None:
+                        phase_full_flat_t = phase_full_flat_t.scatter(0, active_idx_t, phase_free_t)
+                    amp_full_t = amp_full_flat_t.reshape(full_shape)
+                    phase_full_t = phase_full_flat_t.reshape(full_shape)
+                    complex_mask_t = (
+                        amp_full_t.to(torch.complex128)
+                        * torch.exp(1j * phase_full_t.to(torch.complex128))
+                    )[row0:row1, col0:col1]
+                    res_torch = self._linear_fastpath.simulate_surrogate_planes_from_complex_mask_tensor(
+                        complex_mask_t,
+                        need_xz=bool(self._need_x or self._need_z),
+                        need_yz=bool(self._need_y or self._need_z),
+                        stop_callback=stop_callback,
+                    )
                 surrogate_obj_t, surrogate_metrics_t = self._surrogate_objective_from_torch_res(res_torch)
                 surrogate_obj_t.backward()
-                grad_t = amp_free_t.grad
-                if grad_t is None:
-                    grad_t = torch.zeros_like(amp_free_t)
+                if mode_name == "amplitude":
+                    grad_t = amp_free_t.grad
+                    if grad_t is None:
+                        grad_t = torch.zeros_like(amp_free_t)
+                    grad_np = np.asarray(grad_t.detach().cpu().numpy(), dtype=np.float64)
+                elif mode_name == "phase":
+                    grad_t = phase_free_t.grad
+                    if grad_t is None:
+                        grad_t = torch.zeros_like(phase_free_t)
+                    grad_np = np.asarray(grad_t.detach().cpu().numpy(), dtype=np.float64)
+                else:
+                    grad_amp = amp_free_t.grad
+                    grad_phase = phase_free_t.grad
+                    if grad_amp is None:
+                        grad_amp = torch.zeros_like(amp_free_t)
+                    if grad_phase is None:
+                        grad_phase = torch.zeros_like(phase_free_t)
+                    grad_np = np.concatenate(
+                        (
+                            np.asarray(grad_amp.detach().cpu().numpy(), dtype=np.float64),
+                            np.asarray(grad_phase.detach().cpu().numpy(), dtype=np.float64),
+                        ),
+                        axis=0,
+                    )
 
                 surrogate_obj = float(surrogate_obj_t.detach().cpu().item())
                 metrics_np = {
@@ -2421,14 +2711,20 @@ class PostFresnelMaskOptimizer:
                     if (now - float(last_preview_ts["t"])) >= 0.20:
                         last_preview_ts["t"] = now
                         eval_in_start = int(eval_counter - start_eval_base)
-                        amp_preview = self._downsample_preview(
-                            amp_full_t.detach().cpu().numpy(),
-                            max_dim=120,
-                        )
-                        phase_preview = self._downsample_preview(
-                            np.zeros(full_shape, dtype=np.float64),
-                            max_dim=120,
-                        )
+                        if bool(axial_symmetry):
+                            amp_preview_src = self._radial_profile_to_map(
+                                amp_profile_t.detach().cpu().numpy(),
+                                radial["bin_map"],
+                            )
+                            phase_preview_src = self._radial_profile_to_map(
+                                phase_profile_t.detach().cpu().numpy(),
+                                radial["bin_map"],
+                            )
+                        else:
+                            amp_preview_src = amp_full_t.detach().cpu().numpy()
+                            phase_preview_src = phase_full_t.detach().cpu().numpy()
+                        amp_preview = self._downsample_preview(amp_preview_src, max_dim=120)
+                        phase_preview = self._downsample_preview(phase_preview_src, max_dim=120)
                         progress_callback(
                             f"{stage_name}: surrogate evaluating",
                             (
@@ -2453,16 +2749,13 @@ class PostFresnelMaskOptimizer:
                                 "mask_amp_preview": amp_preview,
                                 "mask_phase_preview": phase_preview,
                                 "preview_shape_full": [int(full_shape[0]), int(full_shape[1])],
-                                "axial_symmetry": False,
+                                "axial_symmetry": bool(axial_symmetry),
                                 "binary_structure": "pixel",
                                 "surrogate_loss_enabled": True,
                                 "surrogate_optimizer_name": str(surrogate_optimizer_name),
                             },
                         )
-                return float(surrogate_obj), np.asarray(
-                    grad_t.detach().cpu().numpy(),
-                    dtype=np.float64,
-                )
+                return float(surrogate_obj), grad_np
 
             def callback_fn(_xk):
                 self._check_stop(stop_callback)
@@ -2505,21 +2798,24 @@ class PostFresnelMaskOptimizer:
                 x0=x0,
                 method=surrogate_optimizer_name,
                 jac=True,
-                bounds=[(0.0, 1.0)] * int(n_variables),
+                bounds=self._surrogate_free_bounds(mode_name, int(active_flat.size)),
                 callback=callback_fn,
                 options=options,
             )
 
-            x_result = np.clip(np.asarray(getattr(result, "x", x0), dtype=np.float64).ravel(), 0.0, 1.0)
-            x_final, amp_var = decode_free_vector(x_result)
-            phase_var = np.zeros(full_shape, dtype=np.float64)
+            x_result = np.asarray(getattr(result, "x", x0), dtype=np.float64).ravel()
+            x_final, amp_var, phase_var, amp_profile, phase_profile = decode_free_vector(x_result)
             obj_final, metrics_final, res_final, amp_full, phase_full = self._simulate_from_mask_maps(
                 base_field_after_fresnel=base_field_after_fresnel,
                 pupil_mask=pupil_mask,
                 amp_var=amp_var,
                 phase_var=phase_var,
                 full_shape=full_shape,
-                axial_radial_fastpath_ok=False,
+                amp_profile=amp_profile,
+                phase_profile=phase_profile,
+                radial=radial,
+                support_mask=support if bool(axial_symmetry) else None,
+                axial_radial_fastpath_ok=bool(axial_symmetry),
                 stop_callback=stop_callback,
             )
 
@@ -2566,7 +2862,7 @@ class PostFresnelMaskOptimizer:
                         "mask_amp_preview": best_amp_preview,
                         "mask_phase_preview": best_phase_preview,
                         "preview_shape_full": [int(full_shape[0]), int(full_shape[1])],
-                        "axial_symmetry": False,
+                        "axial_symmetry": bool(axial_symmetry),
                         "binary_structure": "pixel",
                         "surrogate_loss_enabled": True,
                         "surrogate_optimizer_name": str(surrogate_optimizer_name),
@@ -2627,11 +2923,12 @@ class PostFresnelMaskOptimizer:
                 binary_amplitude=binary_amplitude,
                 binary_structure=binary_structure,
             )
-            and (self._linear_fastpath is not None)
         )
         if use_surrogate_gradient:
             return self._run_surrogate_gradient_stage(
                 stage_name=stage_name,
+                mode=mode,
+                axial_symmetry=axial_symmetry,
                 base_field_after_fresnel=base_field_after_fresnel,
                 pupil_mask=pupil_mask,
                 optimizer_name=optimizer_name,

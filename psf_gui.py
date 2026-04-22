@@ -1,3 +1,4 @@
+import csv
 import threading
 import traceback
 import tkinter as tk
@@ -485,6 +486,12 @@ class PSFSimulatorApp:
         self.save_btn.pack(side=tk.LEFT, fill="x", expand=True, padx=(0, 3))
         self.load_btn = ttk.Button(save_row, text="Load Result", command=self._load_result_dialog)
         self.load_btn.pack(side=tk.LEFT, fill="x", expand=True, padx=3)
+        self.export_csv_btn = ttk.Button(
+            save_row,
+            text="Export CSV",
+            command=self._export_current_data_csv_dialog,
+        )
+        self.export_csv_btn.pack(side=tk.LEFT, fill="x", expand=True, padx=3)
         self.show_3d_btn = ttk.Button(save_row, text="Show 3D Window", command=self._show_3d_plot_window)
         self.show_3d_btn.pack(side=tk.LEFT, fill="x", expand=True, padx=(3, 0))
         self.show_3d_btn.configure(state="disabled")
@@ -1503,6 +1510,7 @@ class PSFSimulatorApp:
 
         self._close_pyvista_window()
         self._update_3d_window_button_state()
+        self._update_export_csv_button_state()
         self._refresh_mask_builder_plot()
         self._refresh_mask_input_preview()
         self._refresh_optimization_plot()
@@ -1519,6 +1527,8 @@ class PSFSimulatorApp:
         self.load_mask_btn.configure(state=run_state)
         if hasattr(self, "show_3d_btn"):
             self._update_3d_window_button_state()
+        if hasattr(self, "export_csv_btn"):
+            self._update_export_csv_button_state()
         if hasattr(self, "remove_mask_btn"):
             self.remove_mask_btn.configure(state=run_state)
         self.rotate_cw_btn.configure(state=run_state)
@@ -2358,6 +2368,242 @@ class PSFSimulatorApp:
         has_3d = "yes" if "results_3d" in payload else "no"
         self.status_var.set(f"Saved result. 3D included: {has_3d}.")
 
+    def _collect_current_export_display_data(self):
+        if self.results_2d is None or self.last_simulator is None:
+            raise ValueError("Run or load a simulation result first.")
+
+        r = self.results_2d
+        x_um = np.asarray(r["x_coords"], dtype=float) * 1e6
+        y_um = np.asarray(r["y_coords"], dtype=float) * 1e6
+        z_um = np.asarray(r["z_coords"], dtype=float) * 1e6
+
+        i_xy = np.asarray(
+            self._display_intensity(self._choose_result_array(r, "I_xy", "I_xy_norm")),
+            dtype=float,
+        )
+        i_xz = np.asarray(
+            self._display_intensity(self._choose_result_array(r, "I_xz", "I_xz_norm")),
+            dtype=float,
+        )
+        i_yz = np.asarray(
+            self._display_intensity(self._choose_result_array(r, "I_yz", "I_yz_norm")),
+            dtype=float,
+        )
+
+        width_metrics, x_prof, y_prof, z_prof = self._resolve_width_metrics_and_profiles(
+            level=self._current_width_level(),
+            exact=bool(self._width_level_source == "entry"),
+        )
+        if width_metrics is None:
+            raise RuntimeError("Profile data are unavailable for the current 2D result.")
+
+        focus_z_um = np.nan
+        try:
+            if "z_focus" in r:
+                focus_z_um = float(r["z_focus"]) * 1e6
+        except Exception:
+            focus_z_um = np.nan
+
+        return {
+            "x_um": x_um,
+            "y_um": y_um,
+            "z_um": z_um,
+            "i_xy": i_xy,
+            "i_xz": i_xz,
+            "i_yz": i_yz,
+            "x_profile": np.asarray(x_prof, dtype=float),
+            "y_profile": np.asarray(y_prof, dtype=float),
+            "z_profile": np.asarray(z_prof, dtype=float),
+            "width_metrics": dict(width_metrics),
+            "plot_mode": str(self.plot_mode_var.get()),
+            "normalized": bool(self.normalize_var.get()),
+            "focus_z_um": float(focus_z_um),
+        }
+
+    @staticmethod
+    def _write_csv_metadata_row(writer, dataset, key, value):
+        writer.writerow(
+            [
+                "metadata",
+                str(dataset),
+                str(key),
+                value,
+                "",
+                "",
+                "",
+                "",
+                "",
+            ]
+        )
+
+    @staticmethod
+    def _write_csv_heatmap_rows(
+        writer,
+        dataset,
+        axis_1_label,
+        axis_1_coords,
+        axis_2_label,
+        axis_2_coords,
+        values,
+    ):
+        x = np.asarray(axis_1_coords, dtype=float).ravel()
+        y = np.asarray(axis_2_coords, dtype=float).ravel()
+        arr = np.asarray(values, dtype=float)
+        expected_shape = (int(y.size), int(x.size))
+        if arr.shape != expected_shape:
+            if arr.shape == (int(x.size), int(y.size)):
+                arr = arr.T
+            else:
+                raise ValueError(
+                    f"{dataset} heatmap shape mismatch: got {arr.shape}, expected {expected_shape}."
+                )
+        for iy, yv in enumerate(y):
+            row = arr[iy]
+            for ix, xv in enumerate(x):
+                writer.writerow(
+                    [
+                        "heatmap",
+                        str(dataset),
+                        "",
+                        "",
+                        str(axis_1_label),
+                        float(xv),
+                        str(axis_2_label),
+                        float(yv),
+                        float(row[ix]),
+                    ]
+                )
+
+    @staticmethod
+    def _write_csv_profile_rows(writer, dataset, axis_label, axis_coords, values):
+        x = np.asarray(axis_coords, dtype=float).ravel()
+        y = np.asarray(values, dtype=float).ravel()
+        if int(x.size) != int(y.size):
+            raise ValueError(
+                f"{dataset} profile length mismatch: got {int(y.size)} values for {int(x.size)} coordinates."
+            )
+        for xv, yv in zip(x, y):
+            writer.writerow(
+                [
+                    "profile",
+                    str(dataset),
+                    "",
+                    "",
+                    str(axis_label),
+                    float(xv),
+                    "",
+                    "",
+                    float(yv),
+                ]
+            )
+
+    def _write_current_data_csv(self, path):
+        export = self._collect_current_export_display_data()
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(
+                [
+                    "record_type",
+                    "dataset",
+                    "key",
+                    "meta_value",
+                    "axis_1_label",
+                    "axis_1_value",
+                    "axis_2_label",
+                    "axis_2_value",
+                    "value",
+                ]
+            )
+            self._write_csv_metadata_row(writer, "export", "format", "psf_sim_gui_csv_export_v1")
+            self._write_csv_metadata_row(writer, "display", "plot_mode", export["plot_mode"])
+            self._write_csv_metadata_row(writer, "display", "normalized", int(export["normalized"]))
+            self._write_csv_metadata_row(
+                writer,
+                "display",
+                "width_level",
+                float(export["width_metrics"].get("level", self._current_width_level())),
+            )
+            self._write_csv_metadata_row(writer, "result", "focus_z_um", export["focus_z_um"])
+            self._write_csv_metadata_row(
+                writer, "result", "width_x_um", float(export["width_metrics"].get("width_x_um", np.nan))
+            )
+            self._write_csv_metadata_row(
+                writer, "result", "width_y_um", float(export["width_metrics"].get("width_y_um", np.nan))
+            )
+            self._write_csv_metadata_row(
+                writer, "result", "width_z_um", float(export["width_metrics"].get("width_z_um", np.nan))
+            )
+            self._write_csv_metadata_row(
+                writer,
+                "result",
+                "width_ratio_zx",
+                float(export["width_metrics"].get("width_ratio_zx", np.nan)),
+            )
+            self._write_csv_metadata_row(
+                writer,
+                "result",
+                "width_ratio_zy",
+                float(export["width_metrics"].get("width_ratio_zy", np.nan)),
+            )
+
+            self._write_csv_heatmap_rows(
+                writer,
+                "XY",
+                "x_um",
+                export["x_um"],
+                "y_um",
+                export["y_um"],
+                export["i_xy"],
+            )
+            self._write_csv_heatmap_rows(
+                writer,
+                "XZ",
+                "x_um",
+                export["x_um"],
+                "z_um",
+                export["z_um"],
+                export["i_xz"],
+            )
+            self._write_csv_heatmap_rows(
+                writer,
+                "YZ",
+                "y_um",
+                export["y_um"],
+                "z_um",
+                export["z_um"],
+                export["i_yz"],
+            )
+
+            self._write_csv_profile_rows(writer, "X", "x_um", export["x_um"], export["x_profile"])
+            self._write_csv_profile_rows(writer, "Y", "y_um", export["y_um"], export["y_profile"])
+            self._write_csv_profile_rows(writer, "Z", "z_um", export["z_um"], export["z_profile"])
+
+    def _export_current_data_csv_dialog(self):
+        if self.results_2d is None or self.last_simulator is None:
+            messagebox.showwarning("No result", "Run or load a simulation first, then export CSV.")
+            return
+
+        path = filedialog.asksaveasfilename(
+            title="Export current simulation data as CSV",
+            initialdir=self.saved_simulation_dir,
+            initialfile="psf_data_export.csv",
+            defaultextension=".csv",
+            filetypes=[
+                ("CSV", "*.csv"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not path:
+            return
+
+        ext = os.path.splitext(path)[1].lower()
+        out_path = path if ext != "" else f"{path}.csv"
+        try:
+            self._write_current_data_csv(out_path)
+            self.status_var.set(f"Exported simulation CSV: {out_path}")
+        except Exception as exc:
+            messagebox.showerror("Export CSV", str(exc))
+
     def _load_result_dialog(self):
         path = filedialog.askopenfilename(
             title="Load simulation result",
@@ -2397,6 +2643,7 @@ class PSFSimulatorApp:
         self._set_progress(100.0, force=True)
         self._refresh_plots()
         self._update_3d_window_button_state()
+        self._update_export_csv_button_state()
         self.notebook.select(self.tab_2d)
         if self.results_3d is not None:
             self._show_3d_plot_window()
@@ -2624,6 +2871,8 @@ class PSFSimulatorApp:
                 else "disabled"
             )
             self.opt_apply_btn.configure(state=apply_state)
+        if hasattr(self, "export_csv_btn"):
+            self._update_export_csv_button_state()
 
         # Freeze simulation controls while optimization is in progress.
         if self.opt_is_running:
@@ -2632,6 +2881,8 @@ class PSFSimulatorApp:
             self.stop_btn.configure(state="disabled")
             self.save_btn.configure(state="disabled")
             self.load_btn.configure(state="disabled")
+            if hasattr(self, "export_csv_btn"):
+                self.export_csv_btn.configure(state="disabled")
             self.load_mask_btn.configure(state="disabled")
             if hasattr(self, "remove_mask_btn"):
                 self.remove_mask_btn.configure(state="disabled")
@@ -2650,6 +2901,8 @@ class PSFSimulatorApp:
                 self.stop_btn.configure(state="disabled")
                 self.save_btn.configure(state="normal")
                 self.load_btn.configure(state="normal")
+                if hasattr(self, "export_csv_btn"):
+                    self._update_export_csv_button_state()
                 self.load_mask_btn.configure(state="normal")
                 if hasattr(self, "remove_mask_btn"):
                     self.remove_mask_btn.configure(state="normal")
@@ -4203,6 +4456,17 @@ class PSFSimulatorApp:
             and (not self.opt_is_running)
         )
         self.show_3d_btn.configure(state=("normal" if enabled else "disabled"))
+
+    def _update_export_csv_button_state(self):
+        if not hasattr(self, "export_csv_btn"):
+            return
+        enabled = bool(
+            (self.results_2d is not None)
+            and (self.last_simulator is not None)
+            and (not self.is_running)
+            and (not self.opt_is_running)
+        )
+        self.export_csv_btn.configure(state=("normal" if enabled else "disabled"))
 
     def _ensure_qt_event_pump(self):
         if self._qt_app is None or self._qt_pump_job is not None:
