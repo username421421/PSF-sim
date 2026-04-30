@@ -73,8 +73,3 @@ The sweep writes:
 - `ring_mask_<axis>_metadata.json`
 
 The mask geometry is stored as inner/outer radii and diameters. Mask image files are not written.
-
-## Git Hygiene
-
-`.gitignore` is configured as an allowlist so Git tracks only simulator source/docs. Generated outputs and local data stay on disk but should not be committed.
-
