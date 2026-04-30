@@ -41,8 +41,8 @@ if not defined PYTHON_EXE (
     exit /b 1
 )
 
-echo Starting PSF Simulator GUI...
-%PYTHON_EXE% %PYTHON_ARGS% "%APP%"
+echo Starting PSF Simulator...
+%PYTHON_EXE% %PYTHON_ARGS% "%APP%" %*
 set "EXIT_CODE=%ERRORLEVEL%"
 
 if not "%EXIT_CODE%"=="0" (

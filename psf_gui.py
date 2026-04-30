@@ -496,6 +496,15 @@ class PSFSimulatorApp:
         self.show_3d_btn.pack(side=tk.LEFT, fill="x", expand=True, padx=(3, 0))
         self.show_3d_btn.configure(state="disabled")
 
+        config_row = ttk.Frame(parent)
+        config_row.pack(fill="x", pady=(0, 4))
+        self.save_config_btn = ttk.Button(
+            config_row,
+            text="Save Config",
+            command=self._save_simulation_config_dialog,
+        )
+        self.save_config_btn.pack(side=tk.LEFT, fill="x", expand=True)
+
         prog_row = ttk.Frame(parent)
         prog_row.pack(fill="x", pady=(6, 2))
         self.progress_var = tk.DoubleVar(value=0.0)
@@ -1524,6 +1533,8 @@ class PSFSimulatorApp:
         self.stop_btn.configure(state=stop_state)
         self.save_btn.configure(state=run_state)
         self.load_btn.configure(state=run_state)
+        if hasattr(self, "save_config_btn"):
+            self.save_config_btn.configure(state=run_state)
         self.load_mask_btn.configure(state=run_state)
         if hasattr(self, "show_3d_btn"):
             self._update_3d_window_button_state()
@@ -2276,6 +2287,57 @@ class PSFSimulatorApp:
         except Exception:
             return
 
+    def _build_simulation_config_payload(self):
+        params = self._collect_params()
+        payload = {
+            "format": "psf_sim_gui_config",
+            "version": 1,
+            "params": self._encode_precise_params(self._clone_payload(params)),
+            "ui_values": self._encode_precise_params(self._collect_control_values()),
+            "optimizer_ui_values": self._encode_precise_params(
+                self._collect_optimizer_control_values()
+            ),
+            "mask": {
+                "path": self.mask_path,
+                "rotation_quadrants_ccw": int(self._mask_rotation_quadrants_mod()),
+                "loaded": bool(self.mask_array is not None),
+            },
+        }
+        if self.mask_array is not None:
+            payload["mask"]["shape"] = [int(v) for v in np.asarray(self.mask_array).shape]
+        return payload
+
+    def _save_simulation_config_to_path(self, path):
+        payload = self._build_simulation_config_payload()
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        return payload
+
+    def _save_simulation_config_dialog(self):
+        try:
+            self._build_simulation_config_payload()
+        except Exception as exc:
+            messagebox.showerror("Save simulation config", str(exc))
+            return
+
+        path = filedialog.asksaveasfilename(
+            title="Save simulation config",
+            initialdir=self.saved_simulation_dir,
+            initialfile="simulation_config.json",
+            defaultextension=".json",
+            filetypes=[
+                ("JSON config", "*.json"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not path:
+            return
+        try:
+            self._save_simulation_config_to_path(path)
+            self.status_var.set(f"Saved simulation config: {path}")
+        except Exception as exc:
+            messagebox.showerror("Save simulation config", str(exc))
+
     def _load_last_used_config(self):
         if not os.path.isfile(self.last_config_path):
             return False
@@ -2881,6 +2943,8 @@ class PSFSimulatorApp:
             self.stop_btn.configure(state="disabled")
             self.save_btn.configure(state="disabled")
             self.load_btn.configure(state="disabled")
+            if hasattr(self, "save_config_btn"):
+                self.save_config_btn.configure(state="disabled")
             if hasattr(self, "export_csv_btn"):
                 self.export_csv_btn.configure(state="disabled")
             self.load_mask_btn.configure(state="disabled")
@@ -2901,6 +2965,8 @@ class PSFSimulatorApp:
                 self.stop_btn.configure(state="disabled")
                 self.save_btn.configure(state="normal")
                 self.load_btn.configure(state="normal")
+                if hasattr(self, "save_config_btn"):
+                    self.save_config_btn.configure(state="normal")
                 if hasattr(self, "export_csv_btn"):
                     self._update_export_csv_button_state()
                 self.load_mask_btn.configure(state="normal")
@@ -5202,11 +5268,22 @@ class PSFSimulatorApp:
             self.status_var.set(f"PyVista window render failed: {exc}")
 
 
-def main():
+def launch_gui():
     root = tk.Tk()
     PSFSimulatorApp(root)
     root.mainloop()
 
 
+def main(argv=None):
+    if argv is None:
+        argv = sys.argv[1:]
+    if len(argv) > 0:
+        from psf_cli import main as cli_main
+
+        return cli_main(argv, gui_launcher=launch_gui)
+    launch_gui()
+    return 0
+
+
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

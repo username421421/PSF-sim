@@ -2247,6 +2247,246 @@ class CartesianPSFSimulator:
             "z_profile_at_x0": fwhm_metrics["z_profile_at_x0"],
         }
 
+    def simulate_psf_profile_from_pupil_field(
+        self,
+        pupil_field,
+        size_x,
+        size_y,
+        entrance_pupil_diameter,
+        axis,
+        range_microns=2.0,
+        range_microns_x=None,
+        range_microns_y=None,
+        range_microns_z=None,
+        num_points=101,
+        z_position=None,
+        width_level=0.5,
+        verbose=False,
+        progress_callback=None,
+        stop_callback=None,
+    ):
+        """
+        Compute one on-axis PSF intensity profile without calculating full 2D planes.
+
+        axis="z" computes I(0, 0, z). axis="x" computes I(x, 0, z0), and
+        axis="y" computes I(0, y, z0). If z_position is None for x/y, z0 is
+        found from the peak of the on-axis z profile.
+        """
+        axis = str(axis).strip().lower()
+        if axis not in {"x", "y", "z"}:
+            raise ValueError("axis must be one of: x, y, z.")
+        if int(num_points) < 3:
+            raise ValueError("num_points must be >= 3 for profile simulation.")
+
+        pupil_field = self._to_torch_complex(pupil_field)
+        if pupil_field.ndim != 2:
+            raise ValueError("pupil_field must be a 2D array.")
+
+        range_x_m, range_y_m, range_z_m = self._resolve_axis_ranges_m(
+            range_microns=range_microns,
+            range_microns_x=range_microns_x,
+            range_microns_y=range_microns_y,
+            range_microns_z=range_microns_z,
+        )
+        x_coords, y_coords, z_coords = self._make_scan_coords(
+            range_x_m, range_y_m, range_z_m, num_points
+        )
+
+        self._check_stop(stop_callback)
+        self._emit_progress(progress_callback, "Preparing profile integration tables", 0.0)
+        tables = self._prepare_integration_tables(
+            pupil_field,
+            size_x=size_x,
+            size_y=size_y,
+            entrance_pupil_diameter=entrance_pupil_diameter,
+        )
+        weighted_components = self._weighted_components(tables)
+
+        self._check_stop(stop_callback)
+        axial_by_z = self._axial_phase_for_z(z_coords, tables)
+        x_center = torch.zeros((1,), dtype=torch.float64, device=self.device)
+        y_center = torch.zeros((1,), dtype=torch.float64, device=self.device)
+
+        z_profile = None
+        z_focus = None
+        need_focus_scan = bool(axis == "z" or z_position is None)
+        if need_focus_scan:
+            self._emit_progress(progress_callback, "Computing on-axis Z profile", 0.25)
+            z_profile_map = self._compute_xz_plane(
+                x_center,
+                z_coords,
+                tables,
+                verbose=verbose,
+                progress_callback=lambda f: self._emit_progress(
+                    progress_callback, "Computing on-axis Z profile", 0.25 + 0.45 * float(f)
+                ),
+                stop_callback=stop_callback,
+                weighted_components=weighted_components,
+                exp_x=None,
+                axial_by_z=axial_by_z,
+            )
+            z_profile = z_profile_map[:, 0]
+            z_focus_idx = int(torch.argmax(z_profile).item())
+            z_focus = z_coords[z_focus_idx]
+
+        if z_position is not None:
+            z_eval = self._to_torch_float([float(z_position)])[0]
+        elif z_focus is not None:
+            z_eval = z_focus
+        else:
+            z_eval = torch.tensor(0.0, dtype=torch.float64, device=self.device)
+
+        if axis == "z":
+            profile_t = z_profile
+            coord_t = z_coords
+            z_position_used = z_focus
+        elif axis == "x":
+            self._emit_progress(progress_callback, "Computing X profile", 0.72)
+            axial_eval = self._axial_phase_for_z([float(z_eval.item())], tables)
+            x_profile_map = self._compute_xz_plane(
+                x_coords,
+                self._to_torch_float([float(z_eval.item())]),
+                tables,
+                verbose=verbose,
+                progress_callback=lambda f: self._emit_progress(
+                    progress_callback, "Computing X profile", 0.72 + 0.25 * float(f)
+                ),
+                stop_callback=stop_callback,
+                weighted_components=weighted_components,
+                exp_x=None,
+                axial_by_z=axial_eval,
+            )
+            profile_t = x_profile_map[0, :]
+            coord_t = x_coords
+            z_position_used = z_eval
+        else:
+            self._emit_progress(progress_callback, "Computing Y profile", 0.72)
+            axial_eval = self._axial_phase_for_z([float(z_eval.item())], tables)
+            y_profile_map = self._compute_yz_plane(
+                y_coords,
+                self._to_torch_float([float(z_eval.item())]),
+                tables,
+                verbose=verbose,
+                progress_callback=lambda f: self._emit_progress(
+                    progress_callback, "Computing Y profile", 0.72 + 0.25 * float(f)
+                ),
+                stop_callback=stop_callback,
+                weighted_components=weighted_components,
+                exp_y=None,
+                axial_by_z=axial_eval,
+            )
+            profile_t = y_profile_map[0, :]
+            coord_t = y_coords
+            z_position_used = z_eval
+
+        profile_np = self._to_numpy(profile_t)
+        coord_np = self._to_numpy(coord_t)
+        max_val = float(np.max(profile_np)) if np.size(profile_np) else 0.0
+        profile_norm = profile_np / max_val if max_val > 0.0 else profile_np.copy()
+        peak_index = int(np.argmax(profile_np)) if np.size(profile_np) else 0
+        width_m = self._width_at_level_1d(coord_np, profile_np, level=width_level)
+
+        if z_focus is None:
+            z_focus_value = float(z_position_used.item()) if torch.is_tensor(z_position_used) else float(z_position_used)
+        else:
+            z_focus_value = float(z_focus.item()) if torch.is_tensor(z_focus) else float(z_focus)
+        z_position_value = (
+            float(z_position_used.item()) if torch.is_tensor(z_position_used) else float(z_position_used)
+        )
+
+        self._emit_progress(progress_callback, "Finalizing profile", 1.0)
+        return {
+            "axis": axis,
+            "coords": coord_np,
+            "coords_um": coord_np * 1e6,
+            "intensity": np.asarray(profile_np, dtype=float),
+            "intensity_norm": np.asarray(profile_norm, dtype=float),
+            "width_level": float(width_level),
+            "width_m": float(width_m),
+            "width_um": float(width_m * 1e6) if np.isfinite(width_m) else np.nan,
+            "peak_index": int(peak_index),
+            "peak_coord_m": float(coord_np[peak_index]) if np.size(coord_np) else np.nan,
+            "peak_coord_um": float(coord_np[peak_index] * 1e6) if np.size(coord_np) else np.nan,
+            "peak_intensity": float(profile_np[peak_index]) if np.size(profile_np) else np.nan,
+            "z_focus": float(z_focus_value),
+            "z_focus_um": float(z_focus_value * 1e6),
+            "z_position": float(z_position_value),
+            "z_position_um": float(z_position_value * 1e6),
+        }
+
+    def simulate_psf_profile_full_pipeline(
+        self,
+        input_intensity,
+        size_x,
+        size_y,
+        entrance_pupil_diameter,
+        fresnel_distance,
+        axis,
+        use_gaussian_profile=None,
+        gaussian_waist_x=None,
+        gaussian_waist_y=None,
+        custom_mask=None,
+        ring_inner_diameter=None,
+        ring_outer_diameter=None,
+        range_microns=2.0,
+        range_microns_x=None,
+        range_microns_y=None,
+        range_microns_z=None,
+        num_points=101,
+        z_position=None,
+        width_level=0.5,
+        verbose=False,
+        progress_callback=None,
+        stop_callback=None,
+    ):
+        self._emit_progress(progress_callback, "Preparing pupil field", 0.0)
+        prep = self.prepare_pupil_field_from_input(
+            input_intensity=input_intensity,
+            size_x=size_x,
+            size_y=size_y,
+            entrance_pupil_diameter=entrance_pupil_diameter,
+            fresnel_distance=fresnel_distance,
+            use_gaussian_profile=use_gaussian_profile,
+            gaussian_waist_x=gaussian_waist_x,
+            gaussian_waist_y=gaussian_waist_y,
+            custom_mask=custom_mask,
+            ring_inner_diameter=ring_inner_diameter,
+            ring_outer_diameter=ring_outer_diameter,
+            progress_callback=lambda stage, frac: self._emit_progress(
+                progress_callback, f"Pupil prep: {stage}", 0.45 * float(frac)
+            ),
+            stop_callback=stop_callback,
+        )
+        result = self.simulate_psf_profile_from_pupil_field(
+            pupil_field=prep.get("field_at_pupil_for_psf", prep["field_at_pupil"]),
+            size_x=float(prep.get("size_x_for_psf", size_x)),
+            size_y=float(prep.get("size_y_for_psf", size_y)),
+            entrance_pupil_diameter=entrance_pupil_diameter,
+            axis=axis,
+            range_microns=range_microns,
+            range_microns_x=range_microns_x,
+            range_microns_y=range_microns_y,
+            range_microns_z=range_microns_z,
+            num_points=num_points,
+            z_position=z_position,
+            width_level=width_level,
+            verbose=verbose,
+            progress_callback=lambda stage, frac: self._emit_progress(
+                progress_callback, f"Profile: {stage}", 0.45 + 0.55 * float(frac)
+            ),
+            stop_callback=stop_callback,
+        )
+        result.update(
+            {
+                "pupil_trimmed_for_psf": bool(prep.get("pupil_trimmed_for_psf", False)),
+                "pupil_trim_window": prep.get("pupil_trim_window"),
+                "size_x_for_psf": float(prep.get("size_x_for_psf", size_x)),
+                "size_y_for_psf": float(prep.get("size_y_for_psf", size_y)),
+            }
+        )
+        self._emit_progress(progress_callback, "Done", 1.0)
+        return result
+
     def simulate_full_pipeline(
         self,
         input_intensity,
