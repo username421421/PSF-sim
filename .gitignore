@@ -1,3 +1,22 @@
-saved simulation/
-Literature/
+# Ignore everything by default so GitHub only receives simulator source/docs.
+*
+
+# Keep repository metadata and docs.
+!.gitignore
+!README.md
+!CLI.md
+
+# Keep the Python simulator source and Windows launcher.
+!*.py
+!run_psf_gui.bat
+
+# Always ignore local/runtime artifacts even if a future rule changes.
 __pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
