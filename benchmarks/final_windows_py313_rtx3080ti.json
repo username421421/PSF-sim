@@ -1,0 +1,164 @@
+{
+  "schema_version": 1,
+  "environment": {
+    "platform": "Windows-11-10.0.26200-SP0",
+    "python": "3.13.2",
+    "numpy": "2.2.3",
+    "torch": "2.6.0+cu118",
+    "cuda_runtime": "11.8",
+    "cuda_device": "NVIDIA GeForce RTX 3080 Ti"
+  },
+  "cases": [
+    {
+      "name": "2d_default_cpu",
+      "seconds": [
+        0.29259079999974347,
+        0.31152320000001055,
+        0.3257037000003038,
+        0.28266290000101435,
+        0.2979345999992802
+      ],
+      "median_seconds": 0.2979345999992802,
+      "items_per_run": 1,
+      "median_seconds_per_item": 0.2979345999992802,
+      "parameters": {},
+      "peak_rss_bytes": 768880640,
+      "baseline_rss_bytes": 605528064,
+      "peak_rss_delta_bytes": 163352576,
+      "cuda_peak_bytes": 0
+    },
+    {
+      "name": "3d_61_cpu",
+      "seconds": [
+        0.822171800000433,
+        0.8280011999995622,
+        0.7950089000005391,
+        0.8258772000008321,
+        0.8111317999992025
+      ],
+      "median_seconds": 0.822171800000433,
+      "items_per_run": 1,
+      "median_seconds_per_item": 0.822171800000433,
+      "parameters": {
+        "z_chunk": 8
+      },
+      "peak_rss_bytes": 1095671808,
+      "baseline_rss_bytes": 997085184,
+      "peak_rss_delta_bytes": 98586624,
+      "cuda_peak_bytes": 0
+    },
+    {
+      "name": "profile_sequence_10_cpu",
+      "seconds": [
+        0.16439600000012433,
+        0.16564140000082261,
+        0.15958640000098967,
+        0.1614025999988371,
+        0.16888209999888204
+      ],
+      "median_seconds": 0.16439600000012433,
+      "items_per_run": 10,
+      "median_seconds_per_item": 0.016439600000012433,
+      "parameters": {},
+      "peak_rss_bytes": 961007616,
+      "baseline_rss_bytes": 960462848,
+      "peak_rss_delta_bytes": 544768,
+      "cuda_peak_bytes": 0
+    },
+    {
+      "name": "2d_default_cuda",
+      "seconds": [
+        0.12243660000058298,
+        0.120328500001051,
+        0.12062090000108583,
+        0.1482674999988376,
+        0.12168329999985872
+      ],
+      "median_seconds": 0.12168329999985872,
+      "items_per_run": 1,
+      "median_seconds_per_item": 0.12168329999985872,
+      "parameters": {},
+      "peak_rss_bytes": 744710144,
+      "baseline_rss_bytes": 742920192,
+      "peak_rss_delta_bytes": 1789952,
+      "cuda_peak_bytes": 261915648
+    },
+    {
+      "name": "3d_61_cuda",
+      "seconds": [
+        0.3099068999999872,
+        0.3084567000005336,
+        0.3088828999989346,
+        0.3101888000001054,
+        0.3102279999984603
+      ],
+      "median_seconds": 0.3099068999999872,
+      "items_per_run": 1,
+      "median_seconds_per_item": 0.3099068999999872,
+      "parameters": {
+        "z_chunk": 61
+      },
+      "peak_rss_bytes": 746385408,
+      "baseline_rss_bytes": 744595456,
+      "peak_rss_delta_bytes": 1789952,
+      "cuda_peak_bytes": 3174636032
+    },
+    {
+      "name": "profile_sequence_10_cuda",
+      "seconds": [
+        0.04880380000031437,
+        0.048949399999401066,
+        0.05089449999832141,
+        0.049433600001066225,
+        0.05207510000036564
+      ],
+      "median_seconds": 0.049433600001066225,
+      "items_per_run": 10,
+      "median_seconds_per_item": 0.004943360000106622,
+      "parameters": {},
+      "peak_rss_bytes": 750735360,
+      "baseline_rss_bytes": 750714880,
+      "peak_rss_delta_bytes": 20480,
+      "cuda_peak_bytes": 105434624
+    }
+  ],
+  "comparison_baseline": {
+    "schema_version": 1,
+    "environment": {
+      "platform": "Windows-11-10.0.26200-SP0",
+      "python": "3.13.2",
+      "numpy": "2.2.3",
+      "torch": "2.6.0+cu118",
+      "cuda_runtime": "11.8",
+      "cuda_device": "NVIDIA GeForce RTX 3080 Ti"
+    },
+    "cases": [
+      {
+        "name": "2d_default_cpu",
+        "seconds": [
+          0.26054019999992306,
+          0.27205479999997806,
+          0.2642191999998431,
+          0.28649719999998524,
+          0.2695545999999922
+        ],
+        "median_seconds": 0.2695545999999922,
+        "rss_delta_bytes": 0,
+        "cuda_peak_bytes": 0
+      },
+      {
+        "name": "2d_default_cuda",
+        "seconds": [
+          0.6745690999998715,
+          0.6748233999999229,
+          0.6765674999999192,
+          0.6776992000000064,
+          0.6797806999998102
+        ],
+        "median_seconds": 0.6765674999999192,
+        "rss_delta_bytes": 0,
+        "cuda_peak_bytes": 259620864
+      }
+    ]
+  }
+}
