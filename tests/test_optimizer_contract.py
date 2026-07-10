@@ -25,7 +25,6 @@ def _result():
     )
 
 
-@pytest.mark.xfail(strict=True, reason="C6: optimizer metadata is stored as object dtype")
 def test_optimizer_npz_is_pickle_free(tmp_path):
     path = tmp_path / "mask.npz"
     save_result_npz(path, _result())
@@ -54,6 +53,29 @@ def test_post_fresnel_complex_mask_is_applied_as_amplitude():
     assert np.allclose(
         applied["field_after_fresnel"], base["field_after_fresnel"] * mask, rtol=0, atol=1e-14
     )
+
+
+def test_post_fresnel_uniform_amplitude_scales_raw_intensity_quadratically():
+    from PSF_simulator import CartesianPSFSimulator
+
+    sim = CartesianPSFSimulator(torch_device="cpu")
+    kwargs = dict(
+        size_x=8e-3,
+        size_y=8e-3,
+        entrance_pupil_diameter=5.6e-3,
+        fresnel_distance=0.0,
+        range_microns=1.0,
+        num_points=9,
+    )
+    source = np.ones((24, 24), dtype=np.float64)
+    base = sim.simulate_full_pipeline(source, **kwargs)
+    scaled = sim.simulate_full_pipeline(
+        source,
+        **kwargs,
+        post_fresnel_mask=np.full((24, 24), 0.4, dtype=np.complex128),
+    )
+    assert np.allclose(scaled["I_xy"], 0.16 * base["I_xy"], rtol=1e-12, atol=0.0)
+    assert np.allclose(scaled["I_xy_norm"], base["I_xy_norm"], rtol=0, atol=1e-12)
 
 
 def test_optimizer_returns_exact_candidate_not_worse_than_baseline():

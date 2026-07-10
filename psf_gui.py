@@ -1,8 +1,16 @@
+if __name__ == "__main__":
+    import sys as _early_sys
+
+    if len(_early_sys.argv) > 1 and str(_early_sys.argv[1]).lower() != "gui":
+        from psf_cli import main as _early_cli_main
+
+        raise SystemExit(_early_cli_main(_early_sys.argv[1:]))
+
 import csv
+import copy
 import threading
 import traceback
 import tkinter as tk
-import pickle
 import os
 import sys
 import json
@@ -18,6 +26,13 @@ from matplotlib.transforms import Bbox
 
 from mask_builder import MaskBuilderModel
 from PSF_simulator import CartesianPSFSimulator, SimulationStoppedError
+from psf_cli import (
+    load_result as load_result_file,
+    read_mask as read_mask_file,
+    resize_mask as resize_mask_array,
+    save_result as save_result_file,
+)
+from psf_runtime import create_simulator, enforce_resource_limits, estimate_resources
 from plot_style import (
     add_compact_colorbar,
     apply_publication_style,
@@ -86,6 +101,7 @@ class PSFSimulatorApp:
         self.mask_array = None
         self.post_fresnel_mask_array = None
         self.opt_input_mask = None
+        self.config_extensions = {}
         self.mask_rotation_quadrants = 0  # +1 means +90 deg CCW.
         self.mask_path = None
         self.results_2d = None
@@ -95,10 +111,23 @@ class PSFSimulatorApp:
         self.mask_builder_model = None
         self.mask_builder_action_buttons = []
         self.project_dir = os.path.dirname(os.path.abspath(__file__))
-        self.mask_library_dir = os.path.join(self.project_dir, "mask library")
-        self.saved_simulation_dir = os.path.join(self.project_dir, "saved simulation")
-        self.objective_lens_dir = os.path.join(self.project_dir, "objective lens")
-        self.optimized_mask_dir = os.path.join(self.project_dir, "optimized mask")
+        portable = str(os.environ.get("PSF_SIM_PORTABLE", "")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+        if portable:
+            self.user_data_dir = self.project_dir
+        else:
+            local_root = os.environ.get("LOCALAPPDATA") or os.path.join(
+                os.path.expanduser("~"), "AppData", "Local"
+            )
+            self.user_data_dir = os.path.join(local_root, "PSFSimulator")
+        self.bundled_mask_library_dir = os.path.join(self.project_dir, "mask library")
+        self.mask_library_dir = os.path.join(self.user_data_dir, "mask library")
+        self.saved_simulation_dir = os.path.join(self.user_data_dir, "saved simulation")
+        self.objective_lens_dir = os.path.join(self.user_data_dir, "objective lens")
+        self.optimized_mask_dir = os.path.join(self.user_data_dir, "optimized mask")
         os.makedirs(self.mask_library_dir, exist_ok=True)
         os.makedirs(self.saved_simulation_dir, exist_ok=True)
         os.makedirs(self.objective_lens_dir, exist_ok=True)
@@ -112,6 +141,7 @@ class PSFSimulatorApp:
         self._surface_cache = {}
         self._surface_cache_order = []
         self._surface_cache_max = 32
+        self._surface_cache_max_bytes = 256 * 1024**2
         self._max_3d_display_dim = 96
         self._max_3d_faces = 30000
         self._qt_pump_interval_ms = 5
@@ -345,7 +375,6 @@ class PSFSimulatorApp:
         self._entry(design_media_group, "Immersion oil RI", self.design_immersion_ri_var)
         self._entry(design_media_group, "Coverslip RI", self.design_coverslip_ri_var)
         self._entry(design_media_group, "Coverslip thickness (um)", self.design_coverslip_thickness_um_var)
-        self._entry(design_media_group, "Resin RI", self.design_resin_ri_var)
         objective_lens_row = ttk.Frame(opt_group)
         objective_lens_row.pack(fill="x", pady=(4, 0))
         self.store_objective_lens_btn = ttk.Button(
@@ -520,7 +549,13 @@ class PSFSimulatorApp:
             text="Save Config",
             command=self._save_simulation_config_dialog,
         )
-        self.save_config_btn.pack(side=tk.LEFT, fill="x", expand=True)
+        self.save_config_btn.pack(side=tk.LEFT, fill="x", expand=True, padx=(0, 3))
+        self.load_config_btn = ttk.Button(
+            config_row,
+            text="Load Config",
+            command=self._load_simulation_config_dialog,
+        )
+        self.load_config_btn.pack(side=tk.LEFT, fill="x", expand=True, padx=(3, 0))
 
         prog_row = ttk.Frame(parent)
         prog_row.pack(fill="x", pady=(6, 2))
@@ -1329,7 +1364,7 @@ class PSFSimulatorApp:
             center_y_mm = float(self.builder_center_y_mm_var.get())
             shape = str(self.builder_shape_var.get()).strip().lower()
 
-            model.push_history()
+            previous = model.get_mask()
             if shape == "ring":
                 model.add_ring(
                     center_x_mm=center_x_mm,
@@ -1353,6 +1388,9 @@ class PSFSimulatorApp:
                     radius_mm=float(self.builder_circle_radius_mm_var.get()),
                     mode=mode,
                 )
+            model.history.append(previous)
+            if len(model.history) > model.max_history:
+                model.history.pop(0)
             self.mask_builder_status_var.set(f"Applied {mode} {shape}.")
             self._refresh_mask_builder_plot()
         except Exception as exc:
@@ -1560,6 +1598,8 @@ class PSFSimulatorApp:
         self.load_btn.configure(state=run_state)
         if hasattr(self, "save_config_btn"):
             self.save_config_btn.configure(state=run_state)
+        if hasattr(self, "load_config_btn"):
+            self.load_config_btn.configure(state=run_state)
         self.load_mask_btn.configure(state=run_state)
         if hasattr(self, "show_3d_btn"):
             self._update_3d_window_button_state()
@@ -1659,72 +1699,15 @@ class PSFSimulatorApp:
 
     @staticmethod
     def _read_mask(path):
-        import matplotlib.pyplot as plt
-
-        ext = os.path.splitext(path)[1].lower()
-        if ext == ".npy":
-            arr = np.load(path)
-        elif ext in {".csv", ".txt"}:
-            try:
-                arr = np.loadtxt(path, delimiter=",")
-            except Exception:
-                arr = np.loadtxt(path)
-        elif ext in {".tif", ".tiff"}:
-            if tifffile is not None:
-                arr = tifffile.imread(path)
-            else:
-                arr = plt.imread(path)
-        else:
-            arr = plt.imread(path)
-
-        arr = np.asarray(arr, dtype=float)
-
-        # Handle multipage TIFF/volumetric arrays by taking the first frame.
-        if arr.ndim >= 4:
-            arr = arr[0]
-        if arr.ndim == 3:
-            if arr.shape[-1] in (3, 4):
-                arr = np.mean(arr[..., :3], axis=2)
-            elif arr.shape[0] in (3, 4):
-                arr = np.mean(arr[:3, ...], axis=0)
-            else:
-                arr = arr[0]
-        if arr.ndim != 2:
-            raise ValueError("Mask must be a 2D array.")
-
-        if not np.all(np.isfinite(arr)):
-            raise ValueError("Mask contains NaN or Inf.")
-
-        amin = float(np.min(arr))
-        amax = float(np.max(arr))
-        rng = amax - amin
-
-        # Always normalize loaded mask to [0, 1].
-        if rng <= 0:
-            arr = np.ones_like(arr) if amax > 0 else np.zeros_like(arr)
-        else:
-            arr = (arr - amin) / rng
-
-        return np.clip(arr, 0.0, 1.0)
+        return read_mask_file(path, normalization="physical")
 
     @staticmethod
     def _resize_mask(mask, shape):
-        if mask.shape == shape:
-            return np.clip(mask, 0.0, 1.0)
-
-        mask_t = torch.as_tensor(mask, dtype=torch.float64)
-        resized_t = F.interpolate(
-            mask_t[None, None, :, :],
-            size=(int(shape[0]), int(shape[1])),
-            mode="bilinear",
-            align_corners=False,
-        )[0, 0]
-        out = torch.clamp(resized_t, 0.0, 1.0).detach().cpu().numpy()
-        return out
+        return resize_mask_array(mask, shape)
 
     @staticmethod
     def _clone_payload(data):
-        return pickle.loads(pickle.dumps(data, protocol=pickle.HIGHEST_PROTOCOL))
+        return copy.deepcopy(data)
 
     @staticmethod
     def _encode_precise_params(params):
@@ -1816,12 +1799,19 @@ class PSFSimulatorApp:
         if key not in params:
             return
         try:
-            value = cast(params[key]) * scale
+            raw = params[key]
+            if cast is int:
+                numeric = float(raw)
+                if (not np.isfinite(numeric)) or (not numeric.is_integer()):
+                    raise ValueError(f"{key} must be an integer.")
+                value = int(numeric) * scale
+            else:
+                value = cast(raw) * scale
             if isinstance(value, float) and (not np.isfinite(value)):
-                return
+                raise ValueError(f"{key} must be finite.")
             var.set(value)
-        except Exception:
-            return
+        except Exception as exc:
+            raise ValueError(f"Invalid config value for {key}: {params[key]!r}.") from exc
 
     @staticmethod
     def _finite_float_or_none(value):
@@ -1836,10 +1826,9 @@ class PSFSimulatorApp:
     def _set_bool_var_if_present(self, values, key, var):
         if key not in values:
             return
-        try:
-            var.set(bool(values[key]))
-        except Exception:
-            return
+        if not isinstance(values[key], (bool, np.bool_)):
+            raise ValueError(f"{key} must be a JSON boolean.")
+        var.set(bool(values[key]))
 
     def _set_choice_var_if_valid(self, values, key, var, valid_values, lowercase=False):
         if key not in values:
@@ -2326,6 +2315,31 @@ class PSFSimulatorApp:
             "optimizer_last_run": self._encode_precise_params(optimizer_last_run),
         }
         try:
+            sidecar = os.path.join(
+                os.path.dirname(self.last_config_path), "last_used_simulation_masks.npz"
+            )
+            if self.mask_array is not None or self.post_fresnel_mask_array is not None:
+                arrays = {}
+                if self.mask_array is not None:
+                    arrays["pre_fresnel_intensity"] = np.asarray(
+                        self.mask_array, dtype=np.float64
+                    )
+                if self.post_fresnel_mask_array is not None:
+                    value = np.asarray(self.post_fresnel_mask_array, dtype=np.complex128)
+                    arrays["complex_mask_real"] = value.real
+                    arrays["complex_mask_imag"] = value.imag
+                np.savez_compressed(sidecar, **arrays)
+                payload["mask"] = {
+                    "source": (
+                        "optimized_complex"
+                        if self.post_fresnel_mask_array is not None
+                        else "builder"
+                    ),
+                    "path": os.path.basename(sidecar),
+                    "normalization": "physical",
+                    "rotation_quadrants_ccw": int(self._mask_rotation_quadrants_mod()),
+                    "loaded": True,
+                }
             with open(self.last_config_path, "w", encoding="utf-8") as f:
                 json.dump(payload, f, indent=2)
         except Exception:
@@ -2335,7 +2349,7 @@ class PSFSimulatorApp:
         params = self._collect_params()
         payload = {
             "format": "psf_sim_gui_config",
-            "version": 1,
+            "version": 2,
             "params": self._encode_precise_params(self._clone_payload(params)),
             "ui_values": self._encode_precise_params(self._collect_control_values()),
             "optimizer_ui_values": self._encode_precise_params(
@@ -2343,19 +2357,144 @@ class PSFSimulatorApp:
             ),
             "mask": {
                 "path": self.mask_path,
+                "source": (
+                    "optimized_complex"
+                    if self.post_fresnel_mask_array is not None
+                    else ("file" if self.mask_path else ("builder" if self.mask_array is not None else "all_pass"))
+                ),
+                "normalization": "physical",
+                "plane": (
+                    "post_fresnel_pre_pupil"
+                    if self.post_fresnel_mask_array is not None
+                    else "pre_fresnel_intensity"
+                ),
                 "rotation_quadrants_ccw": int(self._mask_rotation_quadrants_mod()),
-                "loaded": bool(self.mask_array is not None),
+                "loaded": bool(
+                    self.mask_array is not None or self.post_fresnel_mask_array is not None
+                ),
             },
         }
+        if self.config_extensions:
+            payload["extensions"] = self._clone_payload(self.config_extensions)
         if self.mask_array is not None:
             payload["mask"]["shape"] = [int(v) for v in np.asarray(self.mask_array).shape]
         return payload
 
     def _save_simulation_config_to_path(self, path):
         payload = self._build_simulation_config_payload()
+        config_path = os.path.abspath(path)
+        mask_info = payload["mask"]
+        source = str(mask_info.get("source", "all_pass"))
+        if source == "file" and self.mask_path:
+            try:
+                mask_info["path"] = os.path.relpath(
+                    os.path.abspath(self.mask_path), os.path.dirname(config_path)
+                )
+            except Exception:
+                mask_info["path"] = self.mask_path
+        elif source in {"builder", "optimized_complex"}:
+            stem = os.path.splitext(os.path.basename(config_path))[0]
+            sidecar = os.path.join(os.path.dirname(config_path), f"{stem}.masks.npz")
+            arrays = {}
+            if self.mask_array is not None:
+                arrays["pre_fresnel_intensity"] = np.asarray(self.mask_array, dtype=np.float64)
+            if self.post_fresnel_mask_array is not None:
+                value = np.asarray(self.post_fresnel_mask_array, dtype=np.complex128)
+                arrays["complex_mask_real"] = value.real
+                arrays["complex_mask_imag"] = value.imag
+            np.savez_compressed(sidecar, **arrays)
+            mask_info["path"] = os.path.basename(sidecar)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
         return payload
+
+    def _load_simulation_config_from_path(self, path):
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        if not isinstance(payload, dict):
+            raise ValueError("Simulation config must be a JSON object.")
+        version = int(payload.get("version", 1))
+        if version > 2 and payload.get("format") != "psf_sim_gui_last_used_config":
+            raise ValueError(f"Unsupported future simulation config version: {version}.")
+        known = {
+            "format",
+            "version",
+            "params",
+            "ui_values",
+            "optimizer_ui_values",
+            "optimizer_settings",
+            "optimizer_last_run",
+            "mask",
+            "extensions",
+        }
+        extensions = payload.get("extensions", {})
+        self.config_extensions = dict(extensions) if isinstance(extensions, dict) else {}
+        for key, value in payload.items():
+            if key not in known:
+                self.config_extensions[str(key)] = self._clone_payload(value)
+        params = payload.get("params")
+        if isinstance(params, dict):
+            self._apply_params_to_controls(self._decode_precise_params(params))
+        ui_values = payload.get("ui_values")
+        if isinstance(ui_values, dict):
+            self._apply_control_values(self._decode_precise_params(ui_values))
+        opt_values = payload.get("optimizer_ui_values") or payload.get("optimizer_settings")
+        if isinstance(opt_values, dict):
+            self._apply_optimizer_control_values(self._decode_precise_params(opt_values))
+
+        info = payload.get("mask", {})
+        if isinstance(info, dict) and bool(
+            info.get("loaded", info.get("source", "all_pass") != "all_pass")
+        ):
+            raw_path = info.get("path")
+            if raw_path:
+                mask_path = os.path.expanduser(str(raw_path))
+                if not os.path.isabs(mask_path):
+                    mask_path = os.path.join(os.path.dirname(os.path.abspath(path)), mask_path)
+                source = str(info.get("source", "file"))
+                if source in {"builder", "optimized_complex"} or mask_path.lower().endswith(".npz"):
+                    with np.load(mask_path, allow_pickle=False) as data:
+                        if "pre_fresnel_intensity" in data.files:
+                            self.mask_array = np.asarray(
+                                data["pre_fresnel_intensity"], dtype=np.float64
+                            )
+                        if {"complex_mask_real", "complex_mask_imag"}.issubset(data.files):
+                            self.post_fresnel_mask_array = np.asarray(
+                                data["complex_mask_real"], dtype=np.float64
+                            ) + 1j * np.asarray(data["complex_mask_imag"], dtype=np.float64)
+                    self.mask_path = None
+                    self.mask_path_var.set(f"From config sidecar: {mask_path}")
+                else:
+                    self.mask_array = self._read_mask(mask_path)
+                    self.post_fresnel_mask_array = None
+                    self.mask_path = mask_path
+                    self.mask_path_var.set(mask_path)
+                self.mask_rotation_quadrants = int(
+                    info.get("rotation_quadrants_ccw", 0)
+                ) % 4
+                self._update_mask_orientation_label()
+                if self.mask_array is not None:
+                    self.nx_var.set(int(self.mask_array.shape[0]))
+                    self.ny_var.set(int(self.mask_array.shape[1]))
+                self.mask_info_var.set(f"Loaded config mask source: {source}.")
+                self._refresh_mask_input_preview()
+        else:
+            self._clear_loaded_mask(set_status=False)
+        return payload
+
+    def _load_simulation_config_dialog(self):
+        path = filedialog.askopenfilename(
+            title="Load simulation config",
+            initialdir=self.saved_simulation_dir,
+            filetypes=[("JSON config", "*.json"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            self._load_simulation_config_from_path(path)
+            self.status_var.set(f"Loaded simulation config: {path}")
+        except Exception as exc:
+            messagebox.showerror("Load simulation config", str(exc))
 
     def _save_simulation_config_dialog(self):
         try:
@@ -2440,6 +2579,13 @@ class PSFSimulatorApp:
             except Exception:
                 pass
 
+        if isinstance(payload.get("mask"), dict):
+            try:
+                self._load_simulation_config_from_path(self.last_config_path)
+                loaded_any = True
+            except Exception:
+                pass
+
         return bool(loaded_any)
 
     def _save_result_dialog(self):
@@ -2461,17 +2607,8 @@ class PSFSimulatorApp:
         self._save_result_to_path(path)
 
     def _save_result_to_path(self, path):
-        payload = {
-            "format": "psf_sim_gui_result",
-            "version": 1,
-            "params": self._clone_payload(self.last_params),
-            "results_2d": self._clone_payload(self.results_2d),
-        }
-        if self.results_3d is not None:
-            payload["results_3d"] = self._clone_payload(self.results_3d)
-        with open(path, "wb") as f:
-            pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
-        has_3d = "yes" if "results_3d" in payload else "no"
+        save_result_file(path, self.last_params, self.results_2d, self.results_3d)
+        has_3d = "yes" if self.results_3d is not None else "no"
         self.status_var.set(f"Saved result. 3D included: {has_3d}.")
 
     def _collect_current_export_display_data(self):
@@ -2727,8 +2864,18 @@ class PSFSimulatorApp:
             messagebox.showerror("Load error", str(exc))
 
     def _load_result_from_path(self, path):
-        with open(path, "rb") as f:
-            payload = pickle.load(f)
+        try:
+            payload = load_result_file(path)
+        except ValueError as exc:
+            if "Legacy pickle result is unsafe" not in str(exc):
+                raise
+            trusted = messagebox.askyesno(
+                "Unsafe legacy result",
+                "This legacy pickle can execute code while loading. Load it only if you trust its source. Continue?",
+            )
+            if not trusted:
+                raise ValueError("Legacy result loading was cancelled.") from exc
+            payload = load_result_file(path, allow_unsafe_legacy_pickle=True)
         if not isinstance(payload, dict):
             raise ValueError("Invalid result file: expected dictionary payload.")
         if "params" not in payload or "results_2d" not in payload:
@@ -2833,26 +2980,7 @@ class PSFSimulatorApp:
 
     @staticmethod
     def _create_simulator_from_params(p):
-        sim_kwargs = {
-            "wavelength": float(p["wavelength"]),
-            "NA": float(p["NA"]),
-            "theta_samples": int(p["theta_samples"]),
-            "phi_samples": int(p["phi_samples"]),
-            "integration_mode": str(p.get("integration_mode", "cartesian_jacobian")),
-            "torch_device": str(p.get("torch_device", "cpu")).strip().lower(),
-            "n_i": float(p["n_i"]),
-            "n_g": float(p["n_g"]),
-            "t_g": float(p["t_g"]),
-            "n_s": float(p["n_s"]),
-            "t_s": float(p["t_s"]),
-            "n_id": float(p["n_id"]),
-            "n_gd": float(p["n_gd"]),
-            "t_gd": float(p["t_gd"]),
-            "n_sd": float(p.get("n_sd", 1.515)),
-        }
-        if "t_id" in p:
-            sim_kwargs["t_id"] = float(p["t_id"])
-        return CartesianPSFSimulator(**sim_kwargs)
+        return create_simulator(p)
 
     def _get_input_mask(self, shape, size_x, size_y, offset_x=0.0, offset_y=0.0):
         if self.mask_array is None:
@@ -3156,6 +3284,31 @@ class PSFSimulatorApp:
                 offset_x=params["mask_offset_x"],
                 offset_y=params["mask_offset_y"],
             )
+            multiplier = 2 if settings["mode"] == "amplitude_phase" else 1
+            variables = int(params["nx"] * params["ny"] * multiplier)
+            predicted = int(
+                np.ceil(
+                    PostFresnelMaskOptimizer._estimate_evals_per_iteration(
+                        settings["optimizer_name"], variables
+                    )
+                )
+            )
+            estimate = estimate_resources(
+                params,
+                optimizer_variables=variables,
+                predicted_objective_evals_per_iteration=predicted,
+            )
+            try:
+                enforce_resource_limits(estimate, allow_expensive=False)
+            except ValueError as exc:
+                if "Request is expensive" not in str(exc):
+                    raise
+                if not messagebox.askyesno(
+                    "Expensive optimization",
+                    f"{exc}\n\nEstimated peak RAM: {estimate.peak_ram_bytes / 1024**3:.2f} GiB. Continue?",
+                ):
+                    return
+                enforce_resource_limits(estimate, allow_expensive=True)
         except Exception as exc:
             messagebox.showerror("Mask optimization", str(exc))
             return
@@ -3678,6 +3831,23 @@ class PSFSimulatorApp:
     def _start_worker(self, run_3d):
         if self.is_running or self.opt_is_running:
             return
+        try:
+            params = self._collect_params()
+            estimate = estimate_resources(params, run_3d=bool(run_3d))
+            try:
+                enforce_resource_limits(estimate, allow_expensive=False)
+            except ValueError as exc:
+                if "Request is expensive" not in str(exc):
+                    raise
+                if not messagebox.askyesno(
+                    "Expensive simulation",
+                    f"{exc}\n\nEstimated peak RAM: {estimate.peak_ram_bytes / 1024**3:.2f} GiB. Continue?",
+                ):
+                    return
+                enforce_resource_limits(estimate, allow_expensive=True)
+        except Exception as exc:
+            messagebox.showerror("Resource preflight", str(exc))
+            return
         self.stop_requested = False
         self._set_running(True, "Running simulation...")
         self._set_progress(0.0, "Initializing...", force=True)
@@ -3748,7 +3918,10 @@ class PSFSimulatorApp:
                 )
 
                 res3d = simulator.simulate_psf_volume_from_pupil_field(
-                    pupil_field=prep.get("field_at_pupil_for_psf", prep["field_at_pupil"]),
+                    pupil_field=prep.get(
+                        "_field_at_pupil_for_psf_torch",
+                        prep.get("field_at_pupil_for_psf", prep["field_at_pupil"]),
+                    ),
                     size_x=float(prep.get("size_x_for_psf", p["size_x"])),
                     size_y=float(prep.get("size_y_for_psf", p["size_y"])),
                     entrance_pupil_diameter=p["pupil_d"],
@@ -3784,7 +3957,7 @@ class PSFSimulatorApp:
                     "y_profile_at_x0": res3d["y_profile_at_x0"],
                     "z_profile_at_x0": res3d["z_profile_at_x0"],
                 }
-                res2d.update(prep)
+                res2d.update({key: value for key, value in prep.items() if not key.startswith("_")})
             else:
                 res2d = simulator.simulate_full_pipeline(
                     input_intensity=mask,
@@ -4554,7 +4727,19 @@ class PSFSimulatorApp:
         except ValueError:
             pass
         self._surface_cache_order.append(key)
-        while len(self._surface_cache_order) > int(self._surface_cache_max):
+        def cache_bytes():
+            total = 0
+            for item in self._surface_cache.values():
+                try:
+                    total += int(item.actual_memory_size) * 1024
+                except Exception:
+                    pass
+            return total
+
+        while (
+            len(self._surface_cache_order) > int(self._surface_cache_max)
+            or cache_bytes() > int(self._surface_cache_max_bytes)
+        ):
             old = self._surface_cache_order.pop(0)
             self._surface_cache.pop(old, None)
 
@@ -4831,6 +5016,15 @@ class PSFSimulatorApp:
         surface = grid.contour(isosurfaces=[float(display_state["level_abs"])], scalars="psf")
         if surface.n_points < 1 or surface.n_cells < 1:
             return None
+        if int(surface.n_cells) > int(self._max_3d_faces):
+            target_reduction = 1.0 - float(self._max_3d_faces) / float(surface.n_cells)
+            try:
+                surface = surface.decimate_pro(
+                    max(0.0, min(0.99, target_reduction)),
+                    preserve_topology=True,
+                )
+            except Exception:
+                surface = surface.decimate(max(0.0, min(0.99, target_reduction)))
 
         self._put_surface_cache(cache_key, surface)
         return surface

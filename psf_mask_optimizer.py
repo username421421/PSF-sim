@@ -3789,6 +3789,12 @@ class PostFresnelMaskOptimizer:
 
 def save_result_npz(path: str, result: OptimizerResult, extra_metadata: Optional[Dict[str, Any]] = None):
     metadata = {
+        "format": "psf_optimizer_result",
+        "version": 2,
+        "status": str(result.status),
+        "solver_runs": list(result.solver_runs),
+        "mask_plane": "post_fresnel_pre_pupil",
+        "mask_transmission": "complex_amplitude",
         "settings": result.settings,
         "best_objective": float(result.best_objective),
         "baseline_objective": float(result.baseline_objective),
@@ -3805,5 +3811,5 @@ def save_result_npz(path: str, result: OptimizerResult, extra_metadata: Optional
         phase_mask_rad=np.asarray(result.phase_mask_rad, dtype=np.float64),
         complex_mask_real=np.asarray(np.real(result.complex_mask), dtype=np.float64),
         complex_mask_imag=np.asarray(np.imag(result.complex_mask), dtype=np.float64),
-        metadata_json=np.asarray(json.dumps(metadata), dtype=object),
+        metadata_json=np.asarray(json.dumps(metadata, ensure_ascii=False)),
     )

@@ -2,45 +2,71 @@ import argparse
 import csv
 import json
 import os
-import pickle
 import sys
 import time
+import traceback
+import warnings
 from pathlib import Path
 
 import numpy as np
-import torch
-import torch.nn.functional as F
+from psf_io import (
+    clone_payload,
+    has_zip_signature,
+    read_safe_container,
+    read_unsafe_legacy_pickle,
+    write_safe_container,
+)
+from psf_runtime import create_simulator, enforce_resource_limits, estimate_resources
 
-from PSF_simulator import CartesianPSFSimulator, SimulationStoppedError
+torch = None
+F = None
+CartesianPSFSimulator = None
+OptimizerConfig = None
+PostFresnelMaskOptimizer = None
+save_result_npz = None
+HAS_OPTIMIZER = None
+OPTIMIZER_IMPORT_ERROR = ""
 
-try:
-    import tifffile
-except Exception:  # pragma: no cover - optional dependency
-    tifffile = None
 
-try:
-    from psf_mask_optimizer import (
-        OptimizationStoppedError,
-        OptimizerConfig,
-        PostFresnelMaskOptimizer,
-        save_result_npz,
-    )
+def _ensure_core_loaded():
+    global torch, F, CartesianPSFSimulator
+    if CartesianPSFSimulator is not None:
+        return
+    import torch as torch_module
+    import torch.nn.functional as functional
+    from PSF_simulator import CartesianPSFSimulator as simulator_class
 
-    HAS_OPTIMIZER = True
-    OPTIMIZER_IMPORT_ERROR = ""
-except Exception as exc:  # pragma: no cover - optional dependency
-    OptimizationStoppedError = RuntimeError
-    OptimizerConfig = None
-    PostFresnelMaskOptimizer = None
-    save_result_npz = None
-    HAS_OPTIMIZER = False
-    OPTIMIZER_IMPORT_ERROR = str(exc)
+    torch = torch_module
+    F = functional
+    CartesianPSFSimulator = simulator_class
+
+
+def _ensure_optimizer_loaded():
+    global HAS_OPTIMIZER, OPTIMIZER_IMPORT_ERROR
+    global OptimizerConfig, PostFresnelMaskOptimizer, save_result_npz
+    if HAS_OPTIMIZER is not None:
+        return
+    _ensure_core_loaded()
+    try:
+        from psf_mask_optimizer import (
+            OptimizerConfig as config_class,
+            PostFresnelMaskOptimizer as optimizer_class,
+            save_result_npz as save_optimizer_result,
+        )
+
+        OptimizerConfig = config_class
+        PostFresnelMaskOptimizer = optimizer_class
+        save_result_npz = save_optimizer_result
+        HAS_OPTIMIZER = True
+    except Exception as exc:  # pragma: no cover - optional dependency
+        HAS_OPTIMIZER = False
+        OPTIMIZER_IMPORT_ERROR = str(exc)
 
 
 RESULT_FORMAT = "psf_sim_gui_result"
-RESULT_VERSION = 1
+RESULT_VERSION = 2
 CONFIG_FORMAT = "psf_sim_cli_config"
-CONFIG_VERSION = 1
+CONFIG_VERSION = 2
 
 
 DEFAULT_PARAMS = {
@@ -98,10 +124,6 @@ DEFAULT_OPTIMIZER_SETTINGS = {
 }
 
 
-def clone_payload(data):
-    return pickle.loads(pickle.dumps(data, protocol=pickle.HIGHEST_PROTOCOL))
-
-
 def encode_precise_params(params):
     def encode_value(value):
         if isinstance(value, (bool, np.bool_)):
@@ -140,6 +162,8 @@ def decode_precise_params(params):
 
 
 def finite_float(value, name):
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError(f"{name} must be numeric, not boolean.")
     try:
         out = float(value)
     except Exception as exc:
@@ -150,10 +174,15 @@ def finite_float(value, name):
 
 
 def finite_int(value, name):
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError(f"{name} must be an integer, not boolean.")
     try:
-        return int(value)
+        numeric = float(value)
     except Exception as exc:
         raise ValueError(f"{name} must be an integer.") from exc
+    if not np.isfinite(numeric) or not numeric.is_integer():
+        raise ValueError(f"{name} must be a finite integer.")
+    return int(numeric)
 
 
 def normalise_plot_mode(value):
@@ -228,8 +257,15 @@ def params_from_ui_values(values):
     }
     for src, (dst, scale, cast) in mapping.items():
         if src in values:
-            params[dst] = cast(values[src]) * scale if cast is not str else str(values[src])
+            if cast is str:
+                params[dst] = str(values[src])
+            elif cast is int:
+                params[dst] = float(values[src]) * scale
+            else:
+                params[dst] = cast(values[src]) * scale
     if "use_gaussian" in values:
+        if not isinstance(values["use_gaussian"], (bool, np.bool_)):
+            raise ValueError("use_gaussian must be a JSON boolean.")
         params["use_gaussian"] = bool(values["use_gaussian"])
     return params
 
@@ -281,6 +317,9 @@ def load_config(path):
     if not isinstance(payload, dict):
         raise ValueError("config must be a JSON object.")
     payload = decode_precise_params(payload)
+    version = int(payload.get("version", 1))
+    if version > CONFIG_VERSION and payload.get("format") != "psf_sim_gui_last_used_config":
+        raise ValueError(f"Unsupported future config version: {version}.")
 
     params = {}
     optimizer_settings = {}
@@ -315,13 +354,18 @@ def mask_path_from_config(path):
     mask_info = payload.get("mask")
     if not isinstance(mask_info, dict):
         return None
-    if not bool(mask_info.get("loaded", False)):
+    if not bool(mask_info.get("loaded", mask_info.get("source", "all_pass") != "all_pass")):
         return None
     mask_path = mask_info.get("path")
     if mask_path is None:
         return None
     mask_path = str(mask_path).strip()
-    return mask_path if mask_path else None
+    if not mask_path:
+        return None
+    candidate = Path(mask_path).expanduser()
+    if not candidate.is_absolute():
+        candidate = Path(path).expanduser().resolve().parent / candidate
+    return str(candidate)
 
 
 def resolve_mask_path(args):
@@ -336,7 +380,7 @@ def load_objective_lens(path):
     values = payload.get("values", payload)
     if not isinstance(values, dict):
         raise ValueError("objective lens preset must contain a values object.")
-    required = ("NA", "pupil_d_mm", "n_id", "n_gd", "t_gd_um", "n_sd")
+    required = ("NA", "pupil_d_mm", "n_id", "n_gd", "t_gd_um")
     missing = [key for key in required if key not in values]
     if missing:
         raise ValueError(f"objective lens preset missing keys: {', '.join(missing)}.")
@@ -346,7 +390,7 @@ def load_objective_lens(path):
         "n_id": float(values["n_id"]),
         "n_gd": float(values["n_gd"]),
         "t_gd": float(values["t_gd_um"]) * 1e-6,
-        "n_sd": float(values["n_sd"]),
+        "n_sd": float(values.get("n_sd", values["n_id"])),
     }
 
 
@@ -391,6 +435,8 @@ def validate_params(params):
         p[key] = finite_float(p[key], key)
         if p[key] < 0.0:
             raise ValueError(f"{key} must be >= 0.")
+    if not isinstance(p["use_gaussian"], (bool, np.bool_)):
+        raise ValueError("use_gaussian must be a boolean.")
     p["use_gaussian"] = bool(p["use_gaussian"])
     p["gauss_wx"] = finite_float(p["gauss_wx"], "gauss_wx")
     p["gauss_wy"] = finite_float(p["gauss_wy"], "gauss_wy")
@@ -461,7 +507,14 @@ def resolve_params(args):
     if getattr(args, "config", None):
         loaded_params, _loaded_opt = load_config(args.config)
         params.update(loaded_params)
-    return apply_param_overrides(params, args)
+    resolved = apply_param_overrides(params, args)
+    if getattr(args, "n_sd", None) is not None:
+        warnings.warn(
+            "--n-sd is deprecated and retained only for config compatibility; it does not affect this optical model.",
+            FutureWarning,
+            stacklevel=2,
+        )
+    return resolved
 
 
 def resolve_optimizer_settings(args):
@@ -519,52 +572,57 @@ def resolve_optimizer_settings(args):
 
 
 def create_simulator_from_params(params):
-    return CartesianPSFSimulator(
-        wavelength=float(params["wavelength"]),
-        NA=float(params["NA"]),
-        theta_samples=int(params["theta_samples"]),
-        phi_samples=int(params["phi_samples"]),
-        integration_mode=str(params.get("integration_mode", "cartesian_jacobian")),
-        torch_device=str(params.get("torch_device", "cpu")).strip().lower(),
-        n_i=float(params["n_i"]),
-        n_g=float(params["n_g"]),
-        t_g=float(params["t_g"]),
-        n_s=float(params["n_s"]),
-        t_s=float(params["t_s"]),
-        n_id=float(params["n_id"]),
-        n_gd=float(params["n_gd"]),
-        t_gd=float(params["t_gd"]),
-        n_sd=float(params.get("n_sd", 1.515)),
-    )
+    _ensure_core_loaded()
+    return create_simulator(params)
 
 
-def read_mask(path):
+def read_mask(path, normalization="physical"):
     import matplotlib
 
     matplotlib.use("Agg", force=True)
     import matplotlib.pyplot as plt
 
     ext = os.path.splitext(str(path))[1].lower()
+    axes = None
     if ext == ".npy":
-        arr = np.load(path)
+        arr = np.load(path, allow_pickle=False)
     elif ext in {".csv", ".txt"}:
         try:
             arr = np.loadtxt(path, delimiter=",")
         except Exception:
             arr = np.loadtxt(path)
     elif ext in {".tif", ".tiff"}:
+        try:
+            import tifffile
+        except Exception:
+            tifffile = None
         if tifffile is not None:
-            arr = tifffile.imread(path)
+            with tifffile.TiffFile(path) as tif:
+                series = tif.series[0]
+                axes = str(getattr(series, "axes", ""))
+                arr = series.asarray()
         else:
             arr = plt.imread(path)
     else:
         arr = plt.imread(path)
 
-    arr = np.asarray(arr, dtype=float)
+    original = np.asarray(arr)
+    arr = original
     if arr.ndim >= 4:
-        arr = arr[0]
+        while arr.ndim > 3:
+            arr = arr[0]
     if arr.ndim == 3:
-        if arr.shape[-1] in (3, 4):
+        channel_last = bool(axes and axes[-1:] in {"C", "S"})
+        channel_first = bool(axes and axes[:1] in {"C", "S"})
+        if channel_last and arr.shape[-1] in (3, 4):
+            arr = np.mean(arr[..., :3], axis=2)
+        elif channel_first and arr.shape[0] in (3, 4):
+            arr = np.mean(arr[:3, ...], axis=0)
+        elif axes:
+            # Page/time/depth stacks are not RGB merely because they contain
+            # three or four planes.  A 2D mask uses the first plane.
+            arr = arr[0]
+        elif arr.shape[-1] in (3, 4):
             arr = np.mean(arr[..., :3], axis=2)
         elif arr.shape[0] in (3, 4):
             arr = np.mean(arr[:3, ...], axis=0)
@@ -572,21 +630,36 @@ def read_mask(path):
             arr = arr[0]
     if arr.ndim != 2:
         raise ValueError("Mask must be a 2D array.")
+    arr = np.asarray(arr)
+    if np.issubdtype(arr.dtype, np.integer):
+        info = np.iinfo(arr.dtype)
+        if info.min < 0 and np.min(arr) < 0:
+            raise ValueError("Signed integer masks cannot contain negative values.")
+        arr = arr.astype(np.float64) / float(info.max)
+    else:
+        arr = arr.astype(np.float64)
     if not np.all(np.isfinite(arr)):
         raise ValueError("Mask contains NaN or Inf.")
-
-    amin = float(np.min(arr))
-    amax = float(np.max(arr))
-    rng = amax - amin
-    if rng <= 0.0:
-        arr = np.ones_like(arr) if amax > 0.0 else np.zeros_like(arr)
+    mode = str(normalization).strip().lower()
+    if mode == "minmax":
+        amin = float(np.min(arr))
+        amax = float(np.max(arr))
+        rng = amax - amin
+        if rng <= 0.0:
+            arr = np.ones_like(arr) if amax > 0.0 else np.zeros_like(arr)
+        else:
+            arr = (arr - amin) / rng
+    elif mode == "physical":
+        if float(np.min(arr)) < 0.0 or float(np.max(arr)) > 1.0:
+            raise ValueError("Physical mask values must already be within [0, 1].")
     else:
-        arr = (arr - amin) / rng
-    return np.clip(arr, 0.0, 1.0)
+        raise ValueError("mask normalization must be physical or minmax.")
+    return np.ascontiguousarray(np.clip(arr, 0.0, 1.0), dtype=np.float64)
 
 
 def resize_mask(mask, shape):
-    mask = np.asarray(mask, dtype=float)
+    _ensure_core_loaded()
+    mask = np.ascontiguousarray(mask, dtype=np.float64)
     if tuple(mask.shape) == tuple(shape):
         return np.clip(mask, 0.0, 1.0)
     mask_t = torch.as_tensor(mask, dtype=torch.float64)
@@ -605,6 +678,14 @@ def mask_rotation_quadrants(args):
         return int(q) % 4
     deg = getattr(args, "mask_rotate", None)
     if deg is None:
+        config = getattr(args, "config", None)
+        if config:
+            try:
+                payload = decode_precise_params(load_json_file(config))
+                info = payload.get("mask", {}) if isinstance(payload, dict) else {}
+                return finite_int(info.get("rotation_quadrants_ccw", 0), "mask rotation") % 4
+            except Exception:
+                return 0
         return 0
     deg = int(deg)
     if deg % 90 != 0:
@@ -612,13 +693,27 @@ def mask_rotation_quadrants(args):
     return (deg // 90) % 4
 
 
-def build_input_mask(params, mask_path=None, rotation_quadrants=0):
+def mask_normalization_mode(args):
+    explicit = getattr(args, "mask_normalization", None)
+    if explicit:
+        return str(explicit).strip().lower()
+    config = getattr(args, "config", None)
+    if config:
+        payload = decode_precise_params(load_json_file(config))
+        info = payload.get("mask", {}) if isinstance(payload, dict) else {}
+        if isinstance(info, dict) and info.get("normalization"):
+            return str(info["normalization"]).strip().lower()
+    return "physical"
+
+
+def build_input_mask(params, mask_path=None, rotation_quadrants=0, normalization="physical"):
+    _ensure_core_loaded()
     shape = (int(params["nx"]), int(params["ny"]))
     if mask_path:
-        base = read_mask(mask_path)
+        base = read_mask(mask_path, normalization=normalization)
         k = int(rotation_quadrants) % 4
         if k:
-            base = np.rot90(base, k=k)
+            base = np.ascontiguousarray(np.rot90(base, k=k))
     else:
         base = np.ones(shape, dtype=float)
     resized = resize_mask(base, shape)
@@ -629,6 +724,93 @@ def build_input_mask(params, mask_path=None, rotation_quadrants=0):
         offset_x=float(params["mask_offset_x"]),
         offset_y=float(params["mask_offset_y"]),
     )
+
+
+def resize_complex_mask(mask, shape):
+    _ensure_core_loaded()
+    value = np.ascontiguousarray(mask, dtype=np.complex128)
+    if tuple(value.shape) == tuple(shape):
+        return value
+    components_t = torch.as_tensor(
+        np.ascontiguousarray(np.stack((value.real, value.imag), axis=0)), dtype=torch.float64
+    )
+    components = F.interpolate(
+        components_t[None],
+        size=(int(shape[0]), int(shape[1])),
+        mode="bilinear",
+        align_corners=False,
+    )[0].detach().cpu().numpy()
+    out = components[0] + 1j * components[1]
+    amplitude = np.abs(out)
+    over = amplitude > 1.0
+    if np.any(over):
+        out[over] /= amplitude[over]
+    return np.ascontiguousarray(out, dtype=np.complex128)
+
+
+def _safe_npz_masks(path):
+    with np.load(path, allow_pickle=False) as data:
+        names = set(data.files)
+        pre = None
+        post = None
+        if "pre_fresnel_intensity" in names:
+            pre = np.asarray(data["pre_fresnel_intensity"], dtype=np.float64)
+        elif "input_intensity" in names:
+            pre = np.asarray(data["input_intensity"], dtype=np.float64)
+        if {"complex_mask_real", "complex_mask_imag"}.issubset(names):
+            post = np.asarray(data["complex_mask_real"], dtype=np.float64) + 1j * np.asarray(
+                data["complex_mask_imag"], dtype=np.float64
+            )
+        elif "amplitude_mask" in names:
+            amplitude = np.asarray(data["amplitude_mask"], dtype=np.float64)
+            phase = (
+                np.asarray(data["phase_mask_rad"], dtype=np.float64)
+                if "phase_mask_rad" in names
+                else np.zeros_like(amplitude)
+            )
+            post = amplitude * np.exp(1j * phase)
+    return pre, post
+
+
+def resolve_input_and_post_masks(params, args):
+    _ensure_core_loaded()
+    shape = (int(params["nx"]), int(params["ny"]))
+    rotation = mask_rotation_quadrants(args)
+    normalization = mask_normalization_mode(args)
+    explicit = getattr(args, "mask", None)
+    config_path = getattr(args, "config", None)
+
+    source_path = explicit or mask_path_from_config(config_path)
+    source = "file"
+    if config_path and not explicit:
+        payload = decode_precise_params(load_json_file(config_path))
+        info = payload.get("mask", {}) if isinstance(payload, dict) else {}
+        source = str(info.get("source", "file" if source_path else "all_pass"))
+
+    pre = None
+    post = None
+    if source_path and Path(source_path).suffix.lower() == ".npz":
+        pre, post = _safe_npz_masks(source_path)
+    elif source_path:
+        pre = read_mask(source_path, normalization=normalization)
+
+    if pre is None:
+        pre = np.ones(shape, dtype=np.float64)
+    if rotation:
+        pre = np.ascontiguousarray(np.rot90(pre, k=rotation))
+        if post is not None:
+            post = np.ascontiguousarray(np.rot90(post, k=rotation))
+    pre = resize_mask(pre, shape)
+    pre = CartesianPSFSimulator.apply_mask_offset(
+        pre,
+        size_x=float(params["size_x"]),
+        size_y=float(params["size_y"]),
+        offset_x=float(params["mask_offset_x"]),
+        offset_y=float(params["mask_offset_y"]),
+    )
+    if post is not None:
+        post = resize_complex_mask(post, shape)
+    return np.asarray(pre, dtype=np.float64), post, source_path, source
 
 
 class ProgressPrinter:
@@ -655,7 +837,7 @@ class ProgressPrinter:
             self._last_time = now
 
 
-def run_simulation(params, mask, run_3d=False, progress=None):
+def run_simulation(params, mask, run_3d=False, progress=None, post_fresnel_mask=None):
     simulator = create_simulator_from_params(params)
 
     def emit(percent, text):
@@ -698,9 +880,13 @@ def run_simulation(params, mask, run_3d=False, progress=None):
             progress_callback=lambda stage, frac: emit(
                 100.0 * prep_share * float(frac), f"Pupil prep: {stage}"
             ),
+            post_fresnel_mask=post_fresnel_mask,
         )
         res3d = simulator.simulate_psf_volume_from_pupil_field(
-            pupil_field=prep.get("field_at_pupil_for_psf", prep["field_at_pupil"]),
+            pupil_field=prep.get(
+                "_field_at_pupil_for_psf_torch",
+                prep.get("field_at_pupil_for_psf", prep["field_at_pupil"]),
+            ),
             size_x=float(prep.get("size_x_for_psf", params["size_x"])),
             size_y=float(prep.get("size_y_for_psf", params["size_y"])),
             entrance_pupil_diameter=float(params["pupil_d"]),
@@ -735,7 +921,7 @@ def run_simulation(params, mask, run_3d=False, progress=None):
             "y_profile_at_x0": res3d["y_profile_at_x0"],
             "z_profile_at_x0": res3d["z_profile_at_x0"],
         }
-        res2d.update(prep)
+        res2d.update({key: value for key, value in prep.items() if not key.startswith("_")})
     else:
         res2d = simulator.simulate_full_pipeline(
             input_intensity=mask,
@@ -755,6 +941,7 @@ def run_simulation(params, mask, run_3d=False, progress=None):
             num_points=int(params["points_2d"]),
             verbose=False,
             progress_callback=lambda stage, frac: emit(100.0 * float(frac), f"2D: {stage}"),
+            post_fresnel_mask=post_fresnel_mask,
         )
         res3d = None
 
@@ -763,8 +950,19 @@ def run_simulation(params, mask, run_3d=False, progress=None):
     return simulator, res2d, res3d
 
 
-def run_profile(params, mask, axis, z_um=None, width_level=0.5, progress=None, num_points=None):
-    simulator = create_simulator_from_params(params)
+def run_profile(
+    params,
+    mask,
+    axis,
+    z_um=None,
+    width_level=0.5,
+    progress=None,
+    num_points=None,
+    post_fresnel_mask=None,
+    simulator=None,
+):
+    if simulator is None:
+        simulator = create_simulator_from_params(params)
 
     def emit(percent, text):
         if progress is not None:
@@ -795,6 +993,7 @@ def run_profile(params, mask, axis, z_um=None, width_level=0.5, progress=None, n
         width_level=float(width_level),
         verbose=False,
         progress_callback=lambda stage, frac: emit(100.0 * float(frac), str(stage)),
+        post_fresnel_mask=post_fresnel_mask,
     )
     if progress is not None:
         progress.emit(100.0, "Done", force=True)
@@ -816,13 +1015,27 @@ def save_result(path, params, results_2d, results_3d=None):
     }
     if results_3d is not None:
         payload["results_3d"] = clone_payload(results_3d)
-    with open(path, "wb") as f:
-        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+    write_safe_container(
+        path,
+        payload,
+        format_name=RESULT_FORMAT,
+        version=RESULT_VERSION,
+    )
 
 
-def load_result(path):
-    with open(path, "rb") as f:
-        payload = pickle.load(f)
+def load_result(path, *, allow_unsafe_legacy_pickle=False):
+    if has_zip_signature(path):
+        payload = read_safe_container(
+            path,
+            expected_format=RESULT_FORMAT,
+            supported_versions=(RESULT_VERSION,),
+        )
+    else:
+        if not bool(allow_unsafe_legacy_pickle):
+            raise ValueError(
+                "Legacy pickle result is unsafe; pass --allow-unsafe-legacy-pickle only for a trusted file."
+            )
+        payload = read_unsafe_legacy_pickle(path)
     if not isinstance(payload, dict):
         raise ValueError("result file does not contain a result payload.")
     if "params" not in payload or "results_2d" not in payload:
@@ -1067,9 +1280,9 @@ def ring_radius_pairs(radius_grid_mm):
     grid = np.asarray(radius_grid_mm, dtype=float).ravel()
     if grid.size < 1:
         raise ValueError("radius grid is empty.")
-    pairs = []
+    pairs = [(0.0, 0.0)]
     for outer_idx, outer_mm in enumerate(grid):
-        for inner_idx in range(outer_idx + 1):
+        for inner_idx in range(outer_idx):
             pairs.append((float(grid[inner_idx]), float(outer_mm)))
     return pairs
 
@@ -1157,7 +1370,7 @@ def write_arrays_npz(path, params, results_2d, results_3d=None):
                 arr_key = f"{prefix}__{key}"
                 arrays[arr_key] = value
                 metadata[meta_key][key] = ndarray_metadata(value)
-    arrays["metadata_json"] = np.asarray(json.dumps(metadata), dtype=object)
+    arrays["metadata_json"] = np.asarray(json.dumps(metadata, ensure_ascii=False))
     np.savez_compressed(path, **arrays)
     return metadata
 
@@ -1393,7 +1606,12 @@ def command_write_config(args):
 
 def command_mask_info(args):
     params = resolve_params(args)
-    mask = build_input_mask(params, args.mask, mask_rotation_quadrants(args))
+    mask = build_input_mask(
+        params,
+        args.mask,
+        mask_rotation_quadrants(args),
+        normalization=mask_normalization_mode(args),
+    )
     info = {
         "path": args.mask,
         "shape": [int(v) for v in mask.shape],
@@ -1404,16 +1622,56 @@ def command_mask_info(args):
         "offset_x_mm": float(params["mask_offset_x"]) * 1e3,
         "offset_y_mm": float(params["mask_offset_y"]) * 1e3,
     }
-    print(json.dumps(info, indent=2) if args.json else f"mask shape={tuple(mask.shape)}, min={info['min']:.6g}, max={info['max']:.6g}, mean={info['mean']:.6g}")
+    print(
+        json.dumps(info, indent=2)
+        if args.json
+        else f"mask shape={tuple(mask.shape)}, min={info['min']:.6g}, max={info['max']:.6g}, mean={info['mean']:.6g}"
+    )
     return 0
+
+
+def preflight_request(
+    params,
+    args,
+    *,
+    run_3d=False,
+    optimizer_variables=0,
+    predicted_objective_evals_per_iteration=0,
+):
+    estimate = estimate_resources(
+        params,
+        run_3d=bool(run_3d),
+        optimizer_variables=int(optimizer_variables),
+        predicted_objective_evals_per_iteration=int(predicted_objective_evals_per_iteration),
+    )
+    if bool(run_3d) and bool(getattr(args, "auto_z_chunk", False)):
+        params["z_chunk"] = int(estimate.suggested_z_chunk or params["z_chunk"])
+        estimate = estimate_resources(
+            params,
+            run_3d=True,
+            optimizer_variables=int(optimizer_variables),
+            predicted_objective_evals_per_iteration=int(predicted_objective_evals_per_iteration),
+        )
+    enforce_resource_limits(
+        estimate,
+        allow_expensive=bool(getattr(args, "allow_expensive", False)),
+    )
+    return estimate
 
 
 def command_simulate(args):
     params = resolve_params(args)
+    preflight_request(params, args, run_3d=(str(args.mode).lower() == "3d"))
     progress = ProgressPrinter(args.quiet, "simulate")
-    mask = build_input_mask(params, resolve_mask_path(args), mask_rotation_quadrants(args))
+    mask, post_mask, _mask_path, _mask_source = resolve_input_and_post_masks(params, args)
     run_3d = str(args.mode).strip().lower() == "3d"
-    simulator, results_2d, results_3d = run_simulation(params, mask, run_3d=run_3d, progress=progress)
+    simulator, results_2d, results_3d = run_simulation(
+        params,
+        mask,
+        run_3d=run_3d,
+        progress=progress,
+        post_fresnel_mask=post_mask,
+    )
 
     paths = {}
     if args.output:
@@ -1458,9 +1716,12 @@ def command_simulate(args):
 
 def command_profile(args):
     params = resolve_params(args)
+    if args.z_um is not None:
+        args.z_um = finite_float(args.z_um, "z_um")
+    preflight_request(params, args, run_3d=False)
     mask_path = resolve_mask_path(args)
     progress = ProgressPrinter(args.quiet, "profile")
-    mask = build_input_mask(params, mask_path, mask_rotation_quadrants(args))
+    mask, post_mask, mask_path, _mask_source = resolve_input_and_post_masks(params, args)
     _simulator, profile_result = run_profile(
         params,
         mask,
@@ -1468,6 +1729,7 @@ def command_profile(args):
         z_um=args.z_um,
         width_level=args.width_level,
         progress=progress,
+        post_fresnel_mask=post_mask,
     )
     paths = {}
     if args.csv:
@@ -1503,20 +1765,40 @@ def command_profile(args):
 
 
 def command_ring_sweep_z(args):
+    _ensure_core_loaded()
     params = resolve_params(args)
     axis = str(args.axis).strip().lower()
     range_key = f"range_{axis}_um"
-    if getattr(args, "range_um", None) is None and getattr(args, range_key, None) is None:
+    if (
+        getattr(args, "config", None) is None
+        and getattr(args, "range_um", None) is None
+        and getattr(args, range_key, None) is None
+    ):
         params[range_key] = 20.0
-    if axis in {"x", "y"} and getattr(args, "z_um", None) is None and getattr(args, "range_z_um", None) is None:
+    if (
+        getattr(args, "config", None) is None
+        and axis in {"x", "y"}
+        and getattr(args, "z_um", None) is None
+        and getattr(args, "range_z_um", None) is None
+    ):
         params["range_z_um"] = 20.0
-    if getattr(args, "points", None) is None and getattr(args, "points_2d", None) is None:
+    if (
+        getattr(args, "config", None) is None
+        and getattr(args, "points", None) is None
+        and getattr(args, "points_2d", None) is None
+    ):
         params["points_2d"] = 300
     params = validate_params(params)
 
     radius_grid_mm = ring_radius_grid(args.max_radius_mm, args.radius_points)
     radius_pairs_mm = ring_radius_pairs(radius_grid_mm)
     mask_count = len(radius_pairs_mm)
+    preflight_request(
+        params,
+        args,
+        run_3d=False,
+        predicted_objective_evals_per_iteration=mask_count,
+    )
     output_dir = Path(args.output_dir).expanduser()
     output_stem = f"ring_mask_{axis}"
     profiles_csv = default_output_path(output_dir, args.profiles_csv, f"{output_stem}_profiles.csv")
@@ -1590,6 +1872,7 @@ def command_ring_sweep_z(args):
     npz_fwhm_i_um = []
     npz_fwhm_i2_um = []
     npz_coords_um = None
+    shared_simulator = create_simulator_from_params(params)
     with open(profiles_csv, "w", newline="", encoding="utf-8") as profile_f, open(
         summary_csv, "w", newline="", encoding="utf-8"
     ) as summary_f:
@@ -1627,6 +1910,7 @@ def command_ring_sweep_z(args):
                 width_level=0.5,
                 progress=None,
                 num_points=int(params["points_2d"]),
+                simulator=shared_simulator,
             )
             coords_um = np.asarray(profile_result["coords_um"], dtype=float)
             intensity = np.asarray(profile_result["intensity"], dtype=float)
@@ -1753,7 +2037,7 @@ def command_ring_sweep_z(args):
         "mask_definition": {
             "units": "mm",
             "transparent": "r < inner_radius or r > outer_radius",
-            "blocked": "inner_radius <= r <= outer_radius when outer_radius > inner_radius; equal radii are saved as all-pass zero-width controls",
+            "blocked": "inner_radius <= r <= outer_radius when outer_radius > inner_radius; one (0,0) all-pass baseline is included",
             "max_radius_mm": float(radius_grid_mm[-1]) if radius_grid_mm.size else 0.0,
             "radius_grid_mm": [float(v) for v in radius_grid_mm],
             "pair_count": int(mask_count),
@@ -1768,7 +2052,10 @@ def command_ring_sweep_z(args):
 
 
 def command_export(args):
-    payload = load_result(args.input)
+    payload = load_result(
+        args.input,
+        allow_unsafe_legacy_pickle=bool(args.allow_unsafe_legacy_pickle),
+    )
     params = validate_params({**DEFAULT_PARAMS, **params_from_core_values(payload["params"])})
     simulator = create_simulator_from_params(params)
     results_2d = payload["results_2d"]
@@ -1808,22 +2095,29 @@ def command_export(args):
     return 0
 
 
-def read_npz_metadata(path):
-    with np.load(path, allow_pickle=True) as data:
+def read_npz_metadata(path, *, allow_unsafe_legacy_pickle=False):
+    with np.load(path, allow_pickle=False) as data:
         if "metadata_json" not in data.files:
             return {"format": "npz", "arrays": list(data.files)}
-        raw = data["metadata_json"]
         try:
-            text = str(raw.item())
-        except Exception:
-            text = str(raw)
-        return json.loads(text)
+            raw = data["metadata_json"]
+            return json.loads(str(raw.item()))
+        except ValueError as exc:
+            if not allow_unsafe_legacy_pickle:
+                raise ValueError(
+                    "NPZ object metadata is unsafe; pass --allow-unsafe-legacy-pickle only for a trusted file."
+                ) from exc
+    with np.load(path, allow_pickle=True) as data:
+        return json.loads(str(data["metadata_json"].item()))
 
 
 def command_inspect(args):
     suffix = Path(args.input).suffix.lower()
     if suffix in {".psfres", ".pkl", ".pickle"}:
-        payload = load_result(args.input)
+        payload = load_result(
+            args.input,
+            allow_unsafe_legacy_pickle=bool(args.allow_unsafe_legacy_pickle),
+        )
         params = validate_params({**DEFAULT_PARAMS, **params_from_core_values(payload["params"])})
         simulator = create_simulator_from_params(params)
         summary = build_summary(
@@ -1840,7 +2134,10 @@ def command_inspect(args):
         print_summary(summary, json_output=args.json)
         return 0
     if suffix == ".npz":
-        metadata = read_npz_metadata(args.input)
+        metadata = read_npz_metadata(
+            args.input,
+            allow_unsafe_legacy_pickle=bool(args.allow_unsafe_legacy_pickle),
+        )
         if args.summary_json:
             write_summary_json(args.summary_json, json_safe(metadata))
         print(json.dumps(json_safe(metadata), indent=2))
@@ -1849,6 +2146,7 @@ def command_inspect(args):
 
 
 def command_optimizers(args):
+    _ensure_optimizer_loaded()
     if not HAS_OPTIMIZER:
         raise RuntimeError(f"optimizer backend unavailable: {OPTIMIZER_IMPORT_ERROR}")
     print(json.dumps(PostFresnelMaskOptimizer.get_optimizer_category_map(), indent=2))
@@ -1856,11 +2154,27 @@ def command_optimizers(args):
 
 
 def command_optimize(args):
+    _ensure_optimizer_loaded()
     if not HAS_OPTIMIZER:
         raise RuntimeError(f"optimizer backend unavailable: {OPTIMIZER_IMPORT_ERROR}")
     params = resolve_params(args)
     settings = resolve_optimizer_settings(args)
-    mask = build_input_mask(params, args.mask, mask_rotation_quadrants(args))
+    variable_multiplier = 2 if settings["mode"] == "amplitude_phase" else 1
+    variable_count = int(params["nx"] * params["ny"] * variable_multiplier)
+    predicted_evals = int(
+        np.ceil(
+            PostFresnelMaskOptimizer._estimate_evals_per_iteration(
+                settings["optimizer_name"], variable_count
+            )
+        )
+    )
+    preflight_request(
+        params,
+        args,
+        optimizer_variables=variable_count,
+        predicted_objective_evals_per_iteration=predicted_evals,
+    )
+    mask, _post_mask, _mask_path, _mask_source = resolve_input_and_post_masks(params, args)
     simulator = create_simulator_from_params(params)
     optimizer = PostFresnelMaskOptimizer(simulator=simulator, params=params)
     cfg = OptimizerConfig(
@@ -1991,12 +2305,21 @@ def add_common_param_options(parser):
     parser.add_argument("--gauss-wy-mm", type=float, help="Gaussian wy, mm.")
     parser.add_argument("--mask-offset-x-mm", type=float, help="Mask x offset, mm.")
     parser.add_argument("--mask-offset-y-mm", type=float, help="Mask y offset, mm.")
+    parser.add_argument("--allow-expensive", action="store_true", help="Confirm requests above the advisory resource threshold.")
+    parser.add_argument("--auto-z-chunk", action="store_true", help="Choose a conservative 3D z chunk from available memory.")
+    parser.add_argument("--debug", action="store_true", help="Show a traceback for expected command errors.")
 
 
 def add_mask_options(parser, required=False):
     parser.add_argument("--mask", required=required, help="Mask path (.npy/.csv/.txt/.tif/.tiff/image). Omit for all-pass.")
     parser.add_argument("--mask-rotate", type=int, choices=(-270, -180, -90, 0, 90, 180, 270), help="Rotate mask counter-clockwise by degrees.")
     parser.add_argument("--mask-rotate-quadrants", type=int, help="Rotate mask by this many 90-degree counter-clockwise turns.")
+    parser.add_argument(
+        "--mask-normalization",
+        choices=("physical", "minmax"),
+        default=None,
+        help="Physical transmission (default) or explicit legacy min-max scaling.",
+    )
 
 
 def add_display_options(parser):
@@ -2108,6 +2431,11 @@ def build_parser():
 
     export = sub.add_parser("export", help="Export or plot a saved .psfres/.pkl result.")
     export.add_argument("input", help="Input .psfres/.pkl file.")
+    export.add_argument(
+        "--allow-unsafe-legacy-pickle",
+        action="store_true",
+        help="Load a trusted legacy pickle result (may execute code).",
+    )
     add_display_options(export)
     export.add_argument("--csv", help="Write GUI-compatible CSV export.")
     export.add_argument("--npz", help="Write compressed array bundle.")
@@ -2116,6 +2444,11 @@ def build_parser():
 
     inspect = sub.add_parser("inspect", help="Inspect .psfres/.pkl or .npz outputs.")
     inspect.add_argument("input", help="Input result or npz file.")
+    inspect.add_argument(
+        "--allow-unsafe-legacy-pickle",
+        action="store_true",
+        help="Load trusted legacy pickle/object metadata (may execute code).",
+    )
     add_display_options(inspect)
     inspect.set_defaults(func=command_inspect)
 
@@ -2148,8 +2481,10 @@ def main(argv=None, gui_launcher=None):
         if args.func is command_gui:
             return args.func(args, gui_launcher=gui_launcher)
         return args.func(args)
-    except (ValueError, RuntimeError, SimulationStoppedError, OptimizationStoppedError) as exc:
+    except (OSError, ValueError, RuntimeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
+        if bool(getattr(args, "debug", False)):
+            traceback.print_exc()
         return 2
 
 
