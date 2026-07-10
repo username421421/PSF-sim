@@ -1,6 +1,6 @@
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -47,6 +47,8 @@ class OptimizerResult:
     settings: Dict[str, Any]
     baseline_result_2d: Dict[str, Any]
     optimized_result_2d: Dict[str, Any]
+    status: str = "converged"
+    solver_runs: List[Dict[str, Any]] = field(default_factory=list)
 
 
 def _optional_scipy_optimizer(name: str):
@@ -817,6 +819,7 @@ class PostFresnelMaskOptimizer:
         self._surrogate_loss_used = False
         self._surrogate_loss_reason = "disabled"
         self._surrogate_optimizer_name = None
+        self._solver_runs = []
         self._axial_radial_fastpath = None
         self._axial_radial_fastpath_enabled = False
         self._axial_radial_fastpath_reason = "disabled"
@@ -2180,6 +2183,7 @@ class PostFresnelMaskOptimizer:
         support_mask: Optional[np.ndarray] = None,
         axial_radial_fastpath_ok: bool = True,
         stop_callback=None,
+        force_exact: bool = False,
     ) -> Tuple[float, Dict[str, float], Dict[str, Any], np.ndarray, np.ndarray]:
         self._check_stop(stop_callback)
 
@@ -2189,12 +2193,14 @@ class PostFresnelMaskOptimizer:
         phase_full = np.clip(phase_full, -np.pi, np.pi)
 
         use_axial_radial_fastpath = bool(
-            bool(axial_radial_fastpath_ok)
+            (not bool(force_exact))
+            and bool(axial_radial_fastpath_ok)
             and self._axial_radial_fastpath_enabled
             and (self._axial_radial_fastpath is not None)
         )
         use_linear_fastpath = bool(
-            self._linear_fastpath_enabled
+            (not bool(force_exact))
+            and self._linear_fastpath_enabled
             and (self._linear_fastpath is not None)
         )
 
@@ -2789,6 +2795,22 @@ class PostFresnelMaskOptimizer:
                 callback=callback_fn,
                 options=options,
             )
+            run_record = {
+                "backend": "scipy",
+                "optimizer": str(surrogate_optimizer_name),
+                "start_index": int(start_idx),
+                "success": bool(getattr(result, "success", False)),
+                "status": int(getattr(result, "status", -1)),
+                "message": str(getattr(result, "message", "")),
+                "iterations": int(getattr(result, "nit", iter_counter["count"])),
+                "evaluations": int(getattr(result, "nfev", eval_counter - start_eval_base)),
+                "termination_class": (
+                    "converged" if bool(getattr(result, "success", False)) else "budget_or_solver_stop"
+                ),
+                "objective_kind": "surrogate",
+                "surrogate_objective": float(getattr(result, "fun", np.nan)),
+            }
+            self._solver_runs.append(run_record)
 
             x_result = np.asarray(getattr(result, "x", x0), dtype=np.float64).ravel()
             x_final, amp_var, phase_var, amp_profile, phase_profile = decode_free_vector(x_result)
@@ -2804,7 +2826,9 @@ class PostFresnelMaskOptimizer:
                 support_mask=support if bool(axial_symmetry) else None,
                 axial_radial_fastpath_ok=bool(axial_symmetry),
                 stop_callback=stop_callback,
+                force_exact=True,
             )
+            run_record["exact_objective"] = float(obj_final)
 
             if obj_final < best_obj:
                 best_obj = float(obj_final)
@@ -2943,15 +2967,6 @@ class PostFresnelMaskOptimizer:
             n_bins = int(radial["n_bins"])
             support_bins = np.asarray(radial["support_by_bin"], dtype=bool)
             radial_axis_norm = np.linspace(0.0, 1.0, n_bins, dtype=np.float64)
-            if (
-                self._axial_radial_fastpath_enabled
-                and (self._axial_radial_fastpath is not None)
-            ):
-                axis_fast = np.asarray(
-                    self._axial_radial_fastpath.radial_norm_axis, dtype=np.float64
-                ).ravel()
-                if int(axis_fast.size) == int(n_bins):
-                    radial_axis_norm = np.clip(axis_fast, 0.0, 1.0)
         if use_simple_ring:
             bounds = [(0.0, 1.0), (0.0, 1.0)]
         elif use_simple_ellipse:
@@ -3344,6 +3359,23 @@ class PostFresnelMaskOptimizer:
                     options=options,
                 )
 
+            run_record = {
+                "backend": "scipy",
+                "optimizer": str(optimizer_name),
+                "start_index": int(start_idx),
+                "success": bool(getattr(result, "success", False)),
+                "status": int(getattr(result, "status", -1)),
+                "message": str(getattr(result, "message", "")),
+                "iterations": int(getattr(result, "nit", iter_counter["count"])),
+                "evaluations": int(getattr(result, "nfev", eval_counter - start_eval_base)),
+                "termination_class": (
+                    "converged" if bool(getattr(result, "success", False)) else "budget_or_solver_stop"
+                ),
+                "objective_kind": "candidate",
+                "candidate_objective": float(getattr(result, "fun", np.nan)),
+            }
+            self._solver_runs.append(run_record)
+
             x_result = np.asarray(getattr(result, "x", x0), dtype=np.float64).ravel()
             if int(x_result.size) != int(len(bounds)):
                 x_result = np.asarray(x0, dtype=np.float64).ravel()
@@ -3366,7 +3398,9 @@ class PostFresnelMaskOptimizer:
                 support_mask=(support_mask if bool(axial_symmetry) else None),
                 axial_radial_fastpath_ok=bool(axial_symmetry),
                 stop_callback=stop_callback,
+                force_exact=True,
             )
+            run_record["exact_objective"] = float(obj_final)
 
             if obj_final < best_obj:
                 best_obj = float(obj_final)
@@ -3437,6 +3471,7 @@ class PostFresnelMaskOptimizer:
         self._surrogate_loss_used = False
         self._surrogate_loss_reason = "disabled"
         self._surrogate_optimizer_name = None
+        self._solver_runs = []
 
         mask = np.asarray(input_intensity, dtype=np.float64)
         if mask.ndim != 2:
@@ -3516,6 +3551,7 @@ class PostFresnelMaskOptimizer:
             full_shape=full_shape,
             axial_radial_fastpath_ok=bool(self._config.axial_symmetry),
             stop_callback=stop_callback,
+            force_exact=True,
         )
         baseline_eval_s = max(1e-9, float(time.time() - baseline_t0))
 
@@ -3611,6 +3647,19 @@ class PostFresnelMaskOptimizer:
         if final_x is None or final_metrics is None or final_res is None:
             raise RuntimeError("Optimization did not return a final solution.")
 
+        status = (
+            "converged"
+            if any(bool(run.get("success", False)) for run in self._solver_runs)
+            else "budget_exhausted_with_candidate"
+        )
+        if float(final_obj) > float(baseline_obj) + 1e-10:
+            final_obj = float(baseline_obj)
+            final_metrics = dict(baseline_metrics)
+            final_res = baseline_res
+            final_amp = baseline_amp
+            final_phase = baseline_phase
+            status = "budget_exhausted_with_candidate"
+
         amp_out = np.asarray(final_amp, dtype=np.float64)
         phase_out = np.asarray(final_phase, dtype=np.float64)
         amp_out = np.clip(amp_out, 0.0, 1.0)
@@ -3618,6 +3667,28 @@ class PostFresnelMaskOptimizer:
         if bool(self._config.binary_amplitude and self._config.mode == "amplitude"):
             amp_out = np.asarray(amp_out >= 0.5, dtype=np.float64)
             phase_out = np.zeros_like(amp_out, dtype=np.float64)
+
+        exact_obj, exact_metrics, exact_res, amp_out, phase_out = self._simulate_from_mask_maps(
+            base_field_after_fresnel=base_field_after_fresnel,
+            pupil_mask=pupil_mask,
+            amp_var=amp_out,
+            phase_var=phase_out,
+            full_shape=full_shape,
+            axial_radial_fastpath_ok=False,
+            stop_callback=stop_callback,
+            force_exact=True,
+        )
+        if float(exact_obj) <= float(baseline_obj) + 1e-10:
+            final_obj = float(exact_obj)
+            final_metrics = dict(exact_metrics)
+            final_res = exact_res
+        else:
+            final_obj = float(baseline_obj)
+            final_metrics = dict(baseline_metrics)
+            final_res = baseline_res
+            amp_out = baseline_amp.copy()
+            phase_out = baseline_phase.copy()
+            status = "budget_exhausted_with_candidate"
         complex_out = amp_out * np.exp(1j * phase_out)
         use_simple_ring, use_simple_ellipse, _use_binary_latent = self._binary_structure_flags(
             mode=self._config.mode,
@@ -3674,6 +3745,13 @@ class PostFresnelMaskOptimizer:
                 "xz": bool(self._compute_xz),
                 "yz": bool(self._compute_yz),
             },
+            "status": str(status),
+            "solver_runs": list(self._solver_runs),
+            "mask_semantics": {
+                "plane": "post_fresnel_pre_pupil",
+                "transmission": "complex_amplitude",
+                "phase_unit": "radian",
+            },
         }
         if final_x is not None:
             settings.update(
@@ -3686,7 +3764,11 @@ class PostFresnelMaskOptimizer:
             )
 
         if progress_callback is not None:
-            progress_callback("Optimization complete", 1.0, {"objective": float(final_obj)})
+            progress_callback(
+                "Optimization complete" if status == "converged" else "Optimization budget exhausted",
+                1.0,
+                {"objective": float(final_obj), "status": str(status)},
+            )
 
         return OptimizerResult(
             best_objective=float(final_obj),
@@ -3700,6 +3782,8 @@ class PostFresnelMaskOptimizer:
             settings=settings,
             baseline_result_2d=baseline_res,
             optimized_result_2d=final_res,
+            status=str(status),
+            solver_runs=list(self._solver_runs),
         )
 
 

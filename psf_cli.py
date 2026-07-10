@@ -1898,7 +1898,11 @@ def command_optimize(args):
         progress.emit(100.0 * float(frac), text)
 
     result = optimizer.optimize(input_intensity=mask, config=cfg, progress_callback=progress_callback)
-    progress.emit(100.0, "Optimization complete", force=True)
+    progress.emit(
+        100.0,
+        "Optimization complete" if result.status == "converged" else "Optimization budget exhausted; exact candidate retained",
+        force=True,
+    )
 
     paths = {}
     if args.output:
@@ -1915,6 +1919,8 @@ def command_optimize(args):
         paths["phase_csv"] = args.phase_csv
 
     summary = {
+        "status": str(result.status),
+        "solver_runs": json_safe(result.solver_runs),
         "best_objective": float(result.best_objective),
         "baseline_objective": float(result.baseline_objective),
         "best_metrics_um": json_safe(result.best_metrics_um),

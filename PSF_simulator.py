@@ -1008,6 +1008,8 @@ class CartesianPSFSimulator:
         ring_outer_diameter=None,
         progress_callback=None,
         stop_callback=None,
+        *,
+        post_fresnel_mask=None,
     ):
         """
         Pre-PSF pipeline:
@@ -1096,6 +1098,18 @@ class CartesianPSFSimulator:
         if not bool(torch.all(torch.isfinite(field_after_fresnel)).item()):
             raise FloatingPointError("Fresnel field contains NaN or Inf.")
 
+        post_fresnel_mask_t = None
+        if post_fresnel_mask is not None:
+            post_fresnel_mask_t = self._to_torch_complex(post_fresnel_mask)
+            if tuple(post_fresnel_mask_t.shape) != tuple(field_after_fresnel.shape):
+                raise ValueError("post_fresnel_mask shape must match input_intensity shape.")
+            if not bool(torch.all(torch.isfinite(post_fresnel_mask_t)).item()):
+                raise ValueError("post_fresnel_mask contains NaN or Inf.")
+            amplitude = torch.abs(post_fresnel_mask_t)
+            if float(torch.max(amplitude).item()) > 1.0 + 1e-12:
+                raise ValueError("post_fresnel_mask amplitude must be <= 1.")
+            field_after_fresnel = field_after_fresnel * post_fresnel_mask_t
+
         self._check_stop(stop_callback)
         self._emit_progress(progress_callback, "Applying entrance pupil", 0.74)
         pupil_mask = self._to_torch_float(
@@ -1157,6 +1171,9 @@ class CartesianPSFSimulator:
             "ring_mask": None if ring_mask is None else self._to_numpy(ring_mask),
             "entrance_pupil_mask": self._to_numpy(pupil_mask),
             "field_after_fresnel": self._to_numpy(field_after_fresnel),
+            "post_fresnel_mask": (
+                None if post_fresnel_mask_t is None else self._to_numpy(post_fresnel_mask_t)
+            ),
             "field_at_pupil": self._to_numpy(field_at_pupil),
             "field_at_pupil_for_psf": self._to_numpy(field_at_pupil_for_psf),
             "size_x_for_psf": float(size_x_for_psf),
@@ -2525,6 +2542,8 @@ class CartesianPSFSimulator:
         verbose=False,
         progress_callback=None,
         stop_callback=None,
+        *,
+        post_fresnel_mask=None,
     ):
         self._emit_progress(progress_callback, "Preparing pupil field", 0.0)
         prep = self.prepare_pupil_field_from_input(
@@ -2543,6 +2562,7 @@ class CartesianPSFSimulator:
                 progress_callback, f"Pupil prep: {stage}", 0.45 * float(frac)
             ),
             stop_callback=stop_callback,
+            post_fresnel_mask=post_fresnel_mask,
         )
         result = self.simulate_psf_profile_from_pupil_field(
             pupil_field=prep.get("field_at_pupil_for_psf", prep["field_at_pupil"]),
@@ -2595,6 +2615,8 @@ class CartesianPSFSimulator:
         verbose=False,
         progress_callback=None,
         stop_callback=None,
+        *,
+        post_fresnel_mask=None,
     ):
         in_arr = np.asarray(input_intensity)
         if in_arr.ndim != 2:
@@ -2632,6 +2654,7 @@ class CartesianPSFSimulator:
                 f"Pupil prep: {stage}", prep_share * float(frac)
             ),
             stop_callback=stop_callback,
+            post_fresnel_mask=post_fresnel_mask,
         )
 
         self._emit_progress(progress_callback, "Computing PSF planes", prep_share)

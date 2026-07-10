@@ -84,6 +84,8 @@ class PSFSimulatorApp:
         self.root.geometry("1720x980")
 
         self.mask_array = None
+        self.post_fresnel_mask_array = None
+        self.opt_input_mask = None
         self.mask_rotation_quadrants = 0  # +1 means +90 deg CCW.
         self.mask_path = None
         self.results_2d = None
@@ -1625,6 +1627,7 @@ class PSFSimulatorApp:
             return
 
         self.mask_array = arr
+        self.post_fresnel_mask_array = None
         self.mask_rotation_quadrants = 0
         self._update_mask_orientation_label()
         self.mask_path = path
@@ -1639,6 +1642,7 @@ class PSFSimulatorApp:
 
     def _clear_loaded_mask(self, set_status=True):
         self.mask_array = None
+        self.post_fresnel_mask_array = None
         self.mask_rotation_quadrants = 0
         self._update_mask_orientation_label()
         self.mask_path = None
@@ -3145,8 +3149,6 @@ class PSFSimulatorApp:
         try:
             params = self._collect_params()
             settings = self._collect_optimizer_settings()
-            # Optimization always starts from all-pass simulation input mask.
-            self._clear_loaded_mask(set_status=False)
             mask = self._get_input_mask(
                 (params["nx"], params["ny"]),
                 size_x=params["size_x"],
@@ -3160,6 +3162,7 @@ class PSFSimulatorApp:
 
         self.opt_stop_requested = False
         self.opt_result = None
+        self.opt_input_mask = np.asarray(mask, dtype=np.float64).copy()
         self._clear_opt_live_preview()
         self.opt_live_amp_preview = np.clip(np.asarray(mask, dtype=float), 0.0, 1.0)
         self.opt_live_phase_preview = np.zeros_like(self.opt_live_amp_preview, dtype=float)
@@ -3382,9 +3385,11 @@ class PSFSimulatorApp:
         if formatted is not None:
             self.opt_summary_var.set(formatted)
         self._refresh_optimization_plot()
-        self._set_opt_progress(100.0, "Optimization completed.", force=True)
-        self._set_opt_running(False, "Optimization completed.")
-        self.status_var.set("Mask optimization completed.")
+        converged = str(getattr(result, "status", "converged")) == "converged"
+        final_text = "Optimization completed." if converged else "Optimization budget exhausted; best exact candidate retained."
+        self._set_opt_progress(100.0, final_text, force=True)
+        self._set_opt_running(False, final_text)
+        self.status_var.set(final_text)
         self._save_last_used_config(params)
         self.notebook.select(self.tab_opt)
 
@@ -3438,21 +3443,26 @@ class PSFSimulatorApp:
         if self.opt_result is None:
             messagebox.showwarning("No optimization result", "Run mask optimization first.")
             return
-        arr = np.clip(np.asarray(self.opt_result.amplitude_mask, dtype=float), 0.0, 1.0)
-        self.mask_array = arr
+        complex_mask = np.asarray(self.opt_result.complex_mask, dtype=np.complex128)
+        if self.opt_input_mask is None:
+            self.mask_array = np.ones(complex_mask.shape, dtype=np.float64)
+        else:
+            self.mask_array = np.asarray(self.opt_input_mask, dtype=np.float64).copy()
+        self.post_fresnel_mask_array = complex_mask.copy()
         self.mask_rotation_quadrants = 0
         self._update_mask_orientation_label()
         self.mask_path = None
         self.mask_path_var.set("From Mask Optimization")
-        self.nx_var.set(int(arr.shape[0]))
-        self.ny_var.set(int(arr.shape[1]))
+        self.nx_var.set(int(complex_mask.shape[0]))
+        self.ny_var.set(int(complex_mask.shape[1]))
         self.mask_info_var.set(
-            "Loaded + normalized mask: "
-            f"shape={arr.shape}, min={float(arr.min()):.3f}, max={float(arr.max()):.3f} (source=optimization)"
+            "Optimized post-Fresnel complex-amplitude mask: "
+            f"shape={complex_mask.shape}, amplitude=[{float(np.abs(complex_mask).min()):.3f}, "
+            f"{float(np.abs(complex_mask).max()):.3f}]"
         )
         self._refresh_mask_input_preview()
-        self.opt_status_var.set("Applied optimized amplitude mask to simulation input.")
-        self.status_var.set("Applied optimized amplitude mask to simulation input.")
+        self.opt_status_var.set("Applied optimized complex mask after Fresnel propagation.")
+        self.status_var.set("Applied optimized complex mask after Fresnel propagation.")
 
     def _refresh_optimization_plot(self):
         if not hasattr(self, "fig_opt") or not hasattr(self, "canvas_opt"):
@@ -3734,6 +3744,7 @@ class PSFSimulatorApp:
                         100.0 * prep_share * float(frac), f"Pupil prep: {stage}"
                     ),
                     stop_callback=stop_cb,
+                    post_fresnel_mask=self.post_fresnel_mask_array,
                 )
 
                 res3d = simulator.simulate_psf_volume_from_pupil_field(
@@ -3796,6 +3807,7 @@ class PSFSimulatorApp:
                         100.0 * float(frac), f"2D: {stage}"
                     ),
                     stop_callback=stop_cb,
+                    post_fresnel_mask=self.post_fresnel_mask_array,
                 )
                 res3d = None
 
