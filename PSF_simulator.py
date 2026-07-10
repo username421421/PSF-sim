@@ -1,7 +1,5 @@
-import argparse
 import hashlib
-import threading
-import traceback
+import weakref
 from collections import OrderedDict
 from math import asin, isclose, isfinite, log2, pi, prod
 
@@ -9,33 +7,13 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from plot_style import (
-    add_compact_colorbar,
-    add_panel_labels,
-    apply_publication_style,
-    style_image_axis,
-    style_profile_axis,
-)
-
-try:
-    import tkinter as tk
-    from tkinter import filedialog, messagebox, ttk
-except Exception:  # pragma: no cover - optional for headless runs
-    tk = None
-    filedialog = None
-    messagebox = None
-    ttk = None
-
-
-apply_publication_style()
-
-
 class SimulationStoppedError(RuntimeError):
     """Raised when simulation is cancelled by a stop callback."""
 
 
 _FRESNEL_KERNEL_CACHE = OrderedDict()
 _FRESNEL_KERNEL_CACHE_MAX = 16
+_SHARED_GEOMETRY_CACHE = OrderedDict()
 
 
 def _resolve_torch_device(device=None):
@@ -373,10 +351,27 @@ class CartesianPSFSimulator:
         )
 
         # Small LRU caches for expensive precomputations.
-        self._geometry_cache = OrderedDict()
-        self._geometry_cache_max = 8
+        self._geometry_cache = _SHARED_GEOMETRY_CACHE
+        self._geometry_cache_max = 16
         self._integration_table_cache = OrderedDict()
         self._integration_table_cache_max = 8
+        self._prepared_field_tokens = {}
+        self._prepared_revision = 0
+        try:
+            import psutil
+
+            available_ram = int(psutil.virtual_memory().available)
+        except Exception:
+            available_ram = 8 * 1024**3
+        self._cpu_cache_limit_bytes = min(512 * 1024**2, int(0.05 * available_ram))
+        if self.device.type == "cuda":
+            try:
+                free_vram, _total_vram = torch.cuda.mem_get_info(self.device)
+                self._device_cache_limit_bytes = min(256 * 1024**2, int(0.05 * free_vram))
+            except Exception:
+                self._device_cache_limit_bytes = 128 * 1024**2
+        else:
+            self._device_cache_limit_bytes = self._cpu_cache_limit_bytes
 
     def _to_torch_float(self, arr):
         return _torch_float64(arr, device=self.device)
@@ -437,25 +432,87 @@ class CartesianPSFSimulator:
             cache.move_to_end(key)
         return value
 
-    @staticmethod
-    def _lru_put(cache, key, value, max_size):
+    @classmethod
+    def _object_nbytes(cls, value):
+        if torch.is_tensor(value):
+            return int(value.numel() * value.element_size())
+        if isinstance(value, np.ndarray):
+            return int(value.nbytes)
+        if isinstance(value, dict):
+            return sum(cls._object_nbytes(item) for item in value.values())
+        if isinstance(value, (list, tuple)):
+            return sum(cls._object_nbytes(item) for item in value)
+        return 0
+
+    def _cache_nbytes(self, cache):
+        return sum(self._object_nbytes(item) for item in cache.values())
+
+    def _lru_put(self, cache, key, value, max_size):
         cache[key] = value
         cache.move_to_end(key)
-        while len(cache) > int(max_size):
+        byte_limit = self._device_cache_limit_bytes
+        while len(cache) > int(max_size) or (
+            len(cache) > 1 and self._cache_nbytes(cache) > byte_limit
+        ):
             cache.popitem(last=False)
+
+    def clear_caches(self):
+        self._geometry_cache.clear()
+        self._integration_table_cache.clear()
+        self._prepared_field_tokens.clear()
+        _FRESNEL_KERNEL_CACHE.clear()
+        _SHARED_GEOMETRY_CACHE.clear()
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    def cache_info(self):
+        return {
+            "geometry_entries": len(self._geometry_cache),
+            "integration_entries": len(self._integration_table_cache),
+            "geometry_bytes": self._cache_nbytes(self._geometry_cache),
+            "integration_bytes": self._cache_nbytes(self._integration_table_cache),
+            "limit_bytes": int(self._device_cache_limit_bytes),
+        }
 
     def _table_base_key(self, mode, shape, size_x, size_y, entrance_pupil_diameter):
         return (
+            str(self.device),
             str(mode),
             tuple(int(v) for v in shape),
             self._float_key(size_x),
             self._float_key(size_y),
             self._float_key(entrance_pupil_diameter),
+            self._float_key(self.wavelength),
+            self._float_key(self.NA),
+            self._float_key(self.theta_min),
+            int(self.theta_samples),
+            int(self.phi_samples),
+            self._float_key(self.t_gd),
+            self._float_key(self.n_gd),
+            self._float_key(self.n_id),
+            self._float_key(self.t_g),
+            self._float_key(self.n_g),
+            self._float_key(self.t_s),
+            self._float_key(self.n_s),
+            self._float_key(self.n_i),
         )
 
     def _integration_table_cache_key(
         self, pupil_field, mode, size_x, size_y, entrance_pupil_diameter
     ):
+        prepared_entry = self._prepared_field_tokens.get(id(pupil_field))
+        prepared_token = None
+        if prepared_entry is not None:
+            prepared_ref, candidate_token = prepared_entry
+            if prepared_ref() is pupil_field:
+                prepared_token = candidate_token
+            else:
+                self._prepared_field_tokens.pop(id(pupil_field), None)
+        if prepared_token is not None:
+            base = self._table_base_key(
+                mode, pupil_field.shape, size_x, size_y, entrance_pupil_diameter
+            )
+            return ("table",) + base + (("prepared", prepared_token),)
         if torch.is_tensor(pupil_field):
             arr = pupil_field.detach().cpu().numpy().astype(np.complex128, copy=False)
         else:
@@ -1155,6 +1212,22 @@ class CartesianPSFSimulator:
             size_y_for_psf = float(size_y)
             pupil_trimmed_for_psf = False
 
+        self._prepared_revision += 1
+        prepared_token = f"{id(self)}:{self._prepared_revision}"
+        prepared_id = id(field_at_pupil_for_psf)
+
+        def forget_prepared(_ref, *, field_id=prepared_id, token=prepared_token):
+            current = self._prepared_field_tokens.get(field_id)
+            if current is not None and current[1] == token:
+                self._prepared_field_tokens.pop(field_id, None)
+
+        self._prepared_field_tokens[prepared_id] = (
+            weakref.ref(field_at_pupil_for_psf, forget_prepared),
+            prepared_token,
+        )
+        if len(self._prepared_field_tokens) > 32:
+            self._prepared_field_tokens.pop(next(iter(self._prepared_field_tokens)), None)
+
         nx, ny = int(intensity.shape[0]), int(intensity.shape[1])
         entrance_pupil_x_coords = _torch_linspace_no_endpoint(
             -size_x / 2, size_x / 2, nx, device=self.device
@@ -1171,11 +1244,14 @@ class CartesianPSFSimulator:
             "ring_mask": None if ring_mask is None else self._to_numpy(ring_mask),
             "entrance_pupil_mask": self._to_numpy(pupil_mask),
             "field_after_fresnel": self._to_numpy(field_after_fresnel),
+            "_field_after_fresnel_torch": field_after_fresnel,
             "post_fresnel_mask": (
                 None if post_fresnel_mask_t is None else self._to_numpy(post_fresnel_mask_t)
             ),
             "field_at_pupil": self._to_numpy(field_at_pupil),
             "field_at_pupil_for_psf": self._to_numpy(field_at_pupil_for_psf),
+            "_field_at_pupil_for_psf_torch": field_at_pupil_for_psf,
+            "_prepared_cache_token": prepared_token,
             "size_x_for_psf": float(size_x_for_psf),
             "size_y_for_psf": float(size_y_for_psf),
             "pupil_trimmed_for_psf": bool(pupil_trimmed_for_psf),
@@ -1689,7 +1765,7 @@ class CartesianPSFSimulator:
         nx = self._coord_count(x_coords)
         i_xz = torch.empty((nz, nx), dtype=torch.float64, device=self.device)
 
-        z_chunk_size = max(1, int(z_chunk_size))
+        z_chunk_size = nz if self.device.type == "cuda" else max(1, int(z_chunk_size))
         wx_t = None
         if tables["mode"] == "cartesian_jacobian":
             # Precompute component-weighted X-phase once:
@@ -1750,7 +1826,7 @@ class CartesianPSFSimulator:
         ny = self._coord_count(y_coords)
         nx = self._coord_count(x_coords)
         i_xy = torch.empty((ny, nx), dtype=torch.float64, device=self.device)
-        y_chunk_size = max(1, int(y_chunk_size))
+        y_chunk_size = ny if self.device.type == "cuda" else max(1, int(y_chunk_size))
 
         if tables["mode"] == "cartesian_jacobian":
             weighted_z = weighted_components * axial[None, :]
@@ -1816,7 +1892,7 @@ class CartesianPSFSimulator:
         ny = self._coord_count(y_coords)
         i_yz = torch.empty((nz, ny), dtype=torch.float64, device=self.device)
 
-        z_chunk_size = max(1, int(z_chunk_size))
+        z_chunk_size = nz if self.device.type == "cuda" else max(1, int(z_chunk_size))
         wy_t = None
         if tables["mode"] == "cartesian_jacobian":
             # Precompute component-weighted Y-phase once:
@@ -2022,37 +2098,33 @@ class CartesianPSFSimulator:
         )
         self._check_stop(stop_callback)
         self._emit_progress(progress_callback, "Extracting 3D slices", (table_ops + vol_ops) / total_ops)
-        if not bool(torch.all(torch.isfinite(i_xyz)).item()):
+        # The public volume API returns NumPy arrays.  Transfer the completed
+        # volume once, then do scalar validation/normalization on the host.
+        # This avoids a sequence of synchronizing CUDA ``.item()`` calls and
+        # redundant device-to-host transfers for each extracted plane.
+        i_xyz_np = self._to_numpy(i_xyz)
+        if not np.all(np.isfinite(i_xyz_np)):
             raise FloatingPointError("I_xyz contains NaN or Inf.")
-        i_xyz_norm = self._normalize_intensity(i_xyz.clone())
+        i_xyz_norm_np = self._normalize_intensity(i_xyz_np)
 
-        max_flat_idx = int(torch.argmax(i_xyz).item())
+        max_flat_idx = int(np.argmax(i_xyz_np))
         plane = ny * nx
         peak_z_idx = max_flat_idx // plane
         rem = max_flat_idx % plane
         peak_y_idx = rem // nx
         peak_x_idx = rem % nx
 
-        i_xy = i_xyz[peak_z_idx, :, :]
-        i_xz = i_xyz[:, peak_y_idx, :]
-        i_yz = i_xyz[:, :, peak_x_idx]
+        i_xy_np = i_xyz_np[peak_z_idx, :, :]
+        i_xz_np = i_xyz_np[:, peak_y_idx, :]
+        i_yz_np = i_xyz_np[:, :, peak_x_idx]
 
-        i_xy_norm = self._normalize_intensity(i_xy.clone())
-        i_xz_norm = self._normalize_intensity(i_xz.clone())
-        i_yz_norm = self._normalize_intensity(i_yz.clone())
+        i_xy_norm_np = self._normalize_intensity(i_xy_np)
+        i_xz_norm_np = self._normalize_intensity(i_xz_np)
+        i_yz_norm_np = self._normalize_intensity(i_yz_np)
 
         x_coords_np = self._to_numpy(x_coords)
         y_coords_np = self._to_numpy(y_coords)
         z_coords_np = self._to_numpy(z_coords)
-        i_xyz_np = self._to_numpy(i_xyz)
-        i_xyz_norm_np = self._to_numpy(i_xyz_norm)
-        i_xy_np = self._to_numpy(i_xy)
-        i_xz_np = self._to_numpy(i_xz)
-        i_yz_np = self._to_numpy(i_yz)
-        i_xy_norm_np = self._to_numpy(i_xy_norm)
-        i_xz_norm_np = self._to_numpy(i_xz_norm)
-        i_yz_norm_np = self._to_numpy(i_yz_norm)
-
         fwhm_metrics = self._compute_fwhm_metrics(
             x_coords=x_coords_np,
             y_coords=y_coords_np,
@@ -2139,12 +2211,12 @@ class CartesianPSFSimulator:
         weighted_components = self._weighted_components(tables)
         phase_terms = self._get_phase_terms(
             tables,
-            x_coords=x_coords,
-            y_coords=y_coords,
+            x_coords=x_coords if (compute_xz or compute_xy) else None,
+            y_coords=y_coords if (compute_yz or compute_xy) else None,
             z_coords=z_coords,
         )
-        exp_x = phase_terms["exp_x"]
-        exp_y = phase_terms["exp_y"]
+        exp_x = phase_terms.get("exp_x")
+        exp_y = phase_terms.get("exp_y")
         axial_by_z = phase_terms["axial_by_z"]
         pint = max(1, self._integration_point_count(tables))
         nx = int(x_coords.numel())
@@ -2565,7 +2637,10 @@ class CartesianPSFSimulator:
             post_fresnel_mask=post_fresnel_mask,
         )
         result = self.simulate_psf_profile_from_pupil_field(
-            pupil_field=prep.get("field_at_pupil_for_psf", prep["field_at_pupil"]),
+            pupil_field=prep.get(
+                "_field_at_pupil_for_psf_torch",
+                prep.get("field_at_pupil_for_psf", prep["field_at_pupil"]),
+            ),
             size_x=float(prep.get("size_x_for_psf", size_x)),
             size_y=float(prep.get("size_y_for_psf", size_y)),
             entrance_pupil_diameter=entrance_pupil_diameter,
@@ -2658,7 +2733,10 @@ class CartesianPSFSimulator:
         )
 
         self._emit_progress(progress_callback, "Computing PSF planes", prep_share)
-        pupil_field_for_psf = prep.get("field_at_pupil_for_psf", prep["field_at_pupil"])
+        pupil_field_for_psf = prep.get(
+            "_field_at_pupil_for_psf_torch",
+            prep.get("field_at_pupil_for_psf", prep["field_at_pupil"]),
+        )
         size_x_for_psf = float(prep.get("size_x_for_psf", size_x))
         size_y_for_psf = float(prep.get("size_y_for_psf", size_y))
         psf_results = self.simulate_psf_planes_from_pupil_field(
@@ -2679,7 +2757,7 @@ class CartesianPSFSimulator:
             stop_callback=stop_callback,
         )
 
-        psf_results.update(prep)
+        psf_results.update({key: value for key, value in prep.items() if not key.startswith("_")})
         self._emit_progress(progress_callback, "Done", 1.0)
 
         return psf_results
@@ -3152,6 +3230,15 @@ class AxialSymmetricPSFSimulator(CartesianPSFSimulator):
 if __name__ == "__main__":
     import matplotlib
     import matplotlib.pyplot as plt
+    from plot_style import (
+        add_compact_colorbar,
+        add_panel_labels,
+        apply_publication_style,
+        style_image_axis,
+        style_profile_axis,
+    )
+
+    apply_publication_style()
 
     nx, ny = 256, 256
     size_x, size_y = 8.0e-3, 8.0e-3

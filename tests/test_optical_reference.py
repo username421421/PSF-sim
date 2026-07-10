@@ -105,3 +105,46 @@ def test_cpu_cuda_plane_parity(integration_mode):
         )
     for key in ("I_xy_norm", "I_xz_norm", "I_yz_norm"):
         assert np.max(np.abs(outputs[0][key] - outputs[1][key])) <= 1e-10
+
+
+def test_design_angle_apodization_matches_definition():
+    sim = CartesianPSFSimulator(n_i=1.515, n_id=1.50, torch_device="cpu")
+    theta = np.array([0.0, 0.2, 0.5], dtype=np.float64)
+    theta_design = np.arcsin(sim.n_i * np.sin(theta) / sim.n_id)
+    expected = np.sqrt(np.cos(theta_design))
+    actual = sim._design_apodization(theta).detach().cpu().numpy()
+    assert np.allclose(actual, expected, rtol=0, atol=1e-14)
+
+
+def test_public_outputs_are_finite_nonnegative_and_normalized():
+    result = CartesianPSFSimulator(torch_device="cpu").simulate_full_pipeline(
+        np.ones((32, 32)),
+        8e-3,
+        8e-3,
+        5.6e-3,
+        0.0,
+        range_microns=1.0,
+        num_points=11,
+    )
+    for raw_key, norm_key in (
+        ("I_xy", "I_xy_norm"),
+        ("I_xz", "I_xz_norm"),
+        ("I_yz", "I_yz_norm"),
+    ):
+        raw = result[raw_key]
+        normalized = result[norm_key]
+        assert np.all(np.isfinite(raw)) and np.min(raw) >= 0.0
+        assert np.all(np.isfinite(normalized)) and np.min(normalized) >= 0.0
+        assert abs(float(np.max(normalized)) - 1.0) <= 1e-12
+
+
+def test_deprecated_n_sd_is_inert():
+    field = np.ones((24, 24), dtype=np.complex128)
+    results = []
+    for n_sd in (1.1, 1.8):
+        results.append(
+            CartesianPSFSimulator(n_sd=n_sd, torch_device="cpu").simulate_psf_planes_from_pupil_field(
+                field, 8e-3, 8e-3, 5.6e-3, range_microns=1.0, num_points=9
+            )
+        )
+    assert np.array_equal(results[0]["I_xy"], results[1]["I_xy"])
