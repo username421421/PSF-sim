@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "psf-simulator-gui"
+version = "0.2.0.dev0"
+description = "Vectorial PSF simulator with CLI, GUI, and mask optimization"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.26,<3",
+  "scipy>=1.11,<2",
+  "matplotlib>=3.8,<4",
+  "torch>=2.2",
+  "tifffile>=2023.7.10",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<9", "psutil>=5.9"]
+gui3d = ["pyvista>=0.43"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+  "cuda: requires a working CUDA device",
+  "gui: exercises GUI-facing contracts",
+  "benchmark: performance or memory benchmark",
+  "legacy_unsafe: explicitly exercises trusted legacy pickle loading",
+]

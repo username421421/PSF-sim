@@ -5,10 +5,15 @@
 !.gitignore
 !README.md
 !CLI.md
+!pyproject.toml
 
 # Keep the Python simulator source and Windows launcher.
 !*.py
 !run_psf_gui.bat
+!tests/
+!tests/**
+!benchmarks/
+!benchmarks/**
 
 # Always ignore local/runtime artifacts even if a future rule changes.
 __pycache__/
@@ -19,4 +24,7 @@ __pycache__/
 .venv/
 venv/
 env/
+benchmark-results/
+benchmarks/results/
+benchmarks/*.local.json
 

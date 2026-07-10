@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "environment": {
+    "platform": "Windows-11-10.0.26200-SP0",
+    "python": "3.13.2",
+    "numpy": "2.2.3",
+    "torch": "2.6.0+cu118",
+    "cuda_runtime": "11.8",
+    "cuda_device": "NVIDIA GeForce RTX 3080 Ti"
+  },
+  "cases": [
+    {
+      "name": "2d_default_cpu",
+      "seconds": [
+        0.26054019999992306,
+        0.27205479999997806,
+        0.2642191999998431,
+        0.28649719999998524,
+        0.2695545999999922
+      ],
+      "median_seconds": 0.2695545999999922,
+      "rss_delta_bytes": 0,
+      "cuda_peak_bytes": 0
+    },
+    {
+      "name": "2d_default_cuda",
+      "seconds": [
+        0.6745690999998715,
+        0.6748233999999229,
+        0.6765674999999192,
+        0.6776992000000064,
+        0.6797806999998102
+      ],
+      "median_seconds": 0.6765674999999192,
+      "rss_delta_bytes": 0,
+      "cuda_peak_bytes": 259620864
+    }
+  ]
+}
