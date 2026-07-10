@@ -11,7 +11,6 @@ def test_fractional_integer_is_rejected():
         psf_cli.finite_int(9.5, "points")
 
 
-@pytest.mark.xfail(strict=True, reason="C10: integration mode is not exposed through CLI params")
 def test_cli_resolves_explicit_integration_mode():
     parser = psf_cli.build_parser()
     args = parser.parse_args(["simulate", "--integration-mode", "polar_interp"])

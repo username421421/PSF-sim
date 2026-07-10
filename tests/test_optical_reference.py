@@ -26,7 +26,6 @@ def _axial_precomputed():
     )
 
 
-@pytest.mark.xfail(strict=True, reason="C1: effective NA currently stretches the pupil")
 def test_effective_na_truncates_nominal_pupil_without_remapping():
     sim = CartesianPSFSimulator(
         NA=1.4, n_i=1.515, n_g=1.515, n_s=1.33, torch_device="cpu"
@@ -44,7 +43,6 @@ def test_effective_na_truncates_nominal_pupil_without_remapping():
     assert selected_fraction <= sim.NA_eff / sim.NA + 2 / 64
 
 
-@pytest.mark.xfail(strict=True, reason="C2: axial x/y operators are circularized")
 def test_axial_x_linear_y_operator_has_no_longitudinal_component():
     _sim, pre = _axial_precomputed()
     assert np.max(np.abs(pre["mz_y"].detach().cpu().numpy())) <= 1e-14
@@ -58,3 +56,52 @@ def test_axial_x_linear_y_operator_has_no_longitudinal_component():
 
 def test_cartesian_is_the_library_default():
     assert CartesianPSFSimulator().integration_mode == "cartesian_jacobian"
+
+
+def test_corrected_axial_matches_full_polar_reference():
+    kwargs = dict(
+        wavelength=780e-9,
+        NA=1.4,
+        n_i=1.515,
+        n_g=1.515,
+        n_s=1.474,
+        theta_samples=41,
+        phi_samples=80,
+        torch_device="cpu",
+        integration_mode="polar_interp",
+    )
+    field = np.ones((64, 64), dtype=np.complex128)
+    full = CartesianPSFSimulator(**kwargs).simulate_psf_planes_from_pupil_field(
+        field, 8e-3, 8e-3, 5.6e-3, range_microns=1.0, num_points=21
+    )
+    axial = AxialSymmetricPSFSimulator(**kwargs)
+    pre = axial.prepare_axial_symmetric_precomputed(
+        field, 8e-3, 8e-3, 5.6e-3, range_microns=1.0, num_points=21
+    )
+    fast = axial.simulate_psf_planes_from_radial_profiles(
+        np.ones(41), precomputed=pre
+    )
+    for key in ("I_xy_norm", "I_xz_norm", "I_yz_norm"):
+        assert np.max(np.abs(full[key] - fast[key])) <= 5e-4
+    for key in ("fwhm_x_um", "fwhm_y_um", "fwhm_z_um"):
+        assert abs(full[key] - fast[key]) / full[key] < 2e-3
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize("integration_mode", ["cartesian_jacobian", "polar_interp"])
+def test_cpu_cuda_plane_parity(integration_mode):
+    kwargs = dict(
+        integration_mode=integration_mode,
+        theta_samples=31,
+        phi_samples=60,
+    )
+    field = np.ones((32, 32), dtype=np.complex128)
+    outputs = []
+    for device in ("cpu", "cuda"):
+        outputs.append(
+            CartesianPSFSimulator(torch_device=device, **kwargs).simulate_psf_planes_from_pupil_field(
+                field, 8e-3, 8e-3, 5.6e-3, range_microns=1.0, num_points=11
+            )
+        )
+    for key in ("I_xy_norm", "I_xz_norm", "I_yz_norm"):
+        assert np.max(np.abs(outputs[0][key] - outputs[1][key])) <= 1e-10

@@ -305,6 +305,7 @@ class PSFSimulatorApp:
         self.pupil_d_mm_var = tk.DoubleVar(value=5.6)
         self.theta_samples_var = tk.IntVar(value=61)
         self.phi_samples_var = tk.IntVar(value=120)
+        self.integration_mode_var = tk.StringVar(value="cartesian_jacobian")
 
         self.exp_immersion_ri_var = tk.DoubleVar(value=1.515)
         self.exp_coverslip_ri_var = tk.DoubleVar(value=1.515)
@@ -320,8 +321,22 @@ class PSFSimulatorApp:
         self._entry(opt_group, "Wavelength (nm)", self.wavelength_nm_var)
         self._entry(opt_group, "NA", self.na_var)
         self._entry(opt_group, "Entrance pupil diameter (mm)", self.pupil_d_mm_var)
-        self._entry(opt_group, "Theta samples", self.theta_samples_var)
-        self._entry(opt_group, "Phi samples", self.phi_samples_var)
+        ttk.Label(opt_group, text="Integration mode").pack(anchor="w")
+        self.integration_mode_combo = ttk.Combobox(
+            opt_group,
+            textvariable=self.integration_mode_var,
+            state="readonly",
+            values=("cartesian_jacobian", "polar_interp"),
+        )
+        self.integration_mode_combo.pack(fill="x", pady=(0, 4))
+        self.integration_mode_combo.bind("<<ComboboxSelected>>", self._on_integration_mode_change)
+        ttk.Label(opt_group, text="Theta samples (polar mode)").pack(anchor="w")
+        self.theta_samples_entry = ttk.Entry(opt_group, textvariable=self.theta_samples_var)
+        self.theta_samples_entry.pack(fill="x", pady=(0, 4))
+        ttk.Label(opt_group, text="Phi samples (polar mode)").pack(anchor="w")
+        self.phi_samples_entry = ttk.Entry(opt_group, textvariable=self.phi_samples_var)
+        self.phi_samples_entry.pack(fill="x", pady=(0, 4))
+        self._on_integration_mode_change()
         design_media_group = ttk.LabelFrame(opt_group, text="Design Values", padding=6)
         design_media_group.pack(fill="x", pady=(0, 2))
 
@@ -544,6 +559,14 @@ class PSFSimulatorApp:
 
     def _on_sampling_param_change(self, *_args):
         self._update_sampling_info()
+
+    def _on_integration_mode_change(self, *_args):
+        mode = str(self.integration_mode_var.get()).strip().lower()
+        state = "normal" if mode == "polar_interp" else "disabled"
+        for entry_name in ("theta_samples_entry", "phi_samples_entry"):
+            entry = getattr(self, entry_name, None)
+            if entry is not None:
+                entry.configure(state=state)
 
     def _on_mask_preview_param_change(self, *_args):
         self._refresh_mask_input_preview()
@@ -2056,6 +2079,7 @@ class PSFSimulatorApp:
             "NA": float(self.na_var.get()),
             "theta_samples": int(self.theta_samples_var.get()),
             "phi_samples": int(self.phi_samples_var.get()),
+            "integration_mode": str(self.integration_mode_var.get()).strip().lower(),
             "torch_device": str(self.torch_device_var.get()).strip().lower(),
             "nx": int(self.nx_var.get()),
             "ny": int(self.ny_var.get()),
@@ -2149,6 +2173,14 @@ class PSFSimulatorApp:
             {"auto", "cpu", "cuda"},
             lowercase=True,
         )
+        self._set_choice_var_if_valid(
+            values,
+            "integration_mode",
+            self.integration_mode_var,
+            {"cartesian_jacobian", "polar_interp"},
+            lowercase=True,
+        )
+        self._on_integration_mode_change()
         self._apply_axis_range_values(values)
         self._set_bool_var_if_present(values, "use_gaussian", self.use_gaussian_var)
 
@@ -2261,6 +2293,14 @@ class PSFSimulatorApp:
             {"auto", "cpu", "cuda"},
             lowercase=True,
         )
+        self._set_choice_var_if_valid(
+            params,
+            "integration_mode",
+            self.integration_mode_var,
+            {"cartesian_jacobian", "polar_interp"},
+            lowercase=True,
+        )
+        self._on_integration_mode_change()
         self._apply_axis_range_values(params)
         self._set_bool_var_if_present(params, "use_gaussian", self.use_gaussian_var)
 
@@ -2719,6 +2759,7 @@ class PSFSimulatorApp:
             "NA": float(self.na_var.get()),
             "theta_samples": int(self.theta_samples_var.get()),
             "phi_samples": int(self.phi_samples_var.get()),
+            "integration_mode": str(self.integration_mode_var.get()).strip().lower(),
             "torch_device": str(self.torch_device_var.get()).strip().lower(),
             "nx": int(self.nx_var.get()),
             "ny": int(self.ny_var.get()),
@@ -2754,6 +2795,8 @@ class PSFSimulatorApp:
             raise ValueError("Mask size must be positive.")
         if p["pupil_d"] <= 0:
             raise ValueError("Entrance pupil diameter must be positive.")
+        if (not np.isfinite(p["fresnel_z"])) or p["fresnel_z"] < 0.0:
+            raise ValueError("Fresnel propagation distance must be finite and nonnegative.")
         if (
             (not np.isfinite(p["range_x_um"]))
             or (not np.isfinite(p["range_y_um"]))
@@ -2775,6 +2818,8 @@ class PSFSimulatorApp:
             raise ValueError("Thickness values must be non-negative.")
         if p["torch_device"] not in {"auto", "cpu", "cuda"}:
             raise ValueError("Torch device must be one of: auto, cpu, cuda.")
+        if p["integration_mode"] not in {"cartesian_jacobian", "polar_interp"}:
+            raise ValueError("Integration mode must be cartesian_jacobian or polar_interp.")
         if p["use_gaussian"] and (p["gauss_wx"] <= 0 or p["gauss_wy"] <= 0):
             raise ValueError("Gaussian wx/wy must be positive when Gaussian is enabled.")
         if not np.isfinite(p["mask_offset_x"]) or not np.isfinite(p["mask_offset_y"]):
@@ -2789,6 +2834,7 @@ class PSFSimulatorApp:
             "NA": float(p["NA"]),
             "theta_samples": int(p["theta_samples"]),
             "phi_samples": int(p["phi_samples"]),
+            "integration_mode": str(p.get("integration_mode", "cartesian_jacobian")),
             "torch_device": str(p.get("torch_device", "cpu")).strip().lower(),
             "n_i": float(p["n_i"]),
             "n_g": float(p["n_g"]),

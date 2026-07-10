@@ -703,20 +703,11 @@ class _AxialSymmetricRadialFastPSF:
         stop_callback=None,
     ) -> Dict[str, Any]:
         self._check_stop(stop_callback)
-        n_theta = int(self.radial_norm_axis.size)
-        amp = np.clip(
-            self._resample_profile_np(np.asarray(amplitude_profile, dtype=np.float64), n_theta),
-            0.0,
-            1.0,
-        )
+        amp = np.clip(np.asarray(amplitude_profile, dtype=np.float64).ravel(), 0.0, 1.0)
         if phase_profile is None:
-            ph = np.zeros((n_theta,), dtype=np.float64)
+            ph = np.zeros_like(amp, dtype=np.float64)
         else:
-            ph = np.clip(
-                self._resample_profile_np(np.asarray(phase_profile, dtype=np.float64), n_theta),
-                -np.pi,
-                np.pi,
-            )
+            ph = np.clip(np.asarray(phase_profile, dtype=np.float64).ravel(), -np.pi, np.pi)
         return self.axial_simulator.simulate_psf_planes_from_radial_profiles(
             radial_amplitude_profile=amp,
             radial_phase_profile=ph,
@@ -744,21 +735,17 @@ class _AxialSymmetricRadialFastPSF:
         axial_by_z = self.precomputed["axial_by_z"]
         n_theta = int(axial_by_z.shape[0])
 
-        amp = self.axial_simulator._to_torch_float(amplitude_profile).reshape(-1)
-        if int(amp.numel()) != int(n_theta):
-            raise ValueError(
-                f"Axial surrogate amplitude-profile length mismatch: got {int(amp.numel())}, expected {n_theta}."
-            )
+        amp = self.axial_simulator._interpolate_canonical_radial_profile(
+            amplitude_profile, self.precomputed["radial_norm_axis"]
+        ).to(torch.float64)
         amp = torch.clamp(amp, 0.0, 1.0)
 
         if phase_profile is None:
             phase = torch.zeros((n_theta,), dtype=torch.float64, device=self.device)
         else:
-            phase = self.axial_simulator._to_torch_float(phase_profile).reshape(-1)
-            if int(phase.numel()) != int(n_theta):
-                raise ValueError(
-                    f"Axial surrogate phase-profile length mismatch: got {int(phase.numel())}, expected {n_theta}."
-                )
+            phase = self.axial_simulator._interpolate_canonical_radial_profile(
+                phase_profile, self.precomputed["radial_norm_axis"]
+            ).to(torch.float64)
             phase = torch.clamp(phase, -np.pi, np.pi)
 
         modulation = amp.to(torch.complex128) * torch.exp(1j * phase.to(torch.complex128))

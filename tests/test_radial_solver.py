@@ -4,7 +4,6 @@ import pytest
 from PSF_simulator import AxialSymmetricPSFSimulator
 
 
-@pytest.mark.xfail(strict=True, reason="C3: radial coordinate is normalized to effective theta")
 def test_radial_axis_uses_nominal_pupil_radius():
     sim = AxialSymmetricPSFSimulator(
         NA=1.4,
@@ -26,7 +25,6 @@ def test_radial_axis_uses_nominal_pupil_radius():
     assert radial[-1] == pytest.approx(sim.NA_eff / sim.NA, rel=0, abs=1e-14)
 
 
-@pytest.mark.xfail(strict=True, reason="C4: radial profiles are resized by index, not radius")
 def test_radial_profile_is_interpolated_by_canonical_radius():
     sim = AxialSymmetricPSFSimulator(theta_samples=9, phi_samples=16)
     source_r = np.linspace(0.0, 1.0, 5)

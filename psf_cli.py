@@ -48,6 +48,7 @@ DEFAULT_PARAMS = {
     "NA": 1.4,
     "theta_samples": 61,
     "phi_samples": 120,
+    "integration_mode": "cartesian_jacobian",
     "torch_device": "cpu",
     "nx": 256,
     "ny": 256,
@@ -197,6 +198,7 @@ def params_from_ui_values(values):
         "NA": ("NA", 1.0, float),
         "theta_samples": ("theta_samples", 1.0, int),
         "phi_samples": ("phi_samples", 1.0, int),
+        "integration_mode": ("integration_mode", 1.0, str),
         "torch_device": ("torch_device", 1.0, str),
         "nx": ("nx", 1.0, int),
         "ny": ("ny", 1.0, int),
@@ -359,8 +361,14 @@ def validate_params(params):
     for key in ("nx", "ny", "theta_samples", "phi_samples", "points_2d", "points_3d", "z_chunk"):
         p[key] = finite_int(p[key], key)
 
+    p["integration_mode"] = str(p.get("integration_mode", "cartesian_jacobian")).strip().lower()
+    if p["integration_mode"] not in {"cartesian_jacobian", "polar_interp"}:
+        raise ValueError("integration_mode must be cartesian_jacobian or polar_interp.")
+
     if p["wavelength"] <= 0.0:
         raise ValueError("wavelength must be > 0.")
+    if p["fresnel_z"] < 0.0:
+        raise ValueError("fresnel_z must be >= 0 for forward propagation.")
     if p["nx"] < 8 or p["ny"] < 8:
         raise ValueError("Nx and Ny must be >= 8.")
     if p["size_x"] <= 0.0 or p["size_y"] <= 0.0:
@@ -403,6 +411,7 @@ def apply_param_overrides(params, args):
         "na": ("NA", 1.0, float),
         "theta_samples": ("theta_samples", 1.0, int),
         "phi_samples": ("phi_samples", 1.0, int),
+        "integration_mode": ("integration_mode", 1.0, str),
         "torch_device": ("torch_device", 1.0, str),
         "nx": ("nx", 1.0, int),
         "ny": ("ny", 1.0, int),
@@ -515,6 +524,7 @@ def create_simulator_from_params(params):
         NA=float(params["NA"]),
         theta_samples=int(params["theta_samples"]),
         phi_samples=int(params["phi_samples"]),
+        integration_mode=str(params.get("integration_mode", "cartesian_jacobian")),
         torch_device=str(params.get("torch_device", "cpu")).strip().lower(),
         n_i=float(params["n_i"]),
         n_g=float(params["n_g"]),
@@ -1252,6 +1262,12 @@ def build_summary(params, simulator, results_2d, results_3d=None, plot_mode="I",
             "pupil_d_mm": float(params["pupil_d"]) * 1e3,
             "theta_samples": int(params["theta_samples"]),
             "phi_samples": int(params["phi_samples"]),
+            "integration_mode": str(params.get("integration_mode", "cartesian_jacobian")),
+            "requested_NA": float(params["NA"]),
+            "effective_NA": float(simulator.NA_eff),
+            "excluded_pupil_fraction": float(
+                max(0.0, 1.0 - (float(simulator.NA_eff) / float(params["NA"])) ** 2)
+            ),
             "torch_device": str(params["torch_device"]),
         },
         "psf": {
@@ -1933,6 +1949,11 @@ def add_common_param_options(parser):
     parser.add_argument("--na", "--NA", dest="na", type=float, help="Objective numerical aperture.")
     parser.add_argument("--theta-samples", type=int, help="Theta integration samples.")
     parser.add_argument("--phi-samples", type=int, help="Phi integration samples.")
+    parser.add_argument(
+        "--integration-mode",
+        choices=("cartesian_jacobian", "polar_interp"),
+        help="PSF integration grid. Cartesian is the compatibility default.",
+    )
     parser.add_argument("--torch-device", choices=("auto", "cpu", "cuda"), help="Torch compute device.")
     parser.add_argument("--nx", type=int, help="Input mask grid rows.")
     parser.add_argument("--ny", type=int, help="Input mask grid columns.")

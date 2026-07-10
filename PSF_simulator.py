@@ -74,7 +74,7 @@ def _torch_to_numpy(arr):
     return np.asarray(arr)
 
 
-def _fresnel_kernel_cache_key(nx, ny, dx, dy, z, wavelength, device):
+def _fresnel_kernel_cache_key(nx, ny, dx, dy, z, wavelength, device, bandlimit_evanescent):
     return (
         str(device),
         int(nx),
@@ -83,11 +83,16 @@ def _fresnel_kernel_cache_key(nx, ny, dx, dy, z, wavelength, device):
         float(np.float64(dy)),
         float(np.float64(z)),
         float(np.float64(wavelength)),
+        bool(bandlimit_evanescent),
     )
 
 
-def _get_fresnel_transfer_kernel(nx, ny, dx, dy, z, wavelength, device):
-    key = _fresnel_kernel_cache_key(nx, ny, dx, dy, z, wavelength, device)
+def _get_fresnel_transfer_kernel(
+    nx, ny, dx, dy, z, wavelength, device, *, bandlimit_evanescent=False
+):
+    key = _fresnel_kernel_cache_key(
+        nx, ny, dx, dy, z, wavelength, device, bandlimit_evanescent
+    )
     cached = _FRESNEL_KERNEL_CACHE.get(key)
     if cached is not None:
         _FRESNEL_KERNEL_CACHE.move_to_end(key)
@@ -98,8 +103,15 @@ def _get_fresnel_transfer_kernel(nx, ny, dx, dy, z, wavelength, device):
     fy = torch.fft.fftfreq(int(ny), d=float(dy), device=device, dtype=torch.float64)
     kx = 2.0 * pi * fx[:, None]
     ky = 2.0 * pi * fy[None, :]
-    kz = torch.sqrt((k**2 - kx**2 - ky**2).to(torch.complex128))
-    h = torch.exp(1j * kz * float(z))
+    kz_squared = k**2 - kx**2 - ky**2
+    if bandlimit_evanescent:
+        propagating = kz_squared >= 0.0
+        kz = torch.sqrt(torch.clamp(kz_squared, min=0.0))
+        h = torch.exp(1j * kz * float(z)).to(torch.complex128)
+        h = h * propagating.to(torch.complex128)
+    else:
+        kz = torch.sqrt(kz_squared.to(torch.complex128))
+        h = torch.exp(1j * kz * float(z))
 
     _FRESNEL_KERNEL_CACHE[key] = h
     _FRESNEL_KERNEL_CACHE.move_to_end(key)
@@ -108,7 +120,57 @@ def _get_fresnel_transfer_kernel(nx, ny, dx, dy, z, wavelength, device):
     return h
 
 
-def propagate_fresnel_field(intensity, size_x, size_y, z, wavelength, device=None, return_torch=False):
+def propagate_complex_field(
+    field,
+    size_x,
+    size_y,
+    z,
+    wavelength,
+    device=None,
+    return_torch=False,
+    *,
+    bandlimit_evanescent=False,
+):
+    """Propagate a complex field; negative z requires evanescent band-limiting."""
+    dev = _resolve_torch_device(device)
+    field_t = _torch_complex128(field, device=dev)
+    if field_t.ndim != 2 or field_t.numel() == 0:
+        raise ValueError("field must be a non-empty 2D array.")
+    if not bool(torch.all(torch.isfinite(field_t)).item()):
+        raise ValueError("field contains NaN or Inf.")
+    if not isfinite(float(size_x)) or not isfinite(float(size_y)) or size_x <= 0 or size_y <= 0:
+        raise ValueError("size_x and size_y must be finite and positive.")
+    if not isfinite(float(wavelength)) or wavelength <= 0:
+        raise ValueError("wavelength must be finite and positive.")
+    if not isfinite(float(z)):
+        raise ValueError("z must be finite.")
+    if float(z) < 0.0 and not bool(bandlimit_evanescent):
+        raise ValueError(
+            "negative propagation requires bandlimit_evanescent=True to prevent evanescent amplification."
+        )
+    if isclose(float(z), 0.0):
+        return field_t if return_torch else _torch_to_numpy(field_t)
+
+    nx, ny = (int(field_t.shape[0]), int(field_t.shape[1]))
+    h = _get_fresnel_transfer_kernel(
+        nx=nx,
+        ny=ny,
+        dx=float(size_x) / nx,
+        dy=float(size_y) / ny,
+        z=float(z),
+        wavelength=float(wavelength),
+        device=dev,
+        bandlimit_evanescent=bool(bandlimit_evanescent),
+    )
+    propagated = torch.fft.ifft2(torch.fft.fft2(field_t) * h)
+    if not bool(torch.all(torch.isfinite(propagated)).item()):
+        raise FloatingPointError("Fresnel propagation produced NaN or Inf.")
+    return propagated if return_torch else _torch_to_numpy(propagated)
+
+
+def propagate_fresnel_field(
+    intensity, size_x, size_y, z, wavelength, device=None, return_torch=False
+):
     """
     Propagate a 2D input field with exact scalar free-space propagation.
 
@@ -141,11 +203,11 @@ def propagate_fresnel_field(intensity, size_x, size_y, z, wavelength, device=Non
         raise ValueError("intensity must be a 2D array.")
     if intensity_t.numel() == 0:
         raise ValueError("intensity cannot be empty.")
-    if size_x <= 0 or size_y <= 0:
-        raise ValueError("size_x and size_y must be positive.")
-    if wavelength <= 0:
-        raise ValueError("wavelength must be positive.")
+    if not isfinite(float(z)) or float(z) < 0.0:
+        raise ValueError("z must be finite and nonnegative for public Fresnel propagation.")
 
+    if not bool(torch.all(torch.isfinite(intensity_t)).item()):
+        raise ValueError("intensity contains NaN or Inf.")
     min_i = float(torch.min(intensity_t).item())
     max_i = float(torch.max(intensity_t).item())
     if min_i < 0.0 or max_i > 1.0:
@@ -153,26 +215,15 @@ def propagate_fresnel_field(intensity, size_x, size_y, z, wavelength, device=Non
 
     u0 = torch.sqrt(intensity_t).to(torch.complex128)
 
-    if isclose(z, 0.0):
-        return u0 if return_torch else _torch_to_numpy(u0)
-
-    nx, ny = intensity_t.shape
-    dx = size_x / nx
-    dy = size_y / ny
-
-    h = _get_fresnel_transfer_kernel(
-        nx=nx,
-        ny=ny,
-        dx=dx,
-        dy=dy,
+    return propagate_complex_field(
+        u0,
+        size_x=size_x,
+        size_y=size_y,
         z=z,
         wavelength=wavelength,
         device=dev,
+        return_torch=return_torch,
     )
-
-    u0_f = torch.fft.fft2(u0)
-    uz = torch.fft.ifft2(u0_f * h)
-    return uz if return_torch else _torch_to_numpy(uz)
 
 
 def apply_gaussian_profile(intensity, size_x, size_y, wx, wy, device=None, return_torch=False):
@@ -970,6 +1021,11 @@ class CartesianPSFSimulator:
         if intensity.ndim != 2:
             raise ValueError("input_intensity must be a 2D array.")
 
+        if not bool(torch.all(torch.isfinite(intensity)).item()):
+            raise ValueError("input_intensity contains NaN or Inf.")
+        if not isfinite(float(fresnel_distance)) or float(fresnel_distance) < 0.0:
+            raise ValueError("fresnel_distance must be finite and nonnegative.")
+
         min_i = float(torch.min(intensity).item())
         max_i = float(torch.max(intensity).item())
         if min_i < 0.0 or max_i > 1.0:
@@ -1004,6 +1060,10 @@ class CartesianPSFSimulator:
             custom_mask_t = self._to_torch_float(custom_mask)
             if tuple(int(v) for v in custom_mask_t.shape) != tuple(int(v) for v in intensity_after_mask.shape):
                 raise ValueError("custom_mask shape must match input_intensity shape.")
+            if not bool(torch.all(torch.isfinite(custom_mask_t)).item()):
+                raise ValueError("custom_mask contains NaN or Inf.")
+            if float(torch.min(custom_mask_t).item()) < 0.0 or float(torch.max(custom_mask_t).item()) > 1.0:
+                raise ValueError("custom_mask must be within [0, 1].")
             intensity_after_mask = intensity_after_mask * custom_mask_t
 
         ring_mask = None
@@ -1021,10 +1081,8 @@ class CartesianPSFSimulator:
             )
             intensity_after_mask = intensity_after_mask * ring_mask
 
-        max_masked = float(torch.max(intensity_after_mask).item())
-        if max_masked <= 0:
+        if float(torch.max(intensity_after_mask).item()) <= 0:
             raise ValueError("Intensity is all zeros after masking.")
-        intensity_after_mask = intensity_after_mask / max_masked
 
         self._check_stop(stop_callback)
         self._emit_progress(progress_callback, "Propagating to entrance pupil", 0.52)
@@ -1035,6 +1093,8 @@ class CartesianPSFSimulator:
             field_after_fresnel = self.fresnel_propagate(
                 intensity_after_mask, size_x=size_x, size_y=size_y, z=fresnel_distance
             )
+        if not bool(torch.all(torch.isfinite(field_after_fresnel)).item()):
+            raise FloatingPointError("Fresnel field contains NaN or Inf.")
 
         self._check_stop(stop_callback)
         self._emit_progress(progress_callback, "Applying entrance pupil", 0.74)
@@ -1047,6 +1107,8 @@ class CartesianPSFSimulator:
         )
         )
         field_at_pupil = field_after_fresnel * pupil_mask
+        if not bool(torch.all(torch.isfinite(field_at_pupil)).item()):
+            raise FloatingPointError("Pupil field contains NaN or Inf.")
 
         entrance_pupil_intensity = torch.abs(field_after_fresnel) ** 2
         intensity_after_pupil_mask = torch.abs(field_at_pupil) ** 2
@@ -1124,6 +1186,16 @@ class CartesianPSFSimulator:
     def _theta_2(self, theta):
         theta_t = self._to_torch_float(theta)
         return self._safe_asin(self.n_i * torch.sin(theta_t) / self.n_g)
+
+    def _theta_design(self, theta):
+        """Objective design-space angle corresponding to an experimental ray."""
+        theta_t = self._to_torch_float(theta)
+        return self._safe_asin(self.n_i * torch.sin(theta_t) / self.n_id)
+
+    def _design_apodization(self, theta):
+        theta_design = self._theta_design(theta)
+        cos_design = torch.real(torch.cos(theta_design))
+        return torch.sqrt(torch.clamp(cos_design, min=0.0))
 
     def _w_abb(self, theta):
         theta_t = self._to_torch_float(theta)
@@ -1219,10 +1291,12 @@ class CartesianPSFSimulator:
                 0.0, 2.0 * pi, int(self.phi_samples), device=self.device
             )
 
-            sin_theta_max = torch.sin(
-                torch.tensor(self.theta_max, dtype=torch.float64, device=self.device)
-            )
-            rho = (torch.sin(theta) / sin_theta_max) * (0.5 * entrance_pupil_diameter)
+            # A physical pupil coordinate is defined by the objective's nominal
+            # NA.  A lower downstream refractive index truncates support; it
+            # must not stretch the remaining pupil field to the rim.
+            rho = (
+                self.n_i * torch.sin(theta) / float(self.NA)
+            ) * (0.5 * entrance_pupil_diameter)
             xp = rho[:, None] * torch.cos(phi)[None, :]
             yp = rho[:, None] * torch.sin(phi)[None, :]
 
@@ -1231,7 +1305,7 @@ class CartesianPSFSimulator:
 
             cos_theta = torch.cos(theta)
             sin_theta = torch.sin(theta)
-            sqrt_cos_theta = torch.sqrt(cos_theta)
+            design_apodization = self._design_apodization(theta)
             cos_theta_3 = torch.cos(theta_3)
             sin_theta_3 = torch.sin(theta_3)
 
@@ -1254,7 +1328,7 @@ class CartesianPSFSimulator:
             geom_ez = -t_p_col * sin_theta_3[:, None] * cos_phi_grid
 
             common_prefactor = (
-                sqrt_cos_theta[:, None]
+                design_apodization[:, None]
                 * torch.exp(1j * self.k * w_abb)[:, None]
                 * sin_theta[:, None]
             )
@@ -1376,7 +1450,9 @@ class CartesianPSFSimulator:
             if pupil_radius <= 0:
                 raise ValueError("entrance_pupil_diameter must be positive.")
 
-            inside = r <= pupil_radius
+            nominal_sin_theta_max = float(self.NA / self.n_i)
+            effective_radius = pupil_radius * float(self.NA_eff / self.NA)
+            inside = r <= effective_radius
             if not bool(torch.any(inside).item()):
                 raise ValueError("No Cartesian grid points lie inside the entrance pupil.")
 
@@ -1384,10 +1460,11 @@ class CartesianPSFSimulator:
             yp = yg[inside]
             flat_inside = torch.nonzero(inside.reshape(-1), as_tuple=False).reshape(-1).to(torch.int64)
 
-            sin_theta_max = torch.sin(
-                torch.tensor(self.theta_max, dtype=torch.float64, device=self.device)
+            sin_theta = torch.clamp(
+                (r[inside] / pupil_radius) * nominal_sin_theta_max,
+                0.0,
+                float(self.NA_eff / self.n_i),
             )
-            sin_theta = torch.clamp((r[inside] / pupil_radius) * sin_theta_max, 0.0, sin_theta_max)
             if self.theta_min > 0:
                 sin_theta_min = torch.sin(
                     torch.tensor(self.theta_min, dtype=torch.float64, device=self.device)
@@ -1418,10 +1495,10 @@ class CartesianPSFSimulator:
 
             dx = size_x / nx
             dy = size_y / ny
-            jacobian = (sin_theta_max**2 / (pupil_radius**2)) * (dx * dy) / torch.clamp(
+            jacobian = (nominal_sin_theta_max**2 / (pupil_radius**2)) * (dx * dy) / torch.clamp(
                 cos_theta, 1e-12, None
             )
-            prefactor = torch.sqrt(cos_theta) * torch.exp(1j * self.k * w_abb) * jacobian
+            prefactor = self._design_apodization(theta) * torch.exp(1j * self.k * w_abb) * jacobian
 
             geom = {
                 "flat_indices": flat_inside,
@@ -1864,6 +1941,8 @@ class CartesianPSFSimulator:
         pupil_field = self._to_torch_complex(pupil_field)
         if pupil_field.ndim != 2:
             raise ValueError("pupil_field must be a 2D array.")
+        if not bool(torch.all(torch.isfinite(pupil_field)).item()):
+            raise ValueError("pupil_field contains NaN or Inf.")
         if int(num_points) < 3:
             raise ValueError("num_points must be >= 3 for 3D simulation.")
 
@@ -1926,6 +2005,8 @@ class CartesianPSFSimulator:
         )
         self._check_stop(stop_callback)
         self._emit_progress(progress_callback, "Extracting 3D slices", (table_ops + vol_ops) / total_ops)
+        if not bool(torch.all(torch.isfinite(i_xyz)).item()):
+            raise FloatingPointError("I_xyz contains NaN or Inf.")
         i_xyz_norm = self._normalize_intensity(i_xyz.clone())
 
         max_flat_idx = int(torch.argmax(i_xyz).item())
@@ -2012,6 +2093,8 @@ class CartesianPSFSimulator:
         pupil_field = self._to_torch_complex(pupil_field)
         if pupil_field.ndim != 2:
             raise ValueError("pupil_field must be a 2D array.")
+        if not bool(torch.all(torch.isfinite(pupil_field)).item()):
+            raise ValueError("pupil_field contains NaN or Inf.")
         compute_xy = bool(compute_xy)
         compute_xz = bool(compute_xz)
         compute_yz = bool(compute_yz)
@@ -2184,6 +2267,10 @@ class CartesianPSFSimulator:
                 max_idx_yz = int(torch.argmax(i_yz).item())
                 max_i_z = max_idx_yz // ny
                 z_focus = z_coords[max_i_z]
+
+        for name, value in (("I_xy", i_xy), ("I_xz", i_xz), ("I_yz", i_yz)):
+            if value is not None and not bool(torch.all(torch.isfinite(value)).item()):
+                raise FloatingPointError(f"{name} contains NaN or Inf.")
 
         i_xz_norm = None if i_xz is None else self._normalize_intensity(i_xz.clone())
         i_xy_norm = None if i_xy is None else self._normalize_intensity(i_xy.clone())
@@ -2635,6 +2722,20 @@ class AxialSymmetricPSFSimulator(CartesianPSFSimulator):
             align_corners=True,
         )[0, 0]
 
+    def _interpolate_canonical_radial_profile(self, profile, radial_norm):
+        """Linearly sample a profile defined on a uniform radius grid [0, 1]."""
+        source = torch.as_tensor(profile, device=self.device).reshape(-1)
+        if source.numel() < 1:
+            raise ValueError("radial profile cannot be empty.")
+        target = self._to_torch_float(radial_norm)
+        if source.numel() == 1:
+            return source[0].expand(target.shape)
+        position = torch.clamp(target, 0.0, 1.0) * float(source.numel() - 1)
+        lower = torch.floor(position).to(torch.int64)
+        upper = torch.clamp(lower + 1, max=int(source.numel() - 1))
+        fraction = (position - lower.to(torch.float64)).to(source.real.dtype)
+        return source[lower] * (1.0 - fraction) + source[upper] * fraction
+
     def _extract_radial_complex_profile(
         self,
         pupil_field,
@@ -2653,61 +2754,27 @@ class AxialSymmetricPSFSimulator(CartesianPSFSimulator):
             raise ValueError("entrance_pupil_diameter must be > 0.")
 
         nx, ny = int(field.shape[0]), int(field.shape[1])
-        x = _torch_linspace_no_endpoint(-size_x / 2, size_x / 2, nx, device=self.device)
-        y = _torch_linspace_no_endpoint(-size_y / 2, size_y / 2, ny, device=self.device)
-        xg, yg = torch.meshgrid(x, y, indexing="ij")
-
         pupil_radius = 0.5 * float(entrance_pupil_diameter)
-        r_norm = torch.sqrt(xg * xg + yg * yg) / max(pupil_radius, 1e-30)
-        inside = r_norm <= 1.0
-        if not bool(torch.any(inside).item()):
-            raise ValueError("No points found inside entrance pupil for radial profile extraction.")
+        radii = torch.linspace(0.0, 1.0, n_samples, dtype=torch.float64, device=self.device)
+        n_phi = max(64, int(self.phi_samples))
+        phi = _torch_linspace_no_endpoint(0.0, 2.0 * pi, n_phi, device=self.device)
+        xp = radii[:, None] * pupil_radius * torch.cos(phi)[None, :]
+        yp = radii[:, None] * pupil_radius * torch.sin(phi)[None, :]
 
-        r_use = torch.clamp(r_norm[inside], 0.0, 1.0)
-        idx = torch.round(r_use * float(max(1, n_samples - 1))).to(torch.int64)
-        idx = torch.clamp(idx, 0, int(n_samples - 1))
-        vals = field[inside]
-
-        ones = torch.ones_like(r_use, dtype=torch.float64)
-        counts = torch.zeros((n_samples,), dtype=torch.float64, device=self.device)
-        counts.index_add_(0, idx, ones)
-
-        sum_real = torch.zeros((n_samples,), dtype=torch.float64, device=self.device)
-        sum_imag = torch.zeros((n_samples,), dtype=torch.float64, device=self.device)
-        sum_real.index_add_(0, idx, vals.real.to(torch.float64))
-        sum_imag.index_add_(0, idx, vals.imag.to(torch.float64))
-
-        prof_real = torch.zeros((n_samples,), dtype=torch.float64, device=self.device)
-        prof_imag = torch.zeros((n_samples,), dtype=torch.float64, device=self.device)
-        valid = counts > 0
-        prof_real[valid] = sum_real[valid] / counts[valid]
-        prof_imag[valid] = sum_imag[valid] / counts[valid]
-
-        if not bool(torch.all(valid).item()):
-            valid_np = valid.detach().cpu().numpy()
-            idx_np = np.arange(n_samples, dtype=np.float64)
-            real_np = prof_real.detach().cpu().numpy()
-            imag_np = prof_imag.detach().cpu().numpy()
-            if int(np.count_nonzero(valid_np)) < 1:
-                raise ValueError("Failed to construct radial complex profile from pupil field.")
-            real_np[~valid_np] = np.interp(
-                idx_np[~valid_np],
-                idx_np[valid_np],
-                real_np[valid_np],
-                left=float(real_np[valid_np][0]),
-                right=float(real_np[valid_np][-1]),
-            )
-            imag_np[~valid_np] = np.interp(
-                idx_np[~valid_np],
-                idx_np[valid_np],
-                imag_np[valid_np],
-                left=float(imag_np[valid_np][0]),
-                right=float(imag_np[valid_np][-1]),
-            )
-            prof_real = torch.as_tensor(real_np, dtype=torch.float64, device=self.device)
-            prof_imag = torch.as_tensor(imag_np, dtype=torch.float64, device=self.device)
-
-        return prof_real.to(torch.complex128) + 1j * prof_imag.to(torch.complex128)
+        dx = float(size_x) / float(nx)
+        dy = float(size_y) / float(ny)
+        row = (xp + 0.5 * float(size_x)) / dx
+        col = (yp + 0.5 * float(size_y)) / dy
+        norm_row = (2.0 * row / float(nx - 1)) - 1.0 if nx > 1 else torch.zeros_like(row)
+        norm_col = (2.0 * col / float(ny - 1)) - 1.0 if ny > 1 else torch.zeros_like(col)
+        grid = torch.stack((norm_col, norm_row), dim=-1).unsqueeze(0)
+        real = F.grid_sample(
+            field.real[None, None], grid, mode="bilinear", padding_mode="zeros", align_corners=True
+        )[0, 0]
+        imag = F.grid_sample(
+            field.imag[None, None], grid, mode="bilinear", padding_mode="zeros", align_corners=True
+        )[0, 0]
+        return (torch.mean(real, dim=1) + 1j * torch.mean(imag, dim=1)).to(torch.complex128)
 
     def prepare_axial_symmetric_precomputed(
         self,
@@ -2747,18 +2814,21 @@ class AxialSymmetricPSFSimulator(CartesianPSFSimulator):
         theta_w = self._theta_trapezoid_weights(theta).to(device=self.device, dtype=torch.float64)
         sin_theta = torch.sin(theta)
         cos_theta = torch.cos(theta)
-        sin_theta_max = torch.sin(torch.tensor(float(self.theta_max), dtype=torch.float64, device=self.device))
-        if float(torch.abs(sin_theta_max).item()) <= 0.0:
+        nominal_sin_theta_max = float(self.NA / self.n_i)
+        if nominal_sin_theta_max <= 0.0:
             raise ValueError("Invalid theta_max for axial-symmetric precomputation.")
-        radial_norm = torch.clamp(sin_theta / sin_theta_max, 0.0, 1.0)
+        radial_norm = torch.clamp(sin_theta / nominal_sin_theta_max, 0.0, 1.0)
 
-        base_field_radial = self._extract_radial_complex_profile(
+        base_field_canonical = self._extract_radial_complex_profile(
             pupil_field=pupil_field,
             size_x=float(size_x),
             size_y=float(size_y),
             entrance_pupil_diameter=float(entrance_pupil_diameter),
             n_samples=int(theta.numel()),
         )
+        base_field_radial = self._interpolate_canonical_radial_profile(
+            base_field_canonical, radial_norm
+        ).to(torch.complex128)
 
         t_s, t_p, theta_3 = self._transmission_terms(theta)
         cos_theta_3 = torch.cos(theta_3)
@@ -2767,7 +2837,7 @@ class AxialSymmetricPSFSimulator(CartesianPSFSimulator):
 
         base_weight = (
             self.C
-            * torch.sqrt(cos_theta)
+            * self._design_apodization(theta)
             * torch.exp(1j * self.k * w_abb)
             * base_field_radial
             * sin_theta
@@ -2793,8 +2863,26 @@ class AxialSymmetricPSFSimulator(CartesianPSFSimulator):
 
         mx_x = base_weight[:, None] * pi * (coeff_a[:, None] * j0_x + coeff_b[:, None] * j2_x)
         mz_x = base_weight[:, None] * coeff_z[:, None] * j1_x
-        mx_y = base_weight[:, None] * pi * (coeff_a[:, None] * j0_y + coeff_b[:, None] * j2_y)
-        mz_y = base_weight[:, None] * coeff_z[:, None] * j1_y
+        mx_y = base_weight[:, None] * pi * (coeff_a[:, None] * j0_y - coeff_b[:, None] * j2_y)
+        mz_y = torch.zeros_like(mx_y, dtype=torch.complex128)
+
+        # Full x-linearly-polarized XY field.  Radial intensity interpolation
+        # is invalid because the vector field depends on observation azimuth.
+        x_grid, y_grid = torch.meshgrid(x_coords, y_coords, indexing="xy")
+        rho_xy = torch.sqrt(x_grid**2 + y_grid**2).reshape(-1)
+        azimuth_xy = torch.atan2(y_grid, x_grid).reshape(-1)
+        beta_xy = phase_scale[:, None] * rho_xy[None, :]
+        j0_xy = torch.special.bessel_j0(beta_xy)
+        j1_xy = torch.special.bessel_j1(beta_xy)
+        j2_xy = self._bessel_j2(beta_xy, j0=j0_xy, j1=j1_xy)
+        cos_2phi = torch.cos(2.0 * azimuth_xy)[None, :]
+        sin_2phi = torch.sin(2.0 * azimuth_xy)[None, :]
+        cos_phi = torch.cos(azimuth_xy)[None, :]
+        mxy_ex = base_weight[:, None] * pi * (
+            coeff_a[:, None] * j0_xy + coeff_b[:, None] * cos_2phi * j2_xy
+        )
+        mxy_ey = base_weight[:, None] * pi * coeff_b[:, None] * sin_2phi * j2_xy
+        mxy_ez = base_weight[:, None] * coeff_z[:, None] * cos_phi * j1_xy
 
         axial_by_z = torch.exp(
             1j * self.k * self.n_s * cos_theta_3[:, None] * z_coords[None, :]
@@ -2813,6 +2901,10 @@ class AxialSymmetricPSFSimulator(CartesianPSFSimulator):
             "mz_x": mz_x.to(torch.complex128).contiguous(),
             "mx_y": mx_y.to(torch.complex128).contiguous(),
             "mz_y": mz_y.to(torch.complex128).contiguous(),
+            "mxy_ex": mxy_ex.to(torch.complex128).contiguous(),
+            "mxy_ey": mxy_ey.to(torch.complex128).contiguous(),
+            "mxy_ez": mxy_ez.to(torch.complex128).contiguous(),
+            "xy_shape": (int(y_coords.numel()), int(x_coords.numel())),
             "center_x_index": int(center_x),
             "center_y_index": int(center_y),
         }
@@ -2874,12 +2966,17 @@ class AxialSymmetricPSFSimulator(CartesianPSFSimulator):
         axial_by_z = precomputed["axial_by_z"]
         n_theta = int(axial_by_z.shape[0])
 
-        amp = self._resample_profile_1d(radial_amplitude_profile, n_theta, self.device)
+        radial_norm = precomputed["radial_norm_axis"]
+        amp = self._interpolate_canonical_radial_profile(
+            radial_amplitude_profile, radial_norm
+        ).to(torch.float64)
         amp = torch.clamp(amp, 0.0, 1.0)
         if radial_phase_profile is None:
             phase = torch.zeros_like(amp, dtype=torch.float64)
         else:
-            phase = self._resample_profile_1d(radial_phase_profile, n_theta, self.device)
+            phase = self._interpolate_canonical_radial_profile(
+                radial_phase_profile, radial_norm
+            ).to(torch.float64)
             phase = torch.clamp(phase, -pi, pi)
         modulation = amp.to(torch.complex128) * torch.exp(1j * phase.to(torch.complex128))
 
@@ -2925,26 +3022,13 @@ class AxialSymmetricPSFSimulator(CartesianPSFSimulator):
             if max_i_z is None:
                 max_i_z = int(torch.argmin(torch.abs(z_coords - z_focus)).item())
 
-            if i_xz is not None:
-                radial_axis = torch.abs(x_coords)
-                radial_line = i_xz[max_i_z, :]
-            elif i_yz is not None:
-                radial_axis = torch.abs(y_coords)
-                radial_line = i_yz[max_i_z, :]
-            else:
-                wz0 = wz[:, max_i_z]
-                ex_line = torch.matmul(wz0[None, :], mx_x)[0]
-                ez_line = torch.matmul(wz0[None, :], mz_x)[0]
-                radial_axis = torch.abs(x_coords)
-                radial_line = torch.abs(ex_line) ** 2 + torch.abs(ez_line) ** 2
-
-            i_xy_np = self._xy_from_radial_line_numpy(
-                radial_axis_abs=self._to_numpy(radial_axis),
-                radial_intensity=self._to_numpy(radial_line),
-                x_coords=self._to_numpy(x_coords),
-                y_coords=self._to_numpy(y_coords),
+            wz0 = wz[:, max_i_z]
+            ex_xy = torch.matmul(wz0[None, :], precomputed["mxy_ex"])[0]
+            ey_xy = torch.matmul(wz0[None, :], precomputed["mxy_ey"])[0]
+            ez_xy = torch.matmul(wz0[None, :], precomputed["mxy_ez"])[0]
+            i_xy = (torch.abs(ex_xy) ** 2 + torch.abs(ey_xy) ** 2 + torch.abs(ez_xy) ** 2).reshape(
+                precomputed["xy_shape"]
             )
-            i_xy = self._to_torch_float(i_xy_np)
 
         if compute_yz and (i_yz is None):
             self._check_stop(stop_callback)
