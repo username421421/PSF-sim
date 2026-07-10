@@ -111,20 +111,12 @@ class PSFSimulatorApp:
         self.mask_builder_model = None
         self.mask_builder_action_buttons = []
         self.project_dir = os.path.dirname(os.path.abspath(__file__))
-        portable = str(os.environ.get("PSF_SIM_PORTABLE", "")).strip().lower() in {
-            "1",
-            "true",
-            "yes",
-        }
-        if portable:
-            self.user_data_dir = self.project_dir
-        else:
-            local_root = os.environ.get("LOCALAPPDATA") or os.path.join(
-                os.path.expanduser("~"), "AppData", "Local"
-            )
-            self.user_data_dir = os.path.join(local_root, "PSFSimulator")
-        self.bundled_mask_library_dir = os.path.join(self.project_dir, "mask library")
+        # Keep simulation data beside the application.  This preserves the
+        # established portable workflow and makes saved masks/results visible
+        # without an implicit AppData migration.
+        self.user_data_dir = self.project_dir
         self.mask_library_dir = os.path.join(self.user_data_dir, "mask library")
+        self.mask_load_dir = self.project_dir
         self.saved_simulation_dir = os.path.join(self.user_data_dir, "saved simulation")
         self.objective_lens_dir = os.path.join(self.user_data_dir, "objective lens")
         self.optimized_mask_dir = os.path.join(self.user_data_dir, "optimized mask")
@@ -1476,7 +1468,7 @@ class PSFSimulatorApp:
     def _load_mask_into_builder_dialog(self):
         path = filedialog.askopenfilename(
             title="Load mask into builder",
-            initialdir=self.mask_library_dir,
+            initialdir=self.mask_load_dir,
             filetypes=[
                 ("All files", "*.*"),
                 ("NumPy array", "*.npy"),
@@ -1649,7 +1641,7 @@ class PSFSimulatorApp:
     def _load_mask(self):
         path = filedialog.askopenfilename(
             title="Load mask",
-            initialdir=self.mask_library_dir,
+            initialdir=self.mask_load_dir,
             filetypes=[
                 ("All files", "*.*"),
                 ("NumPy array", "*.npy"),

@@ -2,6 +2,7 @@ import pytest
 import json
 import subprocess
 import sys
+from pathlib import Path
 
 import psf_cli
 
@@ -24,3 +25,9 @@ def test_core_import_has_no_gui_plotting_or_scipy_optimizer_side_effects():
     output = subprocess.check_output([sys.executable, "-B", "-c", code], text=True)
     loaded = json.loads(output)
     assert loaded == {"tkinter": False, "matplotlib": False, "scipy.optimize": False}
+
+
+def test_gui_keeps_user_files_in_the_project_folder_by_default():
+    source = (Path(__file__).resolve().parents[1] / "psf_gui.py").read_text(encoding="utf-8")
+    assert "self.user_data_dir = self.project_dir" in source
+    assert "initialdir=self.mask_load_dir" in source
