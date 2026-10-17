@@ -635,28 +635,9 @@ class _AxialSymmetricRadialFastPSF:
         if not (self.compute_xy or self.compute_xz or self.compute_yz):
             raise ValueError("At least one PSF plane must be enabled for axial fast path.")
 
-        device_str = str(getattr(simulator, "device", "cpu"))
-        self.axial_simulator = AxialSymmetricPSFSimulator(
-            wavelength=float(simulator.wavelength),
-            NA=float(simulator.NA),
-            theta_min=float(simulator.theta_min),
-            theta_samples=int(simulator.theta_samples),
-            phi_samples=int(simulator.phi_samples),
-            t_gd=float(simulator.t_gd),
-            n_gd=float(simulator.n_gd),
-            t_id=float(simulator.t_id),
-            n_id=float(simulator.n_id),
-            n_sd=float(simulator.n_sd),
-            t_g=float(simulator.t_g),
-            n_g=float(simulator.n_g),
-            t_s=float(simulator.t_s),
-            n_s=float(simulator.n_s),
-            n_i=float(simulator.n_i),
-            integration_mode=str(getattr(simulator, "integration_mode", "cartesian_jacobian")),
-            torch_device=device_str,
-            trim_pupil_for_psf=bool(getattr(simulator, "trim_pupil_for_psf", True)),
-            pupil_trim_margin_pixels=int(getattr(simulator, "pupil_trim_margin_pixels", 2)),
-        )
+        # Copy the full optical model (including aberration_model) so the
+        # radial objective uses the same physics as the exact evaluation.
+        self.axial_simulator = AxialSymmetricPSFSimulator(**simulator.constructor_kwargs())
 
         field_t = self.axial_simulator._to_torch_complex(base_field_for_psf)
         if field_t.ndim != 2:

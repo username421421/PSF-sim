@@ -34,6 +34,43 @@ def create_simulator(params: Mapping[str, Any]):
     return CartesianPSFSimulator(**kwargs)
 
 
+def pupil_sampling_report(params: Mapping[str, Any], simulator=None) -> dict:
+    """Pupil-phase sampling check for the scan described by ``params``."""
+    sim = simulator if simulator is not None else create_simulator(params)
+    return sim.pupil_phase_sampling(
+        entrance_pupil_diameter=float(params["pupil_d"]),
+        shape=(int(params["nx"]), int(params["ny"])),
+        size_x=float(params["size_x"]),
+        size_y=float(params["size_y"]),
+        range_z_m=float(params["range_z_um"]) * 1e-6,
+        range_r_m=max(float(params["range_x_um"]), float(params["range_y_um"])) * 1e-6,
+    )
+
+
+def sampling_warning(report: Mapping[str, Any]) -> Optional[str]:
+    """Human-readable advice for an under-sampled report, or None when it is fine."""
+    if not report["undersampled"]:
+        return None
+    suggested = report["suggested"]
+    polar_advice = f"polar_interp with at least {suggested['theta_samples']} theta samples"
+    if report["integration_mode"] == "polar_interp":
+        parts = [
+            f"{name} samples to at least {suggested[key]}"
+            for name, key in (("theta", "theta_samples"), ("phi", "phi_samples"))
+            if suggested[key] > report["current"][key]
+        ]
+        advice = "Increase " + " and ".join(parts or ["theta samples"])
+    elif suggested["pixels"] <= 4096:
+        advice = f"Increase Nx/Ny to at least {suggested['pixels']} or use {polar_advice}"
+    else:
+        advice = f"Use {polar_advice} (Cartesian would need about {suggested['pixels']} px)"
+    return (
+        f"The pupil phase changes by {report['max_phase_step_rad']:.1f} rad between neighbouring "
+        f"integration samples (Nyquist limit pi; {report['aberration_waves']:.1f} waves of aberration "
+        f"across the pupil), so the PSF is not converged. {advice}."
+    )
+
+
 def _available_ram_bytes() -> int:
     try:
         import psutil

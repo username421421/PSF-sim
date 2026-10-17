@@ -227,27 +227,51 @@ def test_dip_in_toggle_links_resin_restores_previous_settings_and_keeps_objectiv
 
 
 @pytest.mark.gui
-@pytest.mark.parametrize("dipping", [False, True])
 @pytest.mark.parametrize("core_units", [False, True])
-def test_gui_toggle_overrides_conflicting_model_in_loaded_and_submitted_settings(dipping, core_units):
+def test_dip_in_forces_gibson_lanni_in_loaded_and_submitted_settings(core_units):
     app = _gui_control_app()
-    selected = "gibson_lanni" if dipping else "legacy"
-    conflicting = "legacy" if dipping else "gibson_lanni"
-    values = {"dip_in_enabled": dipping, "aberration_model": conflicting}
+    values = {"dip_in_enabled": True, "aberration_model": "legacy"}
     if core_units:
         app._apply_params_to_controls({**psf_cli.DEFAULT_PARAMS, **values})
     else:
         app._apply_control_values(values)
-    assert app.aberration_model_var.get() == selected
+    assert app.aberration_model_var.get() == "gibson_lanni"
 
-    # Serialization and worker submission must honor the toggle even if an
-    # older code path assigns a conflicting model after loading.
-    app.aberration_model_var.set(conflicting)
-    assert app._collect_control_values()["aberration_model"] == selected
-    app.aberration_model_var.set(conflicting)
+    # Resin replacing the design immersion is only described by the layered
+    # model, so serialization and submission keep it while dipping.
+    app.aberration_model_var.set("legacy")
+    assert app._collect_control_values()["aberration_model"] == "gibson_lanni"
+    app.aberration_model_var.set("legacy")
     params = app._collect_params()
-    assert params["aberration_model"] == selected
-    assert create_simulator(params).aberration_model == selected
+    assert params["aberration_model"] == "gibson_lanni"
+    assert create_simulator(params).aberration_model == "gibson_lanni"
+
+
+@pytest.mark.gui
+@pytest.mark.parametrize("core_units", [False, True])
+def test_standard_mode_keeps_loaded_and_selected_aberration_model(core_units):
+    # A layered Gibson-Lanni config (oil, coverslip, 5 um into resin) is not a
+    # dip-in setup and must not be downgraded to the Nasse-Woehl model.
+    app = _gui_control_app()
+    if core_units:
+        app._apply_params_to_controls({
+            **psf_cli.DEFAULT_PARAMS, "aberration_model": "Gibson_Lanni",
+            "n_i": 1.518, "n_g": 1.518, "t_s": 5e-6,
+        })
+    else:
+        app._apply_control_values({
+            "aberration_model": "gibson_lanni", "n_i": 1.518, "n_g": 1.518, "t_s_um": 5.0,
+        })
+    assert app.dip_in_enabled_var.get() is False
+    assert app.aberration_model_var.get() == "gibson_lanni"
+    assert "Gibson-Lanni" in app.aberration_model_description_var.get()
+    params = app._collect_params()
+    assert params["aberration_model"] == "gibson_lanni"
+    assert create_simulator(params).aberration_model == "gibson_lanni"
+
+    app.aberration_model_var.set("legacy")
+    assert app._collect_params()["aberration_model"] == "legacy"
+    assert app._collect_control_values()["aberration_model"] == "legacy"
 
 
 @pytest.mark.gui
@@ -280,7 +304,8 @@ def test_dip_in_toggle_and_restore_snapshot_survive_gui_config_loading(tmp_path)
     restored = _gui_control_app()
     restored._load_simulation_config_from_path(str(path))
     assert restored.dip_in_enabled_var.get() is True
-    # Older saved snapshots could contain a manually selected mismatch model.
+    assert restored._dip_in_previous_values["aberration_model"] == "legacy"
+    # Leaving dip-in restores the model selected before it was switched on.
     restored._dip_in_previous_values["aberration_model"] = "gibson_lanni"
     restored.exp_resin_ri_var.set(1.49)
     assert restored.exp_immersion_ri_var.get() == 1.49
@@ -289,7 +314,7 @@ def test_dip_in_toggle_and_restore_snapshot_survive_gui_config_loading(tmp_path)
     assert restored.exp_immersion_ri_var.get() == 1.515
     assert restored.exp_coverslip_thickness_um_var.get() == pytest.approx(170)
     assert restored.exp_resin_thickness_um_var.get() == pytest.approx(12)
-    assert restored.aberration_model_var.get() == "legacy"
+    assert restored.aberration_model_var.get() == "gibson_lanni"
 
     # Loading an older layered config while dipping must not have its media
     # overwritten by the resin-RI trace or retain the previous mode.
@@ -324,3 +349,114 @@ def test_dip_in_controls_are_linked_and_toggle_is_disabled_during_work():
     app._on_dip_in_toggle()
     assert app.dip_in_check.state == "normal"
     assert all(entry.state == "normal" for entry in app._dip_in_linked_entries)
+
+
+@pytest.mark.gui
+def test_dip_in_toggle_refuses_half_typed_media_and_keeps_settings(monkeypatch):
+    import psf_gui
+
+    warnings = []
+    monkeypatch.setattr(psf_gui.messagebox, "showwarning", lambda _title, message: warnings.append(message))
+    app = _gui_control_app()
+    app._apply_params_to_controls({**psf_cli.DEFAULT_PARAMS, "n_i": 1.518, "t_g": 175e-6})
+    app.exp_coverslip_thickness_um_var.set("")  # cleared while the user retypes it
+    app.dip_in_enabled_var.set(True)
+    app._on_dip_in_toggle()
+    assert app.dip_in_enabled_var.get() is False
+    assert app._dip_in_previous_values is None
+    assert "Coverslip thickness" in warnings[0]
+
+    app.exp_coverslip_thickness_um_var.set(175.0)
+    params = app._collect_params()
+    assert params["n_i"] == 1.518
+    assert params["t_g"] == pytest.approx(175e-6)
+
+
+@pytest.mark.gui
+def test_failed_config_load_rolls_back_controls_and_dip_in_lock(tmp_path):
+    app = _gui_control_app()
+
+    class Widget:
+        state = "normal"
+
+        def configure(self, *, state):
+            self.state = state
+
+    app.dip_in_check = Widget()
+    app._dip_in_linked_entries = [Widget() for _ in range(4)]
+    app.aberration_model_combo = Widget()
+    app._apply_params_to_controls({**psf_cli.DEFAULT_PARAMS, "t_s": 12e-6})
+    app.dip_in_enabled_var.set(True)
+    app._on_dip_in_toggle()
+    snapshot = dict(app._dip_in_previous_values)
+    before = app._collect_control_values()
+    app.config_extensions = {"keep": 1}
+
+    # wavelength is applied before nx fails, so a partial load would show it.
+    with pytest.raises(ValueError, match="nx"):
+        app._apply_control_values({**before, "dip_in_enabled": False, "wavelength_nm": 900.0, "nx": "abc"})
+    assert app.dip_in_enabled_var.get() is True
+    assert app._dip_in_previous_values == snapshot
+    assert all(entry.state == "disabled" for entry in app._dip_in_linked_entries)
+    assert app.aberration_model_combo.state == "disabled"
+    assert app._collect_control_values() == before
+
+    path = tmp_path / "bad.json"
+    path.write_text(json.dumps({
+        "format": "psf_sim_gui_config", "version": 2, "extra": 1,
+        "params": {**psf_cli.DEFAULT_PARAMS, "wavelength": 900e-9},
+        "ui_values": {"nx": "abc"},
+    }), encoding="utf-8")
+    with pytest.raises(ValueError, match="nx"):
+        app._load_simulation_config_from_path(str(path))
+    assert app.config_extensions == {"keep": 1}
+    assert app._collect_control_values() == before
+
+
+@pytest.mark.gui
+def test_integer_controls_load_as_integers():
+    app = _gui_control_app()
+    app._apply_control_values({"nx": 512, "points_2d": 101.0})
+    assert app.nx_var.get() == 512
+    assert isinstance(app.nx_var.get(), int)
+    assert isinstance(app.points_2d_var.get(), int)
+
+
+@pytest.mark.gui
+def test_simulation_worker_runs_on_the_main_thread_snapshot():
+    app = _gui_control_app()
+    params = app._collect_params()
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("the worker thread must not read Tk variables or loaded masks")
+
+    app._collect_params = forbidden
+    app._get_input_mask = forbidden
+    scheduled = []
+    seen = {}
+    successes = []
+
+    class Root:
+        def after(self, _delay, callback):
+            scheduled.append(callback)
+
+    class FakeSimulator:
+        integration_mode = "cartesian_jacobian"
+
+        def simulate_full_pipeline(self, **kwargs):
+            seen.update(kwargs)
+            return {"ok": True}
+
+    app.root = Root()
+    app.stop_requested = False
+    app._create_simulator_from_params = lambda _params: FakeSimulator()
+    app._on_run_success = lambda _sim, p, res2d, _res3d, _ran_3d: successes.append((p, res2d))
+    app._on_run_error = lambda detail: pytest.fail(detail)
+    mask = np.ones((4, 4))
+    post_mask = np.ones((4, 4), dtype=np.complex128)
+    app._worker_logic(False, params, mask, post_mask)
+    for callback in scheduled:
+        callback()
+    assert successes == [(params, {"ok": True})]
+    assert seen["input_intensity"] is mask
+    assert seen["post_fresnel_mask"] is post_mask

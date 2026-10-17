@@ -16,7 +16,13 @@ from psf_io import (
     read_unsafe_legacy_pickle,
     write_safe_container,
 )
-from psf_runtime import create_simulator, enforce_resource_limits, estimate_resources
+from psf_runtime import (
+    create_simulator,
+    enforce_resource_limits,
+    estimate_resources,
+    pupil_sampling_report,
+    sampling_warning,
+)
 
 torch = None
 F = None
@@ -1246,6 +1252,7 @@ def profile_summary(params, profile_result, plot_mode="I", normalized=True, mask
                 "experimental_coverslip_thickness_um": float(params["t_g"]) * 1e6,
                 "design_coverslip_thickness_um": float(params["t_gd"]) * 1e6,
             },
+            "sampling": pupil_sampling_report(params),
             "pupil_trimmed_for_psf": bool(profile_result.get("pupil_trimmed_for_psf", False)),
         }
     )
@@ -1509,6 +1516,7 @@ def build_summary(params, simulator, results_2d, results_3d=None, plot_mode="I",
             ),
             "torch_device": str(params["torch_device"]),
         },
+        "sampling": pupil_sampling_report(params, simulator),
         "psf": {
             "focus_z_um": export["focus_z_um"],
             "fwhm_x_um": float(results_2d.get("fwhm_x_um", np.nan)),
@@ -1682,6 +1690,9 @@ def preflight_request(
         estimate,
         allow_expensive=bool(getattr(args, "allow_expensive", False)),
     )
+    message = sampling_warning(pupil_sampling_report(params))
+    if message:
+        print(f"warning: {message}", file=sys.stderr)
     return estimate
 
 

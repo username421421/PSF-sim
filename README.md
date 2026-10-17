@@ -98,13 +98,14 @@ a substrate beyond focus, not a layer traversed by the incident beam.
 
 In **Experimental Values**, turn on **Dip-in lens (directly in resin)**.
 This links immersion and placeholder coverslip RI to the editable resin RI,
-sets experimental coverslip thickness and resin position to zero, and locks
-`gibson_lanni`. The linked fields are disabled and greyed out. Turning the toggle off
-restores the previous medium settings and selects the original `legacy` model.
-The toggle is the only model selector in the GUI, including when loading saved
-settings or starting a simulation. The toggle and restore
-values are saved with GUI configurations. Objective design values, NA, pupil
-diameter, illumination, and sampling remain independently configurable.
+sets experimental coverslip thickness and resin position to zero, and locks the
+**Aberration model** selector (Optics) to `gibson_lanni`. The linked fields are
+disabled and greyed out. Turning the toggle off restores the previous medium
+settings and the model selected before. Outside dip-in the selector chooses
+`legacy` or `gibson_lanni` freely, and loaded configurations keep their model.
+The toggle and restore values are saved with GUI configurations. Objective
+design values, NA, pupil diameter, illumination, and sampling remain
+independently configurable.
 
 For the illustrative 63× configuration, load
 `examples/leica_63x_resin_dip_in.json` with **Load Config**, or run:
@@ -169,8 +170,38 @@ two-photon excitation proxy, not a prediction of developed voxel size.
 
 The example uses finer polar integration and a ±25 µm axial range because
 immersion mismatch can create rapid pupil phase variation and a large focus
-shift. Check convergence by increasing theta samples, and check that the
-peak and both width crossings lie inside the axial range.
+shift: about 21 waves across the pupil here. Before each run the GUI and CLI
+compare the largest phase change between neighbouring integration samples
+(θ steps in polar mode, pupil pixels in Cartesian mode, including defocus over
+the requested z range) with the Nyquist limit π, and warn with a suggested
+sample count when it is exceeded. With the default 61 θ samples this example
+gives an axial FWHM of 0.72 µm instead of the converged 3.04 µm. CLI summaries
+include the check as a `sampling` block. Also check that the peak and both
+width crossings lie inside the axial range.
+
+### Optical model and literature
+
+The references are in `Literature/`.
+
+- `legacy` is the Nasse & Woehl (2010) illumination PSF: aberration phase
+  Ψ − Ψ*, coverslip phase β − β*, and the aplanatic apodization evaluated at the
+  design angle n_id sin θ* = n_i sin θ. It omits the optical path through the
+  immersion layer itself.
+- `gibson_lanni` sums the layer optical paths from the objective (Török &
+  Varga 1997, Eq. 28, with the objective as the first medium). It adds the
+  immersion-gap path, which matters whenever the immersion differs from the
+  design immersion, e.g. dip-in.
+- Effective NA follows Nasse & Woehl Sec. 2: total internal reflection at the
+  objective → immersion → coverslip → sample interfaces limits the aperture to
+  `NA_eff = min(NA, n_i, n_g, n_s)`. An NA above the immersion RI (an oil
+  objective dipped into a lower-index resin) truncates the pupil rather than
+  raising an error. The NA must stay below the design immersion RI `n_id`.
+- Multiple reflections in the coverslip use the Airy denominator of Török &
+  Varga Eq. 32, `1 + r12 r23 exp(2iβ)`, with the actual coverslip phase only.
+  Nasse & Woehl Eq. 8 (and the original MATLAB code) also put the design phase
+  β* in this denominator, which adds reflected light in phase at every angle
+  when the coverslip matches the design (about +7% rim amplitude for a dry
+  NA 0.95 objective). Index-matched oil objectives are unaffected.
 
 - A lower downstream refractive index truncates nominal pupil support; it does
   not stretch the accessible pupil to the rim. Summaries report requested and

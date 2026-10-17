@@ -1,7 +1,7 @@
 import hashlib
 import weakref
 from collections import OrderedDict
-from math import asin, isclose, isfinite, log2, pi, prod
+from math import asin, ceil, isclose, isfinite, log2, pi, prod, sin
 
 import numpy as np
 import torch
@@ -326,16 +326,23 @@ class CartesianPSFSimulator:
             raise ValueError("phi_samples must be >= 8.")
         if self.NA <= 0:
             raise ValueError("NA must be positive.")
-        if self.NA > self.n_i:
-            raise ValueError("NA must be <= n_i for theta_max = asin(NA/n_i).")
+        if self.NA >= self.n_id:
+            # Design rays satisfy n_id*sin(theta_d) = NA, so NA >= n_id has no
+            # real design angle and the design apodization/phase turn into NaN.
+            raise ValueError(
+                f"NA ({self.NA:g}) must be below the design immersion RI n_id ({self.n_id:g})."
+            )
         if self.integration_mode not in {"cartesian_jacobian", "polar_interp"}:
             raise ValueError("integration_mode must be 'cartesian_jacobian' or 'polar_interp'.")
         if self.pupil_trim_margin_pixels < 0:
             raise ValueError("pupil_trim_margin_pixels must be >= 0.")
 
         self.k = 2.0 * pi / self.wavelength
-        self.theta_max_nominal = asin(self.NA / self.n_i)
-        # Effective angular support is limited by any lower-index downstream medium.
+        self.theta_max_nominal = asin(min(1.0, self.NA / self.n_i))
+        # Nasse & Woehl (2010), Sec. 2: total internal reflection at the
+        # objective->immersion->coverslip->sample interfaces limits the usable
+        # aperture to NA_eff = min(NA, n1, n2, n3). An NA above the immersion
+        # RI (e.g. an oil objective dipped into resin) truncates the pupil.
         self.NA_eff = min(self.NA, self.n_i, self.n_g, self.n_s)
         self.theta_max = asin(min(1.0, max(-1.0, self.NA_eff / self.n_i)))
         if self.theta_min < 0:
@@ -392,6 +399,31 @@ class CartesianPSFSimulator:
                 self._device_cache_limit_bytes = 128 * 1024**2
         else:
             self._device_cache_limit_bytes = self._cpu_cache_limit_bytes
+
+    def constructor_kwargs(self):
+        """Keyword arguments that rebuild this optical model, e.g. for fast-path copies."""
+        return {
+            "wavelength": self.wavelength,
+            "NA": self.NA,
+            "theta_min": self.theta_min,
+            "theta_samples": self.theta_samples,
+            "phi_samples": self.phi_samples,
+            "t_gd": self.t_gd,
+            "n_gd": self.n_gd,
+            "t_id": self.t_id,
+            "n_id": self.n_id,
+            "n_sd": self.n_sd,
+            "t_g": self.t_g,
+            "n_g": self.n_g,
+            "t_s": self.t_s,
+            "n_s": self.n_s,
+            "n_i": self.n_i,
+            "integration_mode": self.integration_mode,
+            "aberration_model": self.aberration_model,
+            "torch_device": str(self.device),
+            "trim_pupil_for_psf": self.trim_pupil_for_psf,
+            "pupil_trim_margin_pixels": self.pupil_trim_margin_pixels,
+        }
 
     def _to_torch_float(self, arr):
         return _torch_float64(arr, device=self.device)
@@ -1332,6 +1364,28 @@ class CartesianPSFSimulator:
             + self.h_1d * self.n_id * torch.cos(theta_id)
         )
 
+    @staticmethod
+    def _fresnel_coefficients(n_a, cos_a, n_b, cos_b):
+        """s/p transmission and reflection from medium a into b (Torok & Varga, Eqs. 18-19)."""
+        if n_a == n_b:
+            # No interface. The general formulas are 0/0 at grazing incidence,
+            # which NA_eff = n_i (Nasse & Woehl truncation) can reach.
+            one = torch.ones_like(cos_b)
+            zero = torch.zeros_like(cos_b)
+            return one, one, zero, zero
+        t_s = (2 * n_a * cos_a) / (n_a * cos_a + n_b * cos_b)
+        t_p = (2 * n_a * cos_a) / (n_b * cos_a + n_a * cos_b)
+        r_s = (n_a * cos_a - n_b * cos_b) / (n_a * cos_a + n_b * cos_b)
+        r_p = (n_b * cos_a - n_a * cos_b) / (n_b * cos_a + n_a * cos_b)
+        return t_s, t_p, r_s, r_p
+
+    def _glass_phases(self, theta_t):
+        """Actual and design coverslip phases beta_2, beta_2* (Nasse & Woehl, Eq. 8)."""
+        beta_2 = self.k * self.n_g * self.t_g * torch.cos(self._theta_2(theta_t))
+        theta_beta_d = self._safe_asin(self.n_i * torch.sin(theta_t) / self.n_gd)
+        beta_2d = self.k * self.n_gd * self.t_gd * torch.cos(theta_beta_d)
+        return beta_2, beta_2d
+
     def _transmission_terms(self, theta):
         theta_t = self._to_torch_float(theta)
         theta_2 = self._theta_2(theta_t)
@@ -1341,44 +1395,114 @@ class CartesianPSFSimulator:
         cos_theta_2 = torch.cos(theta_2)
         cos_theta_3 = torch.cos(theta_3)
 
-        t_1_s = (2 * self.n_i * cos_theta) / (
-            self.n_i * cos_theta + self.n_g * cos_theta_2
+        t_1_s, t_1_p, r_1_s, r_1_p = self._fresnel_coefficients(
+            self.n_i, cos_theta, self.n_g, cos_theta_2
         )
-        t_1_p = (2 * self.n_i * cos_theta) / (
-            self.n_g * cos_theta + self.n_i * cos_theta_2
-        )
-        r_1_s = (self.n_i * cos_theta - self.n_g * cos_theta_2) / (
-            self.n_i * cos_theta + self.n_g * cos_theta_2
-        )
-        r_1_p = (self.n_g * cos_theta - self.n_i * cos_theta_2) / (
-            self.n_g * cos_theta + self.n_i * cos_theta_2
+        t_2_s, t_2_p, r_2_s, r_2_p = self._fresnel_coefficients(
+            self.n_g, cos_theta_2, self.n_s, cos_theta_3
         )
 
-        t_2_s = (2 * self.n_g * cos_theta_2) / (
-            self.n_g * cos_theta_2 + self.n_s * cos_theta_3
-        )
-        t_2_p = (2 * self.n_g * cos_theta_2) / (
-            self.n_s * cos_theta_2 + self.n_g * cos_theta_3
-        )
-        r_2_s = (self.n_g * cos_theta_2 - self.n_s * cos_theta_3) / (
-            self.n_g * cos_theta_2 + self.n_s * cos_theta_3
-        )
-        r_2_p = (self.n_s * cos_theta_2 - self.n_g * cos_theta_3) / (
-            self.n_s * cos_theta_2 + self.n_g * cos_theta_3
-        )
+        beta_2, beta_2d = self._glass_phases(theta_t)
 
-        beta_2 = self.k * self.n_g * self.t_g * cos_theta_2
-        theta_beta_d = self._safe_asin(self.n_i * torch.sin(theta_t) / self.n_gd)
-        beta_2d = self.k * self.n_gd * self.t_gd * torch.cos(theta_beta_d)
-
+        # The design coverslip only adds the compensating phase -beta_2*; light
+        # reverberates inside the actual coverslip, so the multiple-reflection
+        # denominator carries 2*beta_2 alone (Torok & Varga, Eq. 32).
         phase = torch.exp(1j * (beta_2 - beta_2d))
-        d_2_s = 1 + r_1_s * r_2_s * torch.exp(2j * (beta_2 - beta_2d))
-        d_2_p = 1 + r_1_p * r_2_p * torch.exp(2j * (beta_2 - beta_2d))
+        d_2_s = 1 + r_1_s * r_2_s * torch.exp(2j * beta_2)
+        d_2_p = 1 + r_1_p * r_2_p * torch.exp(2j * beta_2)
 
         t_s = t_2_s * t_1_s * phase / d_2_s
         t_p = t_2_p * t_1_p * phase / d_2_p
 
         return t_s, t_p, theta_3
+
+    def pupil_phase_sampling(
+        self,
+        *,
+        entrance_pupil_diameter,
+        shape,
+        size_x,
+        size_y,
+        range_z_m=0.0,
+        range_r_m=0.0,
+        samples=4096,
+    ):
+        """
+        Largest change of the pupil-integrand phase between neighbouring samples.
+
+        The phase is k*W(theta) + beta_2 - beta_2* plus the defocus
+        k*n_s*z*cos(theta_3) and lateral k*n_i*r*sin(theta) terms at the edge of
+        the requested scan. Steps above pi per sample alias the aberration and
+        silently corrupt the PSF, e.g. the ~20-wave dip-in mismatch at the
+        default 61 theta samples.
+        """
+        z = abs(float(range_z_m))
+        r = abs(float(range_r_m))
+        s_min = sin(self.theta_min)
+        s_max = float(self.NA_eff / self.n_i)
+
+        def aberration_phase(theta):
+            beta_2, beta_2d = self._glass_phases(theta)
+            return torch.real(self.k * self._w_abb(theta) + beta_2 - beta_2d)
+
+        def axial_term(theta):
+            return torch.real(self.k * self.n_s * torch.cos(self._theta_3(theta)))
+
+        def max_radial_step(step, sine_grid):
+            lo, hi = (s_min, s_max) if sine_grid else (self.theta_min, self.theta_max)
+            step = min(float(step), hi - lo)
+            start = torch.linspace(lo, hi - step, int(samples), dtype=torch.float64, device=self.device)
+            if sine_grid:
+                theta_a = torch.asin(torch.clamp(start, 0.0, 1.0))
+                theta_b = torch.asin(torch.clamp(start + step, 0.0, 1.0))
+            else:
+                theta_a, theta_b = start, start + step
+            d_aberration = aberration_phase(theta_b) - aberration_phase(theta_a)
+            d_axial = axial_term(theta_b) - axial_term(theta_a)
+            d_lateral = self.k * self.n_i * (torch.sin(theta_b) - torch.sin(theta_a))
+            # The defocus enters linearly in z, so the worst step is at +/- range_z.
+            worst = torch.maximum(
+                torch.abs(d_aberration + z * d_axial), torch.abs(d_aberration - z * d_axial)
+            )
+            return float(torch.max(worst + r * torch.abs(d_lateral)).item())
+
+        polar_step = max_radial_step(
+            (self.theta_max - self.theta_min) / (self.theta_samples - 1), sine_grid=False
+        )
+        azimuthal_step = self.k * self.n_i * r * s_max * 2.0 * pi / self.phi_samples
+        target = 0.5 * pi
+        pixels = max(int(shape[0]), int(shape[1]))
+        if self.integration_mode == "polar_interp":
+            max_step = max(polar_step, azimuthal_step)
+            pixels_needed = None
+        else:
+            pixel = max(float(size_x) / int(shape[0]), float(size_y) / int(shape[1]))
+            pixel_step = pixel * float(self.NA / self.n_i) / (0.5 * float(entrance_pupil_diameter))
+            max_step = max_radial_step(pixel_step, sine_grid=True)
+            pixels_needed = max(pixels, int(ceil(pixels * max_step / target)))
+        theta_fine = torch.linspace(
+            self.theta_min, self.theta_max, int(samples), dtype=torch.float64, device=self.device
+        )
+        aberration = aberration_phase(theta_fine)
+        return {
+            "integration_mode": self.integration_mode,
+            "max_phase_step_rad": float(max_step),
+            "limit_rad": pi,
+            "undersampled": bool(max_step > pi),
+            "aberration_waves": float((aberration.max() - aberration.min()).item() / (2.0 * pi)),
+            "current": {
+                "theta_samples": self.theta_samples,
+                "phi_samples": self.phi_samples,
+                "pixels": pixels,
+            },
+            "suggested": {
+                "theta_samples": max(
+                    self.theta_samples, int(ceil((self.theta_samples - 1) * polar_step / target)) + 1
+                ),
+                "phi_samples": max(self.phi_samples, int(ceil(self.phi_samples * azimuthal_step / target))),
+                "pixels": pixels_needed,
+            },
+        }
 
     def _prepare_integration_tables_polar_interp(
         self, pupil_field, size_x, size_y, entrance_pupil_diameter
@@ -1585,11 +1709,8 @@ class CartesianPSFSimulator:
             yp = yg[inside]
             flat_inside = torch.nonzero(inside.reshape(-1), as_tuple=False).reshape(-1).to(torch.int64)
 
-            sin_theta = torch.clamp(
-                (r[inside] / pupil_radius) * nominal_sin_theta_max,
-                0.0,
-                float(self.NA_eff / self.n_i),
-            )
+            s_center = (r[inside] / pupil_radius) * nominal_sin_theta_max
+            sin_theta = torch.clamp(s_center, 0.0, float(self.NA_eff / self.n_i))
             if self.theta_min > 0:
                 sin_theta_min = torch.sin(
                     torch.tensor(self.theta_min, dtype=torch.float64, device=self.device)
@@ -1598,6 +1719,7 @@ class CartesianPSFSimulator:
                 xp = xp[keep]
                 yp = yp[keep]
                 flat_inside = flat_inside[keep]
+                s_center = s_center[keep]
                 sin_theta = sin_theta[keep]
                 if int(sin_theta.numel()) == 0:
                     raise ValueError("No Cartesian points remain after theta_min filtering.")
@@ -1620,9 +1742,24 @@ class CartesianPSFSimulator:
 
             dx = size_x / nx
             dy = size_y / ny
-            jacobian = (nominal_sin_theta_max**2 / (pupil_radius**2)) * (dx * dy) / torch.clamp(
-                cos_theta, 1e-12, None
-            )
+            if float(self.NA_eff) >= float(self.n_i):
+                # The truncated pupil reaches theta = 90 deg in the immersion,
+                # where the 1/cos(theta) weight is singular but integrable.
+                # Integrate it across each pixel's radial extent rather than
+                # sampling a centre that may sit exactly on the rim.
+                half_width = 0.5 * (nominal_sin_theta_max / pupil_radius) * float(dx * dy) ** 0.5
+                s_lo = torch.clamp(s_center - half_width, min=0.0)
+                s_hi = s_center + half_width
+                s_hi_inside = torch.clamp(s_hi, max=1.0)
+                mean_inv_cos = (
+                    torch.sqrt(torch.clamp(1.0 - s_lo**2, min=0.0))
+                    - torch.sqrt(torch.clamp(1.0 - s_hi_inside**2, min=0.0))
+                ) / (0.5 * (s_hi**2 - s_lo**2))
+                jacobian = (nominal_sin_theta_max**2 / (pupil_radius**2)) * (dx * dy) * mean_inv_cos
+            else:
+                jacobian = (nominal_sin_theta_max**2 / (pupil_radius**2)) * (dx * dy) / torch.clamp(
+                    cos_theta, 1e-12, None
+                )
             prefactor = self._design_apodization(theta) * torch.exp(1j * self.k * w_abb) * jacobian
 
             geom = {

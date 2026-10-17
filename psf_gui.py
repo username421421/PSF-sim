@@ -6,6 +6,7 @@ if __name__ == "__main__":
 
         raise SystemExit(_early_cli_main(_early_sys.argv[1:]))
 
+import contextlib
 import csv
 import copy
 import threading
@@ -32,7 +33,13 @@ from psf_cli import (
     resize_mask as resize_mask_array,
     save_result as save_result_file,
 )
-from psf_runtime import create_simulator, enforce_resource_limits, estimate_resources
+from psf_runtime import (
+    create_simulator,
+    enforce_resource_limits,
+    estimate_resources,
+    pupil_sampling_report,
+    sampling_warning,
+)
 from plot_style import (
     add_compact_colorbar,
     apply_publication_style,
@@ -343,7 +350,7 @@ class PSFSimulatorApp:
         self.exp_resin_ri_var = tk.DoubleVar(value=1.474)
         self.exp_resin_thickness_um_var = tk.DoubleVar(value=1.0)
         self.dip_in_enabled_var = tk.BooleanVar(value=False)
-        self.dip_in_model_description_var = tk.StringVar(value="Standard: original objective model.")
+        self.aberration_model_description_var = tk.StringVar(value="")
         self._dip_in_previous_values = None
 
         self.design_immersion_ri_var = tk.DoubleVar(value=1.515)
@@ -371,6 +378,19 @@ class PSFSimulatorApp:
         self.phi_samples_entry = ttk.Entry(opt_group, textvariable=self.phi_samples_var)
         self.phi_samples_entry.pack(fill="x", pady=(0, 4))
         self._on_integration_mode_change()
+        ttk.Label(opt_group, text="Aberration model").pack(anchor="w")
+        self.aberration_model_combo = ttk.Combobox(
+            opt_group,
+            textvariable=self.aberration_model_var,
+            state="readonly",
+            values=("legacy", "gibson_lanni"),
+        )
+        self.aberration_model_combo.pack(fill="x", pady=(0, 2))
+        ttk.Label(
+            opt_group, textvariable=self.aberration_model_description_var, wraplength=330,
+        ).pack(fill="x", pady=(0, 4))
+        self.aberration_model_var.trace_add("write", self._update_model_description)
+        self._update_model_description()
         design_media_group = ttk.LabelFrame(opt_group, text="Design Values", padding=6)
         design_media_group.pack(fill="x", pady=(0, 2))
 
@@ -396,10 +416,6 @@ class PSFSimulatorApp:
             variable=self.dip_in_enabled_var, command=self._on_dip_in_toggle,
         )
         self.dip_in_check.pack(anchor="w", pady=(0, 4))
-        ttk.Label(
-            exp_media_group, textvariable=self.dip_in_model_description_var,
-            wraplength=330,
-        ).pack(fill="x", pady=(0, 4))
         self._dip_in_linked_entries = [
             self._entry(exp_media_group, "Immersion medium RI", self.exp_immersion_ri_var),
             self._entry(exp_media_group, "Coverslip RI", self.exp_coverslip_ri_var),
@@ -415,7 +431,7 @@ class PSFSimulatorApp:
             entry.configure(style="LinkedMedium.TEntry")
         ttk.Label(
             exp_media_group,
-            text="Dip-in uses resin as the immersion medium, with the coverslip beyond focus. Turning it off restores your previous settings.",
+            text="Dip-in uses resin as the immersion medium (Gibson-Lanni model), with the coverslip beyond focus. Turning it off restores your previous settings.",
             wraplength=330,
         ).pack(fill="x", pady=(0, 4))
         self.exp_resin_ri_var.trace_add("write", self._sync_dip_in_media)
@@ -627,11 +643,45 @@ class PSFSimulatorApp:
             "aberration_model": self.aberration_model_var,
         }
 
+    _DIP_IN_FIELD_LABELS = {
+        "n_i": "Immersion medium RI",
+        "n_g": "Coverslip RI",
+        "t_g_um": "Coverslip thickness",
+        "t_s_um": "Resin thickness / PSF position",
+    }
+    _MODEL_DESCRIPTIONS = {
+        "legacy": "Nasse-Woehl: coverslip corrected to the design; no immersion-layer path.",
+        "gibson_lanni": "Gibson-Lanni layers: adds the immersion-gap path (Torok-Varga Eq. 28).",
+    }
+
+    def _dip_in_snapshot(self):
+        snapshot = {}
+        for key, var in self._dip_in_value_vars().items():
+            if key == "aberration_model":
+                snapshot[key] = str(var.get()).strip().lower()
+                continue
+            try:
+                value = float(var.get())
+            except (tk.TclError, ValueError):
+                value = float("nan")
+            if not np.isfinite(value):
+                label = self._DIP_IN_FIELD_LABELS[key]
+                raise ValueError(f"Finish editing '{label}' before enabling dip-in.")
+            snapshot[key] = value
+        return snapshot
+
     def _on_dip_in_toggle(self):
         if self.dip_in_enabled_var.get():
-            self._dip_in_previous_values = {
-                key: var.get() for key, var in self._dip_in_value_vars().items()
-            }
+            try:
+                snapshot = self._dip_in_snapshot()
+            except ValueError as exc:
+                # Without a snapshot the layered settings could never be
+                # restored, so stay in standard mode until the field is valid.
+                self.dip_in_enabled_var.set(False)
+                self._update_dip_in_controls()
+                messagebox.showwarning("Dip-in lens", str(exc))
+                return
+            self._dip_in_previous_values = snapshot
         else:
             previous = getattr(self, "_dip_in_previous_values", None)
             if previous:
@@ -641,15 +691,21 @@ class PSFSimulatorApp:
         self._sync_dip_in_media()
         self._update_dip_in_controls()
 
+    def _update_model_description(self, *_args):
+        model = str(self.aberration_model_var.get()).strip().lower()
+        text = self._MODEL_DESCRIPTIONS.get(model, model)
+        if bool(self.dip_in_enabled_var.get()):
+            text = f"Dip-in (resin as immersion). {text}"
+        self.aberration_model_description_var.set(text)
+
     def _sync_dip_in_media(self, *_args):
         dipping = bool(self.dip_in_enabled_var.get())
-        # The GUI toggle owns model selection, including after config loading
-        # and immediately before submitting work to the shared simulator.
-        self.aberration_model_var.set("gibson_lanni" if dipping else "legacy")
-        self.dip_in_model_description_var.set(
-            "Dip-in: includes immersion mismatch." if dipping
-            else "Standard: original objective model."
-        )
+        if dipping:
+            # Resin replaces the design immersion over the whole working
+            # distance, which only the layered Gibson-Lanni phase describes.
+            # Outside dip-in the user's (or loaded config's) model is kept.
+            self.aberration_model_var.set("gibson_lanni")
+        self._update_model_description()
         if not dipping:
             return
         try:
@@ -667,9 +723,12 @@ class PSFSimulatorApp:
         busy = bool(getattr(self, "is_running", False) or getattr(self, "opt_is_running", False))
         if hasattr(self, "dip_in_check"):
             self.dip_in_check.configure(state="disabled" if busy else "normal")
-        state = "disabled" if self.dip_in_enabled_var.get() else "normal"
+        dipping = bool(self.dip_in_enabled_var.get())
+        state = "disabled" if dipping else "normal"
         for entry in getattr(self, "_dip_in_linked_entries", ()):
             entry.configure(state=state)
+        if hasattr(self, "aberration_model_combo"):
+            self.aberration_model_combo.configure(state="disabled" if dipping else "readonly")
 
     def _restore_dip_in_control_state(self, values, *, core_units=False):
         flag = values.get("dip_in_enabled")
@@ -677,7 +736,7 @@ class PSFSimulatorApp:
             glass_key, sample_key = ("t_g", "t_s") if core_units else ("t_g_um", "t_s_um")
             try:
                 flag = (
-                    values.get("aberration_model") == "gibson_lanni"
+                    str(values.get("aberration_model", "")).strip().lower() == "gibson_lanni"
                     and float(values["n_i"]) == float(values["n_g"]) == float(values["n_s"])
                     and float(values[glass_key]) == 0.0
                     and float(values[sample_key]) == 0.0
@@ -705,7 +764,8 @@ class PSFSimulatorApp:
                 if not np.isfinite(value) or value < 0 or (key.startswith("n_") and value == 0):
                     raise ValueError("Invalid previous dip-in medium values.")
                 previous[key] = value
-            if previous.get("aberration_model") not in {"legacy", "gibson_lanni"}:
+            previous["aberration_model"] = str(previous.get("aberration_model", "")).strip().lower()
+            if previous["aberration_model"] not in {"legacy", "gibson_lanni"}:
                 raise ValueError("Invalid previous dip-in aberration model.")
         self._dip_in_previous_values = previous if flag else None
         self.dip_in_enabled_var.set(bool(flag))
@@ -1923,7 +1983,7 @@ class PSFSimulatorApp:
                 numeric = float(raw)
                 if (not np.isfinite(numeric)) or (not numeric.is_integer()):
                     raise ValueError(f"{key} must be an integer.")
-                value = int(numeric) * scale
+                value = int(round(numeric * scale))
             else:
                 value = cast(raw) * scale
             if isinstance(value, float) and (not np.isfinite(value)):
@@ -1964,6 +2024,52 @@ class PSFSimulatorApp:
     def _apply_value_specs(self, values, specs):
         for key, var, cast, scale in specs:
             self._set_var_if_present(values, key, var, cast, scale)
+
+    # Non-variable state that loading a config may replace.
+    _TRANSACTION_ATTRIBUTES = (
+        "_dip_in_previous_values",
+        "config_extensions",
+        "mask_array",
+        "post_fresnel_mask_array",
+        "mask_path",
+        "mask_rotation_quadrants",
+    )
+
+    @contextlib.contextmanager
+    def _control_transaction(self):
+        """Roll every control back if applying settings fails part-way."""
+        variables = [
+            value for value in vars(self).values()
+            if all(hasattr(value, name) for name in ("get", "set", "trace_add"))
+        ]
+        # Raw Tcl values also capture half-typed text that get() rejects.
+        saved_variables = [
+            (var, var._tk.globalgetvar(var._name) if hasattr(var, "_tk") else var.get())
+            for var in variables
+        ]
+        # Loading replaces these objects rather than mutating them, so keeping
+        # references is enough (and avoids copying large mask arrays).
+        saved_attributes = {
+            name: getattr(self, name) for name in self._TRANSACTION_ATTRIBUTES if hasattr(self, name)
+        }
+        try:
+            yield
+        except BaseException:
+            for name, value in saved_attributes.items():
+                setattr(self, name, value)
+            for var, raw in saved_variables:
+                if hasattr(var, "_tk"):
+                    var._tk.globalsetvar(var._name, raw)
+                else:
+                    var.set(raw)
+            self._update_dip_in_controls()
+            self._update_model_description()
+            self._on_integration_mode_change()
+            if hasattr(self, "mask_rotation_quadrants"):
+                self._update_mask_orientation_label()
+            self._update_sampling_info()
+            self._refresh_mask_input_preview()
+            raise
 
     def _apply_axis_range_values(self, values):
         loaded_axis_range = False
@@ -2256,67 +2362,68 @@ class PSFSimulatorApp:
     def _apply_control_values(self, values):
         if not isinstance(values, dict):
             raise ValueError("values must be a dictionary.")
-        self.dip_in_enabled_var.set(False)
-        self.aberration_model_var.set("legacy")
-        self.design_immersion_gap_um_var.set(90.0)
+        with self._control_transaction():
+            self.dip_in_enabled_var.set(False)
+            self.aberration_model_var.set("legacy")
+            self.design_immersion_gap_um_var.set(90.0)
 
-        self._apply_value_specs(
-            values,
-            (
-                ("wavelength_nm", self.wavelength_nm_var, float, 1.0),
-                ("NA", self.na_var, float, 1.0),
-                ("theta_samples", self.theta_samples_var, int, 1.0),
-                ("phi_samples", self.phi_samples_var, int, 1.0),
-                ("nx", self.nx_var, int, 1.0),
-                ("ny", self.ny_var, int, 1.0),
-                ("size_x_mm", self.size_x_mm_var, float, 1.0),
-                ("size_y_mm", self.size_y_mm_var, float, 1.0),
-                ("pupil_d_mm", self.pupil_d_mm_var, float, 1.0),
-                ("fresnel_z_m", self.fresnel_z_m_var, float, 1.0),
-                ("points_2d", self.points_2d_var, int, 1.0),
-                ("points_3d", self.points_3d_var, int, 1.0),
-                ("z_chunk", self.z_chunk_var, int, 1.0),
-                ("n_i", self.exp_immersion_ri_var, float, 1.0),
-                ("n_g", self.exp_coverslip_ri_var, float, 1.0),
-                ("t_g_um", self.exp_coverslip_thickness_um_var, float, 1.0),
-                ("n_s", self.exp_resin_ri_var, float, 1.0),
-                ("t_s_um", self.exp_resin_thickness_um_var, float, 1.0),
-                ("n_id", self.design_immersion_ri_var, float, 1.0),
-                ("t_id_um", self.design_immersion_gap_um_var, float, 1.0),
-                ("n_gd", self.design_coverslip_ri_var, float, 1.0),
-                ("t_gd_um", self.design_coverslip_thickness_um_var, float, 1.0),
-                ("n_sd", self.design_resin_ri_var, float, 1.0),
-                ("gauss_wx_mm", self.gauss_wx_mm_var, float, 1.0),
-                ("gauss_wy_mm", self.gauss_wy_mm_var, float, 1.0),
-                ("mask_offset_x_mm", self.mask_offset_x_mm_var, float, 1.0),
-                ("mask_offset_y_mm", self.mask_offset_y_mm_var, float, 1.0),
-            ),
-        )
-        self._set_choice_var_if_valid(
-            values,
-            "torch_device",
-            self.torch_device_var,
-            {"auto", "cpu", "cuda"},
-            lowercase=True,
-        )
-        self._set_choice_var_if_valid(
-            values,
-            "integration_mode",
-            self.integration_mode_var,
-            {"cartesian_jacobian", "polar_interp"},
-            lowercase=True,
-        )
-        self._on_integration_mode_change()
-        self._set_choice_var_if_valid(
-            values, "aberration_model", self.aberration_model_var,
-            {"legacy", "gibson_lanni"}, lowercase=True,
-        )
-        self._apply_axis_range_values(values)
-        self._set_bool_var_if_present(values, "use_gaussian", self.use_gaussian_var)
-        self._restore_dip_in_control_state(values)
+            self._apply_value_specs(
+                values,
+                (
+                    ("wavelength_nm", self.wavelength_nm_var, float, 1.0),
+                    ("NA", self.na_var, float, 1.0),
+                    ("theta_samples", self.theta_samples_var, int, 1.0),
+                    ("phi_samples", self.phi_samples_var, int, 1.0),
+                    ("nx", self.nx_var, int, 1.0),
+                    ("ny", self.ny_var, int, 1.0),
+                    ("size_x_mm", self.size_x_mm_var, float, 1.0),
+                    ("size_y_mm", self.size_y_mm_var, float, 1.0),
+                    ("pupil_d_mm", self.pupil_d_mm_var, float, 1.0),
+                    ("fresnel_z_m", self.fresnel_z_m_var, float, 1.0),
+                    ("points_2d", self.points_2d_var, int, 1.0),
+                    ("points_3d", self.points_3d_var, int, 1.0),
+                    ("z_chunk", self.z_chunk_var, int, 1.0),
+                    ("n_i", self.exp_immersion_ri_var, float, 1.0),
+                    ("n_g", self.exp_coverslip_ri_var, float, 1.0),
+                    ("t_g_um", self.exp_coverslip_thickness_um_var, float, 1.0),
+                    ("n_s", self.exp_resin_ri_var, float, 1.0),
+                    ("t_s_um", self.exp_resin_thickness_um_var, float, 1.0),
+                    ("n_id", self.design_immersion_ri_var, float, 1.0),
+                    ("t_id_um", self.design_immersion_gap_um_var, float, 1.0),
+                    ("n_gd", self.design_coverslip_ri_var, float, 1.0),
+                    ("t_gd_um", self.design_coverslip_thickness_um_var, float, 1.0),
+                    ("n_sd", self.design_resin_ri_var, float, 1.0),
+                    ("gauss_wx_mm", self.gauss_wx_mm_var, float, 1.0),
+                    ("gauss_wy_mm", self.gauss_wy_mm_var, float, 1.0),
+                    ("mask_offset_x_mm", self.mask_offset_x_mm_var, float, 1.0),
+                    ("mask_offset_y_mm", self.mask_offset_y_mm_var, float, 1.0),
+                ),
+            )
+            self._set_choice_var_if_valid(
+                values,
+                "torch_device",
+                self.torch_device_var,
+                {"auto", "cpu", "cuda"},
+                lowercase=True,
+            )
+            self._set_choice_var_if_valid(
+                values,
+                "integration_mode",
+                self.integration_mode_var,
+                {"cartesian_jacobian", "polar_interp"},
+                lowercase=True,
+            )
+            self._on_integration_mode_change()
+            self._set_choice_var_if_valid(
+                values, "aberration_model", self.aberration_model_var,
+                {"legacy", "gibson_lanni"}, lowercase=True,
+            )
+            self._apply_axis_range_values(values)
+            self._set_bool_var_if_present(values, "use_gaussian", self.use_gaussian_var)
+            self._restore_dip_in_control_state(values)
 
-        self._update_sampling_info()
-        self._refresh_mask_input_preview()
+            self._update_sampling_info()
+            self._refresh_mask_input_preview()
 
     def _apply_optimizer_control_values(self, values):
         if not isinstance(values, dict) or (not hasattr(self, "opt_optimizer_var")):
@@ -2385,67 +2492,68 @@ class PSFSimulatorApp:
     def _apply_params_to_controls(self, params):
         if not isinstance(params, dict):
             raise ValueError("params must be a dictionary.")
-        self.dip_in_enabled_var.set(False)
-        self.aberration_model_var.set("legacy")
-        self.design_immersion_gap_um_var.set(90.0)
+        with self._control_transaction():
+            self.dip_in_enabled_var.set(False)
+            self.aberration_model_var.set("legacy")
+            self.design_immersion_gap_um_var.set(90.0)
 
-        self._apply_value_specs(
-            params,
-            (
-                ("wavelength", self.wavelength_nm_var, float, 1e9),
-                ("NA", self.na_var, float, 1.0),
-                ("theta_samples", self.theta_samples_var, int, 1.0),
-                ("phi_samples", self.phi_samples_var, int, 1.0),
-                ("nx", self.nx_var, int, 1.0),
-                ("ny", self.ny_var, int, 1.0),
-                ("size_x", self.size_x_mm_var, float, 1e3),
-                ("size_y", self.size_y_mm_var, float, 1e3),
-                ("pupil_d", self.pupil_d_mm_var, float, 1e3),
-                ("fresnel_z", self.fresnel_z_m_var, float, 1.0),
-                ("points_2d", self.points_2d_var, int, 1.0),
-                ("points_3d", self.points_3d_var, int, 1.0),
-                ("z_chunk", self.z_chunk_var, int, 1.0),
-                ("n_i", self.exp_immersion_ri_var, float, 1.0),
-                ("n_g", self.exp_coverslip_ri_var, float, 1.0),
-                ("t_g", self.exp_coverslip_thickness_um_var, float, 1e6),
-                ("n_s", self.exp_resin_ri_var, float, 1.0),
-                ("t_s", self.exp_resin_thickness_um_var, float, 1e6),
-                ("n_id", self.design_immersion_ri_var, float, 1.0),
-                ("t_id", self.design_immersion_gap_um_var, float, 1e6),
-                ("n_gd", self.design_coverslip_ri_var, float, 1.0),
-                ("t_gd", self.design_coverslip_thickness_um_var, float, 1e6),
-                ("n_sd", self.design_resin_ri_var, float, 1.0),
-                ("gauss_wx", self.gauss_wx_mm_var, float, 1e3),
-                ("gauss_wy", self.gauss_wy_mm_var, float, 1e3),
-                ("mask_offset_x", self.mask_offset_x_mm_var, float, 1e3),
-                ("mask_offset_y", self.mask_offset_y_mm_var, float, 1e3),
-            ),
-        )
-        self._set_choice_var_if_valid(
-            params,
-            "torch_device",
-            self.torch_device_var,
-            {"auto", "cpu", "cuda"},
-            lowercase=True,
-        )
-        self._set_choice_var_if_valid(
-            params,
-            "integration_mode",
-            self.integration_mode_var,
-            {"cartesian_jacobian", "polar_interp"},
-            lowercase=True,
-        )
-        self._on_integration_mode_change()
-        self._set_choice_var_if_valid(
-            params, "aberration_model", self.aberration_model_var,
-            {"legacy", "gibson_lanni"}, lowercase=True,
-        )
-        self._apply_axis_range_values(params)
-        self._set_bool_var_if_present(params, "use_gaussian", self.use_gaussian_var)
-        self._restore_dip_in_control_state(params, core_units=True)
+            self._apply_value_specs(
+                params,
+                (
+                    ("wavelength", self.wavelength_nm_var, float, 1e9),
+                    ("NA", self.na_var, float, 1.0),
+                    ("theta_samples", self.theta_samples_var, int, 1.0),
+                    ("phi_samples", self.phi_samples_var, int, 1.0),
+                    ("nx", self.nx_var, int, 1.0),
+                    ("ny", self.ny_var, int, 1.0),
+                    ("size_x", self.size_x_mm_var, float, 1e3),
+                    ("size_y", self.size_y_mm_var, float, 1e3),
+                    ("pupil_d", self.pupil_d_mm_var, float, 1e3),
+                    ("fresnel_z", self.fresnel_z_m_var, float, 1.0),
+                    ("points_2d", self.points_2d_var, int, 1.0),
+                    ("points_3d", self.points_3d_var, int, 1.0),
+                    ("z_chunk", self.z_chunk_var, int, 1.0),
+                    ("n_i", self.exp_immersion_ri_var, float, 1.0),
+                    ("n_g", self.exp_coverslip_ri_var, float, 1.0),
+                    ("t_g", self.exp_coverslip_thickness_um_var, float, 1e6),
+                    ("n_s", self.exp_resin_ri_var, float, 1.0),
+                    ("t_s", self.exp_resin_thickness_um_var, float, 1e6),
+                    ("n_id", self.design_immersion_ri_var, float, 1.0),
+                    ("t_id", self.design_immersion_gap_um_var, float, 1e6),
+                    ("n_gd", self.design_coverslip_ri_var, float, 1.0),
+                    ("t_gd", self.design_coverslip_thickness_um_var, float, 1e6),
+                    ("n_sd", self.design_resin_ri_var, float, 1.0),
+                    ("gauss_wx", self.gauss_wx_mm_var, float, 1e3),
+                    ("gauss_wy", self.gauss_wy_mm_var, float, 1e3),
+                    ("mask_offset_x", self.mask_offset_x_mm_var, float, 1e3),
+                    ("mask_offset_y", self.mask_offset_y_mm_var, float, 1e3),
+                ),
+            )
+            self._set_choice_var_if_valid(
+                params,
+                "torch_device",
+                self.torch_device_var,
+                {"auto", "cpu", "cuda"},
+                lowercase=True,
+            )
+            self._set_choice_var_if_valid(
+                params,
+                "integration_mode",
+                self.integration_mode_var,
+                {"cartesian_jacobian", "polar_interp"},
+                lowercase=True,
+            )
+            self._on_integration_mode_change()
+            self._set_choice_var_if_valid(
+                params, "aberration_model", self.aberration_model_var,
+                {"legacy", "gibson_lanni"}, lowercase=True,
+            )
+            self._apply_axis_range_values(params)
+            self._set_bool_var_if_present(params, "use_gaussian", self.use_gaussian_var)
+            self._restore_dip_in_control_state(params, core_units=True)
 
-        self._update_sampling_info()
-        self._refresh_mask_input_preview()
+            self._update_sampling_info()
+            self._refresh_mask_input_preview()
 
     def _save_last_used_config(self, params):
         if not isinstance(params, dict):
@@ -2563,70 +2671,71 @@ class PSFSimulatorApp:
         version = int(payload.get("version", 1))
         if version > 2 and payload.get("format") != "psf_sim_gui_last_used_config":
             raise ValueError(f"Unsupported future simulation config version: {version}.")
-        known = {
-            "format",
-            "version",
-            "params",
-            "ui_values",
-            "optimizer_ui_values",
-            "optimizer_settings",
-            "optimizer_last_run",
-            "mask",
-            "extensions",
-        }
-        extensions = payload.get("extensions", {})
-        self.config_extensions = dict(extensions) if isinstance(extensions, dict) else {}
-        for key, value in payload.items():
-            if key not in known:
-                self.config_extensions[str(key)] = self._clone_payload(value)
-        params = payload.get("params")
-        if isinstance(params, dict):
-            self._apply_params_to_controls(self._decode_precise_params(params))
-        ui_values = payload.get("ui_values")
-        if isinstance(ui_values, dict):
-            self._apply_control_values(self._decode_precise_params(ui_values))
-        opt_values = payload.get("optimizer_ui_values") or payload.get("optimizer_settings")
-        if isinstance(opt_values, dict):
-            self._apply_optimizer_control_values(self._decode_precise_params(opt_values))
+        with self._control_transaction():
+            known = {
+                "format",
+                "version",
+                "params",
+                "ui_values",
+                "optimizer_ui_values",
+                "optimizer_settings",
+                "optimizer_last_run",
+                "mask",
+                "extensions",
+            }
+            extensions = payload.get("extensions", {})
+            self.config_extensions = dict(extensions) if isinstance(extensions, dict) else {}
+            for key, value in payload.items():
+                if key not in known:
+                    self.config_extensions[str(key)] = self._clone_payload(value)
+            params = payload.get("params")
+            if isinstance(params, dict):
+                self._apply_params_to_controls(self._decode_precise_params(params))
+            ui_values = payload.get("ui_values")
+            if isinstance(ui_values, dict):
+                self._apply_control_values(self._decode_precise_params(ui_values))
+            opt_values = payload.get("optimizer_ui_values") or payload.get("optimizer_settings")
+            if isinstance(opt_values, dict):
+                self._apply_optimizer_control_values(self._decode_precise_params(opt_values))
 
-        info = payload.get("mask", {})
-        if isinstance(info, dict) and bool(
-            info.get("loaded", info.get("source", "all_pass") != "all_pass")
-        ):
-            raw_path = info.get("path")
-            if raw_path:
-                mask_path = os.path.expanduser(str(raw_path))
-                if not os.path.isabs(mask_path):
-                    mask_path = os.path.join(os.path.dirname(os.path.abspath(path)), mask_path)
-                source = str(info.get("source", "file"))
-                if source in {"builder", "optimized_complex"} or mask_path.lower().endswith(".npz"):
-                    with np.load(mask_path, allow_pickle=False) as data:
-                        if "pre_fresnel_intensity" in data.files:
-                            self.mask_array = np.asarray(
-                                data["pre_fresnel_intensity"], dtype=np.float64
-                            )
-                        if {"complex_mask_real", "complex_mask_imag"}.issubset(data.files):
-                            self.post_fresnel_mask_array = np.asarray(
-                                data["complex_mask_real"], dtype=np.float64
-                            ) + 1j * np.asarray(data["complex_mask_imag"], dtype=np.float64)
-                    self.mask_path = None
-                    self.mask_path_var.set(f"From config sidecar: {mask_path}")
-                else:
-                    self.mask_array = self._read_mask(mask_path)
-                    self.post_fresnel_mask_array = None
-                    self.mask_path = mask_path
-                    self.mask_path_var.set(mask_path)
-                self.mask_rotation_quadrants = int(
-                    info.get("rotation_quadrants_ccw", 0)
-                ) % 4
-                self._update_mask_orientation_label()
-                if self.mask_array is not None:
-                    self.nx_var.set(int(self.mask_array.shape[0]))
-                    self.ny_var.set(int(self.mask_array.shape[1]))
-                self.mask_info_var.set(f"Loaded config mask source: {source}.")
-                self._refresh_mask_input_preview()
-        else:
-            self._clear_loaded_mask(set_status=False)
+            info = payload.get("mask", {})
+            if isinstance(info, dict) and bool(
+                info.get("loaded", info.get("source", "all_pass") != "all_pass")
+            ):
+                raw_path = info.get("path")
+                if raw_path:
+                    mask_path = os.path.expanduser(str(raw_path))
+                    if not os.path.isabs(mask_path):
+                        mask_path = os.path.join(os.path.dirname(os.path.abspath(path)), mask_path)
+                    source = str(info.get("source", "file"))
+                    if source in {"builder", "optimized_complex"} or mask_path.lower().endswith(".npz"):
+                        with np.load(mask_path, allow_pickle=False) as data:
+                            if "pre_fresnel_intensity" in data.files:
+                                self.mask_array = np.asarray(
+                                    data["pre_fresnel_intensity"], dtype=np.float64
+                                )
+                            if {"complex_mask_real", "complex_mask_imag"}.issubset(data.files):
+                                self.post_fresnel_mask_array = np.asarray(
+                                    data["complex_mask_real"], dtype=np.float64
+                                ) + 1j * np.asarray(data["complex_mask_imag"], dtype=np.float64)
+                        self.mask_path = None
+                        self.mask_path_var.set(f"From config sidecar: {mask_path}")
+                    else:
+                        self.mask_array = self._read_mask(mask_path)
+                        self.post_fresnel_mask_array = None
+                        self.mask_path = mask_path
+                        self.mask_path_var.set(mask_path)
+                    self.mask_rotation_quadrants = int(
+                        info.get("rotation_quadrants_ccw", 0)
+                    ) % 4
+                    self._update_mask_orientation_label()
+                    if self.mask_array is not None:
+                        self.nx_var.set(int(self.mask_array.shape[0]))
+                        self.ny_var.set(int(self.mask_array.shape[1]))
+                    self.mask_info_var.set(f"Loaded config mask source: {source}.")
+                    self._refresh_mask_input_preview()
+            else:
+                self._clear_loaded_mask(set_status=False)
         return payload
 
     def _load_simulation_config_dialog(self):
@@ -3463,6 +3572,8 @@ class PSFSimulatorApp:
                 ):
                     return
                 enforce_resource_limits(estimate, allow_expensive=True)
+            if not self._confirm_pupil_sampling(params, "Under-resolved pupil phase"):
+                return
         except Exception as exc:
             messagebox.showerror("Mask optimization", str(exc))
             return
@@ -3999,14 +4110,35 @@ class PSFSimulatorApp:
                 ):
                     return
                 enforce_resource_limits(estimate, allow_expensive=True)
+            if not self._confirm_pupil_sampling(params, "Under-resolved pupil phase"):
+                return
+            # Snapshot everything the worker needs here: Tk variables and the
+            # loaded masks must not be read or written from the worker thread.
+            mask = self._get_input_mask(
+                (params["nx"], params["ny"]),
+                size_x=params["size_x"],
+                size_y=params["size_y"],
+                offset_x=params["mask_offset_x"],
+                offset_y=params["mask_offset_y"],
+            )
         except Exception as exc:
             messagebox.showerror("Resource preflight", str(exc))
             return
         self.stop_requested = False
         self._set_running(True, "Running simulation...")
         self._set_progress(0.0, "Initializing...", force=True)
-        thread = threading.Thread(target=self._worker_logic, args=(run_3d,), daemon=True)
+        thread = threading.Thread(
+            target=self._worker_logic,
+            args=(run_3d, params, mask, self.post_fresnel_mask_array),
+            daemon=True,
+        )
         thread.start()
+
+    def _confirm_pupil_sampling(self, params, title):
+        message = sampling_warning(pupil_sampling_report(params))
+        if message is None:
+            return True
+        return messagebox.askyesno(title, f"{message}\n\nRun anyway?", icon="warning")
 
     def _stop_simulation(self):
         if not self.is_running:
@@ -4014,18 +4146,9 @@ class PSFSimulatorApp:
         self.stop_requested = True
         self._set_progress(float(self.progress_var.get()), "Stopping requested...")
 
-    def _worker_logic(self, run_3d):
+    def _worker_logic(self, run_3d, p, mask, post_fresnel_mask):
         try:
-            p = self._collect_params()
             simulator = self._create_simulator_from_params(p)
-
-            mask = self._get_input_mask(
-                (p["nx"], p["ny"]),
-                size_x=p["size_x"],
-                size_y=p["size_y"],
-                offset_x=p["mask_offset_x"],
-                offset_y=p["mask_offset_y"],
-            )
             stop_cb = lambda: self.stop_requested
 
             def queue_progress(percent, text):
@@ -4068,7 +4191,7 @@ class PSFSimulatorApp:
                         100.0 * prep_share * float(frac), f"Pupil prep: {stage}"
                     ),
                     stop_callback=stop_cb,
-                    post_fresnel_mask=self.post_fresnel_mask_array,
+                    post_fresnel_mask=post_fresnel_mask,
                 )
 
                 res3d = simulator.simulate_psf_volume_from_pupil_field(
@@ -4134,7 +4257,7 @@ class PSFSimulatorApp:
                         100.0 * float(frac), f"2D: {stage}"
                     ),
                     stop_callback=stop_cb,
-                    post_fresnel_mask=self.post_fresnel_mask_array,
+                    post_fresnel_mask=post_fresnel_mask,
                 )
                 res3d = None
 
