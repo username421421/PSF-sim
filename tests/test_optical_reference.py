@@ -58,7 +58,8 @@ def test_cartesian_is_the_library_default():
     assert CartesianPSFSimulator().integration_mode == "cartesian_jacobian"
 
 
-def test_corrected_axial_matches_full_polar_reference():
+@pytest.mark.parametrize("aberration_model", ["legacy", "gibson_lanni"])
+def test_corrected_axial_matches_full_polar_reference(aberration_model):
     kwargs = dict(
         wavelength=780e-9,
         NA=1.4,
@@ -69,6 +70,7 @@ def test_corrected_axial_matches_full_polar_reference():
         phi_samples=80,
         torch_device="cpu",
         integration_mode="polar_interp",
+        aberration_model=aberration_model,
     )
     field = np.ones((64, 64), dtype=np.complex128)
     full = CartesianPSFSimulator(**kwargs).simulate_psf_planes_from_pupil_field(

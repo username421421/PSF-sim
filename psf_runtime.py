@@ -17,6 +17,7 @@ def create_simulator(params: Mapping[str, Any]):
         "theta_samples": int(params["theta_samples"]),
         "phi_samples": int(params["phi_samples"]),
         "integration_mode": str(params.get("integration_mode", "cartesian_jacobian")),
+        "aberration_model": str(params.get("aberration_model", "legacy")),
         "torch_device": str(params.get("torch_device", "cpu")).strip().lower(),
         "n_i": float(params["n_i"]),
         "n_g": float(params["n_g"]),

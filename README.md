@@ -90,6 +90,88 @@ The mask geometry is stored as inner/outer radii and diameters. Mask image files
 
 ## Numerical and file semantics
 
+### Printing below a coverslip with a resin-dipped objective
+
+If the front lens touches resin and the focus is on the underside of a
+coverslip, the incoming path is **objective → resin → focus**. The coverslip is
+a substrate beyond focus, not a layer traversed by the incident beam.
+
+In **Experimental Values**, turn on **Dip-in lens (directly in resin)**.
+This links immersion and placeholder coverslip RI to the editable resin RI,
+sets experimental coverslip thickness and resin position to zero, and locks
+`gibson_lanni`. The linked fields are disabled and greyed out. Turning the toggle off
+restores the previous medium settings and selects the original `legacy` model.
+The toggle is the only model selector in the GUI, including when loading saved
+settings or starting a simulation. The toggle and restore
+values are saved with GUI configurations. Objective design values, NA, pupil
+diameter, illumination, and sampling remain independently configurable.
+
+For the illustrative 63× configuration, load
+`examples/leica_63x_resin_dip_in.json` with **Load Config**, or run:
+
+```powershell
+python psf_gui.py profile --axis z --config examples/leica_63x_resin_dip_in.json --plot-mode I2 --csv dip_in_z.csv
+```
+
+The example assumes the conventional Leica 63×/1.4 oil objective discussed
+here, a nominal 8.89 mm pupil, 1.518 design oil/glass RI, 140 µm design oil gap,
+and 170 µm design coverglass. These are modeling assumptions, not verified
+specifications for a purpose-built dipping lens. Confirm the objective model,
+design coverglass requirement, pupil diameter, and RI at the laser wavelength.
+The [Leica objective finder](https://www.leica-microsystems.com/products/microscope-accessories/microscope-objective-lens/objectivefinder/objective/506349/)
+lists a 63×/1.4 oil model with coverglass and 0.14 mm free working distance.
+
+Use these controls for the direct-dip geometry:
+
+| Control | Value / meaning |
+| --- | --- |
+| Aberration model | `gibson_lanni` |
+| Experimental immersion RI / resin RI | Both `1.474` |
+| Experimental coverslip thickness | `0` µm; the substrate is beyond focus |
+| Experimental coverslip RI | `1.474` as a zero-layer placeholder |
+| Resin thickness / PSF position | `0` µm as a homogeneous-medium reference |
+| Design immersion RI | Objective's intended immersion medium, e.g. `1.518` |
+| Design immersion gap / free WD | Intended front-lens-to-coverglass gap; `140` µm in this example |
+| Design coverslip thickness | Keep the objective's design value; use `0` only for a lens designed without coverglass |
+| Input field size X/Y | `12` mm to contain the estimated `8.89` mm pupil |
+| Fresnel propagation z | `0` for an input field specified at the pupil |
+
+The optional `gibson_lanni` mode adds the full layer optical-path difference
+to the existing vectorial integral. With `q = NA * pupil_radius_fraction`, it
+uses
+
+```text
+W(q) = t_s sqrt(n_s²-q²) + gap sqrt(n_i²-q²) - t_id sqrt(n_id²-q²)
+       + t_g sqrt(n_g²-q²) - t_gd sqrt(n_gd²-q²)
+gap  = n_i (t_id/n_id + t_gd/n_gd - t_g/n_g - t_s/n_s)
+```
+
+The gap sets the paraxial reference focus; the numerical intensity maximum
+may shift away from `z = 0`. The glass phase is included once in the existing
+transmission terms. This follows the design-versus-experimental layer OPD in
+the [Gibson–Lanni model](https://www.aimicroscopy.org/microsc_psf/).
+The default `legacy` mode retains existing simulations' phase convention.
+
+For homogeneous resin (`n_i = n_s`, no incoming coverslip), changing `t_s`
+just reallocates the same total lens-to-focus path; it does not introduce a
+new refracting boundary. This distinguishes dipping from focusing through
+oil and glass into a mismatched resin. The model assumes an ideal objective
+with fixed nominal pupil-to-NA mapping and does not trace its internal lens
+prescription. It also omits the reflected field and other substrate effects
+at the resin–glass printing interface.
+
+Start with an all-pass pupil. Use the actual beam footprint or enable the
+Gaussian envelope to compare pupil filling. Here intensity is
+`exp(-(x/wx)^2-(y/wy)^2)`, so for a circular beam with **1/e² intensity diameter
+D**, set `wx = wy = D/(2*sqrt(2))`; a 5.6 mm beam gives `1.98` mm. A Gaussian
+does not impose a hard effective-NA cutoff. For polymerization, `I^2` is the
+two-photon excitation proxy, not a prediction of developed voxel size.
+
+The example uses finer polar integration and a ±25 µm axial range because
+immersion mismatch can create rapid pupil phase variation and a large focus
+shift. Check convergence by increasing theta samples, and check that the
+peak and both width crossings lie inside the axial range.
+
 - A lower downstream refractive index truncates nominal pupil support; it does
   not stretch the accessible pupil to the rim. Summaries report requested and
   effective NA plus the excluded-pupil fraction.

@@ -16,6 +16,23 @@ run_psf_gui.bat simulate --help
 
 ## Common Workflows
 
+Direct resin dipping for printing on the underside of a coverslip:
+
+```powershell
+python psf_gui.py profile --axis z --config examples/leica_63x_resin_dip_in.json --plot-mode I2 --csv dip_in_z.csv
+```
+
+Use `--aberration-model gibson_lanni` to include immersion-medium mismatch in
+the full layer optical-path phase. `--t-id-um` supplies the design immersion
+gap / free working distance. The example assumes a conventional coverslip
+corrected Leica oil objective; confirm its design values for your lens.
+The experimental glass thickness is zero because the substrate is beyond the
+focus. See the direct-dip section in `README.md` for assumptions, beam-width
+conventions, and model limits.
+Profile summaries report the width of the selected `I` or `I2` signal in
+`width_um`; `intensity_width_um` always retains the width of the unsquared
+optical intensity.
+
 Run a 2D simulation and save app-compatible, CSV, NPZ, and PNG outputs:
 
 ```powershell

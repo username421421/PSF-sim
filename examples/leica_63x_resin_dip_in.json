@@ -1,0 +1,33 @@
+{
+  "format": "psf_sim_cli_config",
+  "version": 2,
+  "notes": "Illustrative direct-resin dipping below a coverslip substrate. Assumes a conventional Leica 63x/1.4 oil objective designed for 170 um coverglass and a 140 um oil gap; verify the actual objective. The coverslip beyond focus is excluded. RI values must be replaced by values at the laser wavelength. Pupil diameter is a nominal estimate, not a measured aperture.",
+  "params": {
+    "wavelength": 7.8e-7,
+    "NA": 1.4,
+    "pupil_d": 0.00889,
+    "aberration_model": "gibson_lanni",
+    "integration_mode": "polar_interp",
+    "theta_samples": 801,
+    "phi_samples": 120,
+    "nx": 512,
+    "ny": 512,
+    "size_x": 0.012,
+    "size_y": 0.012,
+    "n_id": 1.518,
+    "t_id": 0.00014,
+    "n_gd": 1.518,
+    "t_gd": 0.00017,
+    "n_i": 1.474,
+    "n_g": 1.474,
+    "t_g": 0.0,
+    "n_s": 1.474,
+    "t_s": 0.0,
+    "fresnel_z": 0.0,
+    "use_gaussian": false,
+    "range_x_um": 2.0,
+    "range_y_um": 2.0,
+    "range_z_um": 25.0,
+    "points_2d": 501
+  }
+}

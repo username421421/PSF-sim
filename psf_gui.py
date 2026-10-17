@@ -193,6 +193,11 @@ class PSFSimulatorApp:
         )
         style.configure("TButton", font=("Segoe UI", 10, "bold"), padding=6)
         style.configure("TEntry", padding=4)
+        style.map(
+            "LinkedMedium.TEntry",
+            fieldbackground=[("disabled", "#e4e8ed")],
+            foreground=[("disabled", "#737b87")],
+        )
         style.configure("TRadiobutton", background="#f3f5f8", font=("Segoe UI", 10))
         style.configure("TCheckbutton", background="#f3f5f8", font=("Segoe UI", 10))
         style.configure("TNotebook", background="#f3f5f8", borderwidth=0)
@@ -330,14 +335,19 @@ class PSFSimulatorApp:
         self.theta_samples_var = tk.IntVar(value=61)
         self.phi_samples_var = tk.IntVar(value=120)
         self.integration_mode_var = tk.StringVar(value="cartesian_jacobian")
+        self.aberration_model_var = tk.StringVar(value="legacy")
 
         self.exp_immersion_ri_var = tk.DoubleVar(value=1.515)
         self.exp_coverslip_ri_var = tk.DoubleVar(value=1.515)
         self.exp_coverslip_thickness_um_var = tk.DoubleVar(value=170.0)
         self.exp_resin_ri_var = tk.DoubleVar(value=1.474)
         self.exp_resin_thickness_um_var = tk.DoubleVar(value=1.0)
+        self.dip_in_enabled_var = tk.BooleanVar(value=False)
+        self.dip_in_model_description_var = tk.StringVar(value="Standard: original objective model.")
+        self._dip_in_previous_values = None
 
         self.design_immersion_ri_var = tk.DoubleVar(value=1.515)
+        self.design_immersion_gap_um_var = tk.DoubleVar(value=90.0)
         self.design_coverslip_ri_var = tk.DoubleVar(value=1.515)
         self.design_coverslip_thickness_um_var = tk.DoubleVar(value=170.0)
         self.design_resin_ri_var = tk.DoubleVar(value=1.515)
@@ -364,7 +374,8 @@ class PSFSimulatorApp:
         design_media_group = ttk.LabelFrame(opt_group, text="Design Values", padding=6)
         design_media_group.pack(fill="x", pady=(0, 2))
 
-        self._entry(design_media_group, "Immersion oil RI", self.design_immersion_ri_var)
+        self._entry(design_media_group, "Immersion medium RI", self.design_immersion_ri_var)
+        self._entry(design_media_group, "Immersion gap / free WD (um)", self.design_immersion_gap_um_var)
         self._entry(design_media_group, "Coverslip RI", self.design_coverslip_ri_var)
         self._entry(design_media_group, "Coverslip thickness (um)", self.design_coverslip_thickness_um_var)
         objective_lens_row = ttk.Frame(opt_group)
@@ -380,15 +391,34 @@ class PSFSimulatorApp:
 
         exp_media_group = ttk.LabelFrame(parent, text="Experimental Values", padding=8)
         exp_media_group.pack(fill="x", pady=4)
-        self._entry(exp_media_group, "Immersion oil RI", self.exp_immersion_ri_var)
-        self._entry(exp_media_group, "Coverslip RI", self.exp_coverslip_ri_var)
-        self._entry(exp_media_group, "Coverslip thickness (um)", self.exp_coverslip_thickness_um_var)
+        self.dip_in_check = ttk.Checkbutton(
+            exp_media_group, text="Dip-in lens (directly in resin)",
+            variable=self.dip_in_enabled_var, command=self._on_dip_in_toggle,
+        )
+        self.dip_in_check.pack(anchor="w", pady=(0, 4))
+        ttk.Label(
+            exp_media_group, textvariable=self.dip_in_model_description_var,
+            wraplength=330,
+        ).pack(fill="x", pady=(0, 4))
+        self._dip_in_linked_entries = [
+            self._entry(exp_media_group, "Immersion medium RI", self.exp_immersion_ri_var),
+            self._entry(exp_media_group, "Coverslip RI", self.exp_coverslip_ri_var),
+            self._entry(exp_media_group, "Coverslip thickness (um)", self.exp_coverslip_thickness_um_var),
+        ]
         self._entry(exp_media_group, "Resin RI", self.exp_resin_ri_var)
-        self._entry(
+        self._dip_in_linked_entries.append(self._entry(
             exp_media_group,
             "Resin thickness / PSF position (um)",
             self.exp_resin_thickness_um_var,
-        )
+        ))
+        for entry in self._dip_in_linked_entries:
+            entry.configure(style="LinkedMedium.TEntry")
+        ttk.Label(
+            exp_media_group,
+            text="Dip-in uses resin as the immersion medium, with the coverslip beyond focus. Turning it off restores your previous settings.",
+            wraplength=330,
+        ).pack(fill="x", pady=(0, 4))
+        self.exp_resin_ri_var.trace_add("write", self._sync_dip_in_media)
 
         propagation_group = ttk.LabelFrame(parent, text="Propagation", padding=8)
         propagation_group.pack(fill="x", pady=4)
@@ -584,7 +614,103 @@ class PSFSimulatorApp:
     @staticmethod
     def _entry(parent, label, var):
         ttk.Label(parent, text=label).pack(anchor="w")
-        ttk.Entry(parent, textvariable=var).pack(fill="x", pady=(0, 4))
+        entry = ttk.Entry(parent, textvariable=var)
+        entry.pack(fill="x", pady=(0, 4))
+        return entry
+
+    def _dip_in_value_vars(self):
+        return {
+            "n_i": self.exp_immersion_ri_var,
+            "n_g": self.exp_coverslip_ri_var,
+            "t_g_um": self.exp_coverslip_thickness_um_var,
+            "t_s_um": self.exp_resin_thickness_um_var,
+            "aberration_model": self.aberration_model_var,
+        }
+
+    def _on_dip_in_toggle(self):
+        if self.dip_in_enabled_var.get():
+            self._dip_in_previous_values = {
+                key: var.get() for key, var in self._dip_in_value_vars().items()
+            }
+        else:
+            previous = getattr(self, "_dip_in_previous_values", None)
+            if previous:
+                for key, var in self._dip_in_value_vars().items():
+                    var.set(previous[key])
+            self._dip_in_previous_values = None
+        self._sync_dip_in_media()
+        self._update_dip_in_controls()
+
+    def _sync_dip_in_media(self, *_args):
+        dipping = bool(self.dip_in_enabled_var.get())
+        # The GUI toggle owns model selection, including after config loading
+        # and immediately before submitting work to the shared simulator.
+        self.aberration_model_var.set("gibson_lanni" if dipping else "legacy")
+        self.dip_in_model_description_var.set(
+            "Dip-in: includes immersion mismatch." if dipping
+            else "Standard: original objective model."
+        )
+        if not dipping:
+            return
+        try:
+            resin_ri = float(self.exp_resin_ri_var.get())
+        except (ValueError, tk.TclError):
+            return  # Allow an incomplete entry while the user types.
+        if not np.isfinite(resin_ri) or resin_ri <= 0:
+            return
+        self.exp_immersion_ri_var.set(resin_ri)
+        self.exp_coverslip_ri_var.set(resin_ri)
+        self.exp_coverslip_thickness_um_var.set(0.0)
+        self.exp_resin_thickness_um_var.set(0.0)
+
+    def _update_dip_in_controls(self):
+        busy = bool(getattr(self, "is_running", False) or getattr(self, "opt_is_running", False))
+        if hasattr(self, "dip_in_check"):
+            self.dip_in_check.configure(state="disabled" if busy else "normal")
+        state = "disabled" if self.dip_in_enabled_var.get() else "normal"
+        for entry in getattr(self, "_dip_in_linked_entries", ()):
+            entry.configure(state=state)
+
+    def _restore_dip_in_control_state(self, values, *, core_units=False):
+        flag = values.get("dip_in_enabled")
+        if flag is None:
+            glass_key, sample_key = ("t_g", "t_s") if core_units else ("t_g_um", "t_s_um")
+            try:
+                flag = (
+                    values.get("aberration_model") == "gibson_lanni"
+                    and float(values["n_i"]) == float(values["n_g"]) == float(values["n_s"])
+                    and float(values[glass_key]) == 0.0
+                    and float(values[sample_key]) == 0.0
+                )
+            except (KeyError, TypeError, ValueError):
+                flag = False
+        if not isinstance(flag, (bool, np.bool_)):
+            raise ValueError("dip_in_enabled must be a boolean.")
+        previous = values.get("dip_in_previous_values")
+        if flag and previous is None:
+            # Older/manual dip-in configs have no pre-toggle snapshot. Offer
+            # layered settings based on their current objective's design.
+            previous = {
+                "n_i": float(self.design_immersion_ri_var.get()),
+                "n_g": float(self.design_coverslip_ri_var.get()),
+                "t_g_um": float(self.design_coverslip_thickness_um_var.get()),
+                "t_s_um": 1.0, "aberration_model": "legacy",
+            }
+        if previous is not None:
+            if not isinstance(previous, dict):
+                raise ValueError("dip_in_previous_values must be an object.")
+            previous = dict(previous)
+            for key in ("n_i", "n_g", "t_g_um", "t_s_um"):
+                value = float(previous[key])
+                if not np.isfinite(value) or value < 0 or (key.startswith("n_") and value == 0):
+                    raise ValueError("Invalid previous dip-in medium values.")
+                previous[key] = value
+            if previous.get("aberration_model") not in {"legacy", "gibson_lanni"}:
+                raise ValueError("Invalid previous dip-in aberration model.")
+        self._dip_in_previous_values = previous if flag else None
+        self.dip_in_enabled_var.set(bool(flag))
+        self._sync_dip_in_media()
+        self._update_dip_in_controls()
 
     def _on_sampling_param_change(self, *_args):
         self._update_sampling_info()
@@ -1581,6 +1707,7 @@ class PSFSimulatorApp:
 
     def _set_running(self, running, status_text):
         self.is_running = bool(running)
+        self._update_dip_in_controls()
         run_state = "disabled" if (self.is_running or self.opt_is_running) else "normal"
         stop_state = "normal" if self.is_running else "disabled"
         self.run_2d_btn.configure(state=run_state)
@@ -1958,6 +2085,7 @@ class PSFSimulatorApp:
             "NA": float(self.na_var.get()),
             "pupil_d_mm": float(self.pupil_d_mm_var.get()),
             "n_id": float(self.design_immersion_ri_var.get()),
+            "t_id_um": float(self.design_immersion_gap_um_var.get()),
             "n_gd": float(self.design_coverslip_ri_var.get()),
             "t_gd_um": float(self.design_coverslip_thickness_um_var.get()),
             "n_sd": float(self.design_resin_ri_var.get()),
@@ -1976,6 +2104,7 @@ class PSFSimulatorApp:
             na = float(values["NA"])
             pupil_d_mm = float(values["pupil_d_mm"])
             n_id = float(values["n_id"])
+            t_id_um = float(values.get("t_id_um", 90.0))
             n_gd = float(values["n_gd"])
             t_gd_um = float(values["t_gd_um"])
             n_sd = float(values["n_sd"])
@@ -1994,10 +2123,13 @@ class PSFSimulatorApp:
             raise ValueError("Design resin RI must be finite and > 0.")
         if (not np.isfinite(t_gd_um)) or t_gd_um < 0.0:
             raise ValueError("Design coverslip thickness must be finite and >= 0 um.")
+        if (not np.isfinite(t_id_um)) or t_id_um < 0.0:
+            raise ValueError("Design immersion gap must be finite and >= 0 um.")
 
         self.na_var.set(na)
         self.pupil_d_mm_var.set(pupil_d_mm)
         self.design_immersion_ri_var.set(n_id)
+        self.design_immersion_gap_um_var.set(t_id_um)
         self.design_coverslip_ri_var.set(n_gd)
         self.design_coverslip_thickness_um_var.set(t_gd_um)
         self.design_resin_ri_var.set(n_sd)
@@ -2059,12 +2191,16 @@ class PSFSimulatorApp:
             messagebox.showerror("Load objective lens", str(exc))
 
     def _collect_control_values(self):
+        self._sync_dip_in_media()
         return {
+            "dip_in_enabled": bool(self.dip_in_enabled_var.get()),
+            "dip_in_previous_values": self._clone_payload(getattr(self, "_dip_in_previous_values", None)),
             "wavelength_nm": float(self.wavelength_nm_var.get()),
             "NA": float(self.na_var.get()),
             "theta_samples": int(self.theta_samples_var.get()),
             "phi_samples": int(self.phi_samples_var.get()),
             "integration_mode": str(self.integration_mode_var.get()).strip().lower(),
+            "aberration_model": str(self.aberration_model_var.get()).strip().lower(),
             "torch_device": str(self.torch_device_var.get()).strip().lower(),
             "nx": int(self.nx_var.get()),
             "ny": int(self.ny_var.get()),
@@ -2084,6 +2220,7 @@ class PSFSimulatorApp:
             "n_s": float(self.exp_resin_ri_var.get()),
             "t_s_um": float(self.exp_resin_thickness_um_var.get()),
             "n_id": float(self.design_immersion_ri_var.get()),
+            "t_id_um": float(self.design_immersion_gap_um_var.get()),
             "n_gd": float(self.design_coverslip_ri_var.get()),
             "t_gd_um": float(self.design_coverslip_thickness_um_var.get()),
             "n_sd": float(self.design_resin_ri_var.get()),
@@ -2119,6 +2256,9 @@ class PSFSimulatorApp:
     def _apply_control_values(self, values):
         if not isinstance(values, dict):
             raise ValueError("values must be a dictionary.")
+        self.dip_in_enabled_var.set(False)
+        self.aberration_model_var.set("legacy")
+        self.design_immersion_gap_um_var.set(90.0)
 
         self._apply_value_specs(
             values,
@@ -2142,6 +2282,7 @@ class PSFSimulatorApp:
                 ("n_s", self.exp_resin_ri_var, float, 1.0),
                 ("t_s_um", self.exp_resin_thickness_um_var, float, 1.0),
                 ("n_id", self.design_immersion_ri_var, float, 1.0),
+                ("t_id_um", self.design_immersion_gap_um_var, float, 1.0),
                 ("n_gd", self.design_coverslip_ri_var, float, 1.0),
                 ("t_gd_um", self.design_coverslip_thickness_um_var, float, 1.0),
                 ("n_sd", self.design_resin_ri_var, float, 1.0),
@@ -2166,8 +2307,13 @@ class PSFSimulatorApp:
             lowercase=True,
         )
         self._on_integration_mode_change()
+        self._set_choice_var_if_valid(
+            values, "aberration_model", self.aberration_model_var,
+            {"legacy", "gibson_lanni"}, lowercase=True,
+        )
         self._apply_axis_range_values(values)
         self._set_bool_var_if_present(values, "use_gaussian", self.use_gaussian_var)
+        self._restore_dip_in_control_state(values)
 
         self._update_sampling_info()
         self._refresh_mask_input_preview()
@@ -2239,6 +2385,9 @@ class PSFSimulatorApp:
     def _apply_params_to_controls(self, params):
         if not isinstance(params, dict):
             raise ValueError("params must be a dictionary.")
+        self.dip_in_enabled_var.set(False)
+        self.aberration_model_var.set("legacy")
+        self.design_immersion_gap_um_var.set(90.0)
 
         self._apply_value_specs(
             params,
@@ -2262,6 +2411,7 @@ class PSFSimulatorApp:
                 ("n_s", self.exp_resin_ri_var, float, 1.0),
                 ("t_s", self.exp_resin_thickness_um_var, float, 1e6),
                 ("n_id", self.design_immersion_ri_var, float, 1.0),
+                ("t_id", self.design_immersion_gap_um_var, float, 1e6),
                 ("n_gd", self.design_coverslip_ri_var, float, 1.0),
                 ("t_gd", self.design_coverslip_thickness_um_var, float, 1e6),
                 ("n_sd", self.design_resin_ri_var, float, 1.0),
@@ -2286,8 +2436,13 @@ class PSFSimulatorApp:
             lowercase=True,
         )
         self._on_integration_mode_change()
+        self._set_choice_var_if_valid(
+            params, "aberration_model", self.aberration_model_var,
+            {"legacy", "gibson_lanni"}, lowercase=True,
+        )
         self._apply_axis_range_values(params)
         self._set_bool_var_if_present(params, "use_gaussian", self.use_gaussian_var)
+        self._restore_dip_in_control_state(params, core_units=True)
 
         self._update_sampling_info()
         self._refresh_mask_input_preview()
@@ -2897,12 +3052,15 @@ class PSFSimulatorApp:
             self.status_var.set("Loaded saved result with 2D data.")
 
     def _collect_params(self):
+        self._sync_dip_in_media()
         p = {
+            "dip_in_enabled": bool(self.dip_in_enabled_var.get()),
             "wavelength": float(self.wavelength_nm_var.get()) * 1e-9,
             "NA": float(self.na_var.get()),
             "theta_samples": int(self.theta_samples_var.get()),
             "phi_samples": int(self.phi_samples_var.get()),
             "integration_mode": str(self.integration_mode_var.get()).strip().lower(),
+            "aberration_model": str(self.aberration_model_var.get()).strip().lower(),
             "torch_device": str(self.torch_device_var.get()).strip().lower(),
             "nx": int(self.nx_var.get()),
             "ny": int(self.ny_var.get()),
@@ -2922,6 +3080,7 @@ class PSFSimulatorApp:
             "n_s": float(self.exp_resin_ri_var.get()),
             "t_s": float(self.exp_resin_thickness_um_var.get()) * 1e-6,
             "n_id": float(self.design_immersion_ri_var.get()),
+            "t_id": float(self.design_immersion_gap_um_var.get()) * 1e-6,
             "n_gd": float(self.design_coverslip_ri_var.get()),
             "t_gd": float(self.design_coverslip_thickness_um_var.get()) * 1e-6,
             "n_sd": float(self.design_resin_ri_var.get()),
@@ -2957,12 +3116,14 @@ class PSFSimulatorApp:
             raise ValueError("Experimental RI values must be positive.")
         if p["n_id"] <= 0 or p["n_gd"] <= 0 or p["n_sd"] <= 0:
             raise ValueError("Design RI values must be positive.")
-        if p["t_g"] < 0 or p["t_s"] < 0 or p["t_gd"] < 0:
+        if p["t_g"] < 0 or p["t_s"] < 0 or p["t_gd"] < 0 or not np.isfinite(p["t_id"]) or p["t_id"] < 0:
             raise ValueError("Thickness values must be non-negative.")
         if p["torch_device"] not in {"auto", "cpu", "cuda"}:
             raise ValueError("Torch device must be one of: auto, cpu, cuda.")
         if p["integration_mode"] not in {"cartesian_jacobian", "polar_interp"}:
             raise ValueError("Integration mode must be cartesian_jacobian or polar_interp.")
+        if p["aberration_model"] not in {"legacy", "gibson_lanni"}:
+            raise ValueError("Aberration model must be legacy or gibson_lanni.")
         if p["use_gaussian"] and (p["gauss_wx"] <= 0 or p["gauss_wy"] <= 0):
             raise ValueError("Gaussian wx/wy must be positive when Gaussian is enabled.")
         if not np.isfinite(p["mask_offset_x"]) or not np.isfinite(p["mask_offset_y"]):
@@ -3080,6 +3241,7 @@ class PSFSimulatorApp:
 
     def _set_opt_running(self, running, status_text):
         self.opt_is_running = bool(running)
+        self._update_dip_in_controls()
         run_state = "disabled" if self.opt_is_running else "normal"
         stop_state = "normal" if self.opt_is_running else "disabled"
 

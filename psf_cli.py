@@ -75,6 +75,7 @@ DEFAULT_PARAMS = {
     "theta_samples": 61,
     "phi_samples": 120,
     "integration_mode": "cartesian_jacobian",
+    "aberration_model": "legacy",
     "torch_device": "cpu",
     "nx": 256,
     "ny": 256,
@@ -94,6 +95,7 @@ DEFAULT_PARAMS = {
     "n_s": 1.474,
     "t_s": 1.0e-6,
     "n_id": 1.515,
+    "t_id": 90.0e-6,
     "n_gd": 1.515,
     "t_gd": 170.0e-6,
     "n_sd": 1.515,
@@ -228,6 +230,7 @@ def params_from_ui_values(values):
         "theta_samples": ("theta_samples", 1.0, int),
         "phi_samples": ("phi_samples", 1.0, int),
         "integration_mode": ("integration_mode", 1.0, str),
+        "aberration_model": ("aberration_model", 1.0, str),
         "torch_device": ("torch_device", 1.0, str),
         "nx": ("nx", 1.0, int),
         "ny": ("ny", 1.0, int),
@@ -247,6 +250,7 @@ def params_from_ui_values(values):
         "n_s": ("n_s", 1.0, float),
         "t_s_um": ("t_s", 1e-6, float),
         "n_id": ("n_id", 1.0, float),
+        "t_id_um": ("t_id", 1e-6, float),
         "n_gd": ("n_gd", 1.0, float),
         "t_gd_um": ("t_gd", 1e-6, float),
         "n_sd": ("n_sd", 1.0, float),
@@ -388,6 +392,7 @@ def load_objective_lens(path):
         "NA": float(values["NA"]),
         "pupil_d": float(values["pupil_d_mm"]) * 1e-3,
         "n_id": float(values["n_id"]),
+        "t_id": float(values.get("t_id_um", 90.0)) * 1e-6,
         "n_gd": float(values["n_gd"]),
         "t_gd": float(values["t_gd_um"]) * 1e-6,
         "n_sd": float(values.get("n_sd", values["n_id"])),
@@ -408,6 +413,10 @@ def validate_params(params):
     p["integration_mode"] = str(p.get("integration_mode", "cartesian_jacobian")).strip().lower()
     if p["integration_mode"] not in {"cartesian_jacobian", "polar_interp"}:
         raise ValueError("integration_mode must be cartesian_jacobian or polar_interp.")
+    p["aberration_model"] = str(p.get("aberration_model", "legacy")).strip().lower()
+    if p["aberration_model"] not in {"legacy", "gibson_lanni"}:
+        raise ValueError("aberration_model must be legacy or gibson_lanni.")
+    p.setdefault("t_id", DEFAULT_PARAMS["t_id"])
 
     if p["wavelength"] <= 0.0:
         raise ValueError("wavelength must be > 0.")
@@ -431,7 +440,7 @@ def validate_params(params):
         p[key] = finite_float(p[key], key)
         if p[key] <= 0.0:
             raise ValueError(f"{key} must be > 0.")
-    for key in ("t_g", "t_s", "t_gd"):
+    for key in ("t_g", "t_s", "t_gd", "t_id"):
         p[key] = finite_float(p[key], key)
         if p[key] < 0.0:
             raise ValueError(f"{key} must be >= 0.")
@@ -458,6 +467,7 @@ def apply_param_overrides(params, args):
         "theta_samples": ("theta_samples", 1.0, int),
         "phi_samples": ("phi_samples", 1.0, int),
         "integration_mode": ("integration_mode", 1.0, str),
+        "aberration_model": ("aberration_model", 1.0, str),
         "torch_device": ("torch_device", 1.0, str),
         "nx": ("nx", 1.0, int),
         "ny": ("ny", 1.0, int),
@@ -477,6 +487,7 @@ def apply_param_overrides(params, args):
         "n_s": ("n_s", 1.0, float),
         "t_s_um": ("t_s", 1e-6, float),
         "n_id": ("n_id", 1.0, float),
+        "t_id_um": ("t_id", 1e-6, float),
         "n_gd": ("n_gd", 1.0, float),
         "t_gd_um": ("t_gd", 1e-6, float),
         "n_sd": ("n_sd", 1.0, float),
@@ -1194,6 +1205,12 @@ def write_profile_csv(path, profile_result, plot_mode="I", normalized=True):
 
 
 def profile_summary(params, profile_result, plot_mode="I", normalized=True, mask_path=None):
+    _ensure_core_loaded()
+    displayed_width = CartesianPSFSimulator._width_at_level_1d(
+        profile_result["coords"],
+        np.asarray(profile_result["intensity_norm"]) ** intensity_power(plot_mode),
+        level=float(profile_result["width_level"]),
+    )
     return json_safe(
         {
             "axis": str(profile_result["axis"]).lower(),
@@ -1201,7 +1218,8 @@ def profile_summary(params, profile_result, plot_mode="I", normalized=True, mask
             "coord_min_um": float(np.min(profile_result["coords_um"])),
             "coord_max_um": float(np.max(profile_result["coords_um"])),
             "width_level": float(profile_result["width_level"]),
-            "width_um": float(profile_result["width_um"]),
+            "width_um": float(displayed_width * 1e6),
+            "intensity_width_um": float(profile_result["width_um"]),
             "peak_index": int(profile_result["peak_index"]),
             "peak_coord_um": float(profile_result["peak_coord_um"]),
             "peak_intensity": float(profile_result["peak_intensity"]),
@@ -1221,6 +1239,12 @@ def profile_summary(params, profile_result, plot_mode="I", normalized=True, mask
                 "NA": float(params["NA"]),
                 "pupil_d_mm": float(params["pupil_d"]) * 1e3,
                 "fresnel_z_m": float(params["fresnel_z"]),
+                "aberration_model": str(params.get("aberration_model", "legacy")),
+                "design_immersion_gap_um": float(params.get("t_id", 90e-6)) * 1e6,
+                "design_immersion_RI": float(params["n_id"]),
+                "experimental_immersion_RI": float(params["n_i"]),
+                "experimental_coverslip_thickness_um": float(params["t_g"]) * 1e6,
+                "design_coverslip_thickness_um": float(params["t_gd"]) * 1e6,
             },
             "pupil_trimmed_for_psf": bool(profile_result.get("pupil_trimmed_for_psf", False)),
         }
@@ -1476,6 +1500,8 @@ def build_summary(params, simulator, results_2d, results_3d=None, plot_mode="I",
             "theta_samples": int(params["theta_samples"]),
             "phi_samples": int(params["phi_samples"]),
             "integration_mode": str(params.get("integration_mode", "cartesian_jacobian")),
+            "aberration_model": str(params.get("aberration_model", "legacy")),
+            "design_immersion_gap_um": float(params.get("t_id", 90e-6)) * 1e6,
             "requested_NA": float(params["NA"]),
             "effective_NA": float(simulator.NA_eff),
             "excluded_pupil_fraction": float(
@@ -2275,6 +2301,8 @@ def add_common_param_options(parser):
         help="PSF integration grid. Cartesian is the compatibility default.",
     )
     parser.add_argument("--torch-device", choices=("auto", "cpu", "cuda"), help="Torch compute device.")
+    parser.add_argument("--aberration-model", choices=("legacy", "gibson_lanni"),
+                        help="Use gibson_lanni for full design/experimental layer OPD, including changed immersion medium.")
     parser.add_argument("--nx", type=int, help="Input mask grid rows.")
     parser.add_argument("--ny", type=int, help="Input mask grid columns.")
     parser.add_argument("--size-x-mm", type=float, help="Mask physical size in x, mm.")
@@ -2295,6 +2323,7 @@ def add_common_param_options(parser):
     parser.add_argument("--n-s", type=float, help="Experimental resin/sample refractive index.")
     parser.add_argument("--t-s-um", type=float, help="Resin thickness / PSF position, um.")
     parser.add_argument("--n-id", type=float, help="Design immersion refractive index.")
+    parser.add_argument("--t-id-um", type=float, help="Design immersion gap from front lens to coverslip (or focus without coverslip), um.")
     parser.add_argument("--n-gd", type=float, help="Design coverslip refractive index.")
     parser.add_argument("--t-gd-um", type=float, help="Design coverslip thickness, um.")
     parser.add_argument("--n-sd", type=float, help="Design resin/sample refractive index.")

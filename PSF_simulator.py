@@ -284,6 +284,7 @@ class CartesianPSFSimulator:
         torch_device="cpu",
         trim_pupil_for_psf=True,
         pupil_trim_margin_pixels=2,
+        aberration_model="legacy",
     ):
         self.device = _resolve_torch_device(torch_device)
         self.wavelength = float(wavelength)
@@ -306,6 +307,16 @@ class CartesianPSFSimulator:
         self.integration_mode = str(integration_mode).strip().lower()
         self.trim_pupil_for_psf = bool(trim_pupil_for_psf)
         self.pupil_trim_margin_pixels = int(pupil_trim_margin_pixels)
+        self.aberration_model = str(aberration_model).strip().lower()
+
+        if self.aberration_model not in {"legacy", "gibson_lanni"}:
+            raise ValueError("aberration_model must be 'legacy' or 'gibson_lanni'.")
+        for name in ("n_i", "n_g", "n_s", "n_id", "n_gd"):
+            if not isfinite(getattr(self, name)) or getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be finite and positive.")
+        for name in ("t_s", "t_g", "t_gd", "t_id"):
+            if not isfinite(getattr(self, name)) or getattr(self, name) < 0:
+                raise ValueError(f"{name} must be finite and nonnegative.")
 
         if self.wavelength <= 0:
             raise ValueError("wavelength must be positive.")
@@ -339,6 +350,15 @@ class CartesianPSFSimulator:
             + (self.t_gd / self.n_gd)
             + (self.t_id / self.n_id)
         )
+        # Physical immersion gap at the paraxial focal plane. The inherited
+        # t_i convention includes t_s; the layer OPD uses the gap alone.
+        self.immersion_gap = self.n_i * (
+            -self.t_s / self.n_s - self.t_g / self.n_g
+            + self.t_gd / self.n_gd + self.t_id / self.n_id
+        )
+        if self.aberration_model == "gibson_lanni" and self.immersion_gap < -1e-15:
+            raise ValueError("The paraxial immersion gap is negative; reduce the sample depth or coverslip thickness.")
+        self.immersion_gap = max(0.0, self.immersion_gap)
 
         self.h_1 = self.t_s + self.t_g
         self.h_2 = self.t_s
@@ -495,6 +515,8 @@ class CartesianPSFSimulator:
             self._float_key(self.t_s),
             self._float_key(self.n_s),
             self._float_key(self.n_i),
+            self.aberration_model,
+            self._float_key(self.t_id),
         )
 
     def _integration_table_cache_key(
@@ -1294,6 +1316,16 @@ class CartesianPSFSimulator:
         theta_t = self._to_torch_float(theta)
         theta_3 = self._theta_3(theta_t)
         theta_id = self._safe_asin(self.n_i * torch.sin(theta_t) / self.n_id)
+        if self.aberration_model == "gibson_lanni":
+            # Actual sample + immersion path minus the design immersion path.
+            # The glass OPD is already included once by _transmission_terms.
+            opd = (
+                self.t_s * self.n_s * torch.cos(theta_3)
+                + self.immersion_gap * self.n_i * torch.cos(theta_t)
+                - self.t_id * self.n_id * torch.cos(theta_id)
+            )
+            piston = self.t_s * self.n_s + self.immersion_gap * self.n_i - self.t_id * self.n_id
+            return opd - piston
         return (
             self.h_2 * self.n_s * torch.cos(theta_3)
             - self.h_1 * self.n_i * torch.cos(theta_t)
