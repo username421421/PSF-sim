@@ -31,7 +31,18 @@ from psf_cli import (
     load_result as load_result_file,
     read_mask as read_mask_file,
     resize_mask as resize_mask_array,
+    run_simulation,
     save_result as save_result_file,
+)
+from psf_models import (
+    ABERRATION_MODELS,
+    INTEGRATION_MODES,
+    OBJECTIVE_SPECS,
+    PARAM_SPECS,
+    LEGACY_UI_KEYS,
+    TORCH_DEVICES,
+    objective_ui_values,
+    upgrade_ui_values,
 )
 from psf_runtime import (
     create_simulator,
@@ -99,6 +110,17 @@ HAS_PYVISTA_WINDOW = bool(HAS_PYVISTA and HAS_PYVISTA_QT)
 apply_publication_style()
 
 
+class _QueuedProgress:
+    """Hands worker-thread progress updates to the Tk event loop."""
+
+    def __init__(self, root, callback):
+        self.root = root
+        self.callback = callback
+
+    def emit(self, percent, text, force=False):
+        self.root.after(0, lambda: self.callback(percent, text))
+
+
 class PSFSimulatorApp:
     def __init__(self, root):
         self.root = root
@@ -159,6 +181,7 @@ class PSFSimulatorApp:
         self._active_width_level = 0.50
         self._width_level_source = "slider"
         self._width_entry_job = None
+        self._mask_preview_job = None
         self.opt_is_running = False
         self.opt_stop_requested = False
         self.opt_result = None
@@ -199,6 +222,7 @@ class PSFSimulatorApp:
             "TLabelframe.Label", background="#f3f5f8", foreground="#1e2a38", font=("Segoe UI", 10, "bold")
         )
         style.configure("TButton", font=("Segoe UI", 10, "bold"), padding=6)
+        style.configure("Small.TButton", font=("Segoe UI", 9), padding=(6, 3))
         style.configure("TEntry", padding=4)
         style.map(
             "LinkedMedium.TEntry",
@@ -268,7 +292,7 @@ class PSFSimulatorApp:
             compute_group,
             textvariable=self.torch_device_var,
             state="readonly",
-            values=("auto", "cpu", "cuda"),
+            values=TORCH_DEVICES,
         )
         self.torch_device_combo.pack(fill="x", pady=(0, 4))
 
@@ -281,7 +305,7 @@ class PSFSimulatorApp:
         mask_btn_row.pack(fill="x", pady=(6, 2))
         self.load_mask_btn = ttk.Button(
             mask_btn_row,
-            text="Load Mask (.npy/.csv/.txt/.tif/.tiff/image)",
+            text="Load Mask…",
             command=self._load_mask,
         )
         self.load_mask_btn.pack(side=tk.LEFT, fill="x", expand=True, padx=(0, 3))
@@ -292,7 +316,7 @@ class PSFSimulatorApp:
         )
         self.remove_mask_btn.pack(side=tk.LEFT, fill="x", expand=True, padx=(3, 0))
         self.mask_info_var = tk.StringVar(value="No file loaded. Using all-pass mask.")
-        ttk.Label(mask_group, textvariable=self.mask_info_var, wraplength=330).pack(fill="x")
+        self._wrap_label(ttk.Label(mask_group, textvariable=self.mask_info_var, wraplength=330)).pack(fill="x")
         self.nx_var = tk.IntVar(value=256)
         self.ny_var = tk.IntVar(value=256)
         self.size_x_mm_var = tk.DoubleVar(value=8.0)
@@ -303,7 +327,7 @@ class PSFSimulatorApp:
         self._entry(mask_group, "Mask size Y (mm)", self.size_y_mm_var)
         self.sampling_info_var = tk.StringVar(value="")
         ttk.Label(mask_group, text="Fresnel sampling").pack(anchor="w", pady=(4, 0))
-        ttk.Label(mask_group, textvariable=self.sampling_info_var, wraplength=330).pack(
+        self._wrap_label(ttk.Label(mask_group, textvariable=self.sampling_info_var, wraplength=330)).pack(
             fill="x", pady=(0, 4)
         )
         self.mask_offset_x_mm_var = tk.DoubleVar(value=0.0)
@@ -312,20 +336,24 @@ class PSFSimulatorApp:
         self._entry(mask_group, "Mask Y offset (mm)", self.mask_offset_y_mm_var)
         rot_row = ttk.Frame(mask_group)
         rot_row.pack(fill="x", pady=(2, 2))
-        ttk.Label(rot_row, text="Rotate 90 deg").pack(side=tk.LEFT)
-        self.rotate_ccw_btn = ttk.Button(rot_row, text="↺", width=3, command=self._rotate_mask_ccw_90)
-        self.rotate_ccw_btn.pack(side=tk.RIGHT, padx=(3, 0))
-        self.rotate_cw_btn = ttk.Button(rot_row, text="↻", width=3, command=self._rotate_mask_cw_90)
-        self.rotate_cw_btn.pack(side=tk.RIGHT)
+        ttk.Label(rot_row, text="Rotate mask 90°").pack(side=tk.LEFT)
+        self.rotate_cw_btn = ttk.Button(
+            rot_row, text="↻ CW", width=6, style="Small.TButton", command=self._rotate_mask_cw_90
+        )
+        self.rotate_cw_btn.pack(side=tk.RIGHT, padx=(3, 0))
+        self.rotate_ccw_btn = ttk.Button(
+            rot_row, text="↺ CCW", width=6, style="Small.TButton", command=self._rotate_mask_ccw_90
+        )
+        self.rotate_ccw_btn.pack(side=tk.RIGHT)
         self.mask_orientation_var = tk.StringVar(value="Mask orientation: 0 deg")
-        ttk.Label(mask_group, textvariable=self.mask_orientation_var, wraplength=330).pack(
+        self._wrap_label(ttk.Label(mask_group, textvariable=self.mask_orientation_var, wraplength=330)).pack(
             fill="x", pady=(0, 2)
         )
-        ttk.Label(
+        self._wrap_label(ttk.Label(
             mask_group,
             text="Shifted-out regions are treated as all-pass (transmission = 1).",
             wraplength=330,
-        ).pack(fill="x", pady=(0, 2))
+        )).pack(fill="x", pady=(0, 2))
         preview_group = ttk.LabelFrame(
             mask_group, text="Mask Preview (orientation + offset)", padding=6
         )
@@ -367,28 +395,24 @@ class PSFSimulatorApp:
             opt_group,
             textvariable=self.integration_mode_var,
             state="readonly",
-            values=("cartesian_jacobian", "polar_interp"),
+            values=INTEGRATION_MODES,
         )
         self.integration_mode_combo.pack(fill="x", pady=(0, 4))
         self.integration_mode_combo.bind("<<ComboboxSelected>>", self._on_integration_mode_change)
-        ttk.Label(opt_group, text="Theta samples (polar mode)").pack(anchor="w")
-        self.theta_samples_entry = ttk.Entry(opt_group, textvariable=self.theta_samples_var)
-        self.theta_samples_entry.pack(fill="x", pady=(0, 4))
-        ttk.Label(opt_group, text="Phi samples (polar mode)").pack(anchor="w")
-        self.phi_samples_entry = ttk.Entry(opt_group, textvariable=self.phi_samples_var)
-        self.phi_samples_entry.pack(fill="x", pady=(0, 4))
+        self.theta_samples_entry = self._entry(opt_group, "Theta samples (polar mode)", self.theta_samples_var)
+        self.phi_samples_entry = self._entry(opt_group, "Phi samples (polar mode)", self.phi_samples_var)
         self._on_integration_mode_change()
         ttk.Label(opt_group, text="Aberration model").pack(anchor="w")
         self.aberration_model_combo = ttk.Combobox(
             opt_group,
             textvariable=self.aberration_model_var,
             state="readonly",
-            values=("legacy", "gibson_lanni"),
+            values=ABERRATION_MODELS,
         )
         self.aberration_model_combo.pack(fill="x", pady=(0, 2))
-        ttk.Label(
+        self._wrap_label(ttk.Label(
             opt_group, textvariable=self.aberration_model_description_var, wraplength=330,
-        ).pack(fill="x", pady=(0, 4))
+        )).pack(fill="x", pady=(0, 4))
         self.aberration_model_var.trace_add("write", self._update_model_description)
         self._update_model_description()
         design_media_group = ttk.LabelFrame(opt_group, text="Design Values", padding=6)
@@ -429,25 +453,25 @@ class PSFSimulatorApp:
         ))
         for entry in self._dip_in_linked_entries:
             entry.configure(style="LinkedMedium.TEntry")
-        ttk.Label(
+        self._wrap_label(ttk.Label(
             exp_media_group,
             text="Dip-in uses resin as the immersion medium (Gibson-Lanni model), with the coverslip beyond focus. Turning it off restores your previous settings.",
             wraplength=330,
-        ).pack(fill="x", pady=(0, 4))
+        )).pack(fill="x", pady=(0, 4))
         self.exp_resin_ri_var.trace_add("write", self._sync_dip_in_media)
 
         propagation_group = ttk.LabelFrame(parent, text="Propagation", padding=8)
         propagation_group.pack(fill="x", pady=4)
         self.fresnel_z_m_var = tk.DoubleVar(value=0.30)
         self.use_gaussian_var = tk.BooleanVar(value=False)
-        self.gauss_wx_mm_var = tk.DoubleVar(value=1.6)
-        self.gauss_wy_mm_var = tk.DoubleVar(value=1.6)
+        self.gauss_fwhm_x_mm_var = tk.DoubleVar(value=2.7)
+        self.gauss_fwhm_y_mm_var = tk.DoubleVar(value=2.7)
         self._entry(propagation_group, "Fresnel propagation z (m)", self.fresnel_z_m_var)
         ttk.Checkbutton(
             propagation_group, text="Apply Gaussian envelope", variable=self.use_gaussian_var
         ).pack(anchor="w")
-        self._entry(propagation_group, "wx (mm)", self.gauss_wx_mm_var)
-        self._entry(propagation_group, "wy (mm)", self.gauss_wy_mm_var)
+        self._entry(propagation_group, "Intensity FWHM x (mm)", self.gauss_fwhm_x_mm_var)
+        self._entry(propagation_group, "Intensity FWHM y (mm)", self.gauss_fwhm_y_mm_var)
 
         sim_group = ttk.LabelFrame(parent, text="Simulation Settings", padding=8)
         sim_group.pack(fill="x", pady=4)
@@ -569,14 +593,18 @@ class PSFSimulatorApp:
         self.save_btn = ttk.Button(save_row, text="Save Result", command=self._save_result_dialog)
         self.save_btn.pack(side=tk.LEFT, fill="x", expand=True, padx=(0, 3))
         self.load_btn = ttk.Button(save_row, text="Load Result", command=self._load_result_dialog)
-        self.load_btn.pack(side=tk.LEFT, fill="x", expand=True, padx=3)
+        self.load_btn.pack(side=tk.LEFT, fill="x", expand=True, padx=(3, 0))
+
+        # Two buttons per row so no label is clipped at the sidebar width.
+        export_row = ttk.Frame(parent)
+        export_row.pack(fill="x", pady=(0, 4))
         self.export_csv_btn = ttk.Button(
-            save_row,
+            export_row,
             text="Export CSV",
             command=self._export_current_data_csv_dialog,
         )
-        self.export_csv_btn.pack(side=tk.LEFT, fill="x", expand=True, padx=3)
-        self.show_3d_btn = ttk.Button(save_row, text="Show 3D Window", command=self._show_3d_plot_window)
+        self.export_csv_btn.pack(side=tk.LEFT, fill="x", expand=True, padx=(0, 3))
+        self.show_3d_btn = ttk.Button(export_row, text="Show 3D Window", command=self._show_3d_plot_window)
         self.show_3d_btn.pack(side=tk.LEFT, fill="x", expand=True, padx=(3, 0))
         self.show_3d_btn.configure(state="disabled")
 
@@ -610,11 +638,11 @@ class PSFSimulatorApp:
         )
         self.progress_bar.pack(fill="x", pady=(0, 4))
 
-        ttk.Label(parent, textvariable=self.status_var, wraplength=330).pack(fill="x", pady=(6, 0))
+        self._wrap_label(ttk.Label(parent, textvariable=self.status_var, wraplength=330)).pack(fill="x", pady=(6, 0))
         self.cursor_info_var = tk.StringVar(
             value="Cursor (XY/XZ/YZ): move mouse over 2D plots after a run."
         )
-        ttk.Label(parent, textvariable=self.cursor_info_var, wraplength=330).pack(
+        self._wrap_label(ttk.Label(parent, textvariable=self.cursor_info_var, wraplength=330)).pack(
             fill="x", pady=(2, 0)
         )
 
@@ -627,12 +655,78 @@ class PSFSimulatorApp:
         self._refresh_mask_input_preview()
         self._update_sampling_info()
 
-    @staticmethod
-    def _entry(parent, label, var):
-        ttk.Label(parent, text=label).pack(anchor="w")
-        entry = ttk.Entry(parent, textvariable=var)
-        entry.pack(fill="x", pady=(0, 4))
+    _UNITS = ("nm", "um", "mm", "m", "deg")
+
+    @classmethod
+    def _split_unit(cls, label):
+        """'Mask size X (mm)' -> ('Mask size X', 'mm'); labels without a unit are unchanged."""
+        if label.endswith(")") and " (" in label:
+            text, unit = label[:-1].rsplit(" (", 1)
+            if unit in cls._UNITS:
+                return text, unit
+        return label, ""
+
+    @classmethod
+    def _entry(cls, parent, label, var, unit=None):
+        text, parsed_unit = cls._split_unit(label)
+        row = ttk.Frame(parent)
+        row.pack(fill="x", pady=(0, 3))
+        row.columnconfigure(0, weight=1)
+        ttk.Label(row, text=text).grid(row=0, column=0, sticky="w", padx=(0, 6))
+        entry = ttk.Entry(row, textvariable=var, width=10, justify="right")
+        entry.grid(row=0, column=1, sticky="e")
+        ttk.Label(row, text=parsed_unit if unit is None else unit, width=3).grid(
+            row=0, column=2, sticky="w", padx=(4, 0)
+        )
         return entry
+
+    @staticmethod
+    def _wrap_label(label):
+        """Re-wrap a full-width label whenever the panel width changes."""
+        label.bind("<Configure>", lambda event: event.widget.configure(wraplength=max(120, event.width - 4)))
+        return label
+
+    # GUI variable holding each PARAM_SPECS entry, keyed by its display-unit ui_key.
+    _PARAM_VARIABLES = {
+        "wavelength_nm": "wavelength_nm_var",
+        "NA": "na_var",
+        "theta_samples": "theta_samples_var",
+        "phi_samples": "phi_samples_var",
+        "integration_mode": "integration_mode_var",
+        "aberration_model": "aberration_model_var",
+        "torch_device": "torch_device_var",
+        "nx": "nx_var",
+        "ny": "ny_var",
+        "size_x_mm": "size_x_mm_var",
+        "size_y_mm": "size_y_mm_var",
+        "pupil_d_mm": "pupil_d_mm_var",
+        "fresnel_z_m": "fresnel_z_m_var",
+        "range_x_um": "range_x_um_var",
+        "range_y_um": "range_y_um_var",
+        "range_z_um": "range_z_um_var",
+        "points_2d": "points_2d_var",
+        "points_3d": "points_3d_var",
+        "z_chunk": "z_chunk_var",
+        "n_i": "exp_immersion_ri_var",
+        "n_g": "exp_coverslip_ri_var",
+        "t_g_um": "exp_coverslip_thickness_um_var",
+        "n_s": "exp_resin_ri_var",
+        "t_s_um": "exp_resin_thickness_um_var",
+        "n_id": "design_immersion_ri_var",
+        "t_id_um": "design_immersion_gap_um_var",
+        "n_gd": "design_coverslip_ri_var",
+        "t_gd_um": "design_coverslip_thickness_um_var",
+        "n_sd": "design_resin_ri_var",
+        "use_gaussian": "use_gaussian_var",
+        "gauss_fwhm_x_mm": "gauss_fwhm_x_mm_var",
+        "gauss_fwhm_y_mm": "gauss_fwhm_y_mm_var",
+        "mask_offset_x_mm": "mask_offset_x_mm_var",
+        "mask_offset_y_mm": "mask_offset_y_mm_var",
+    }
+    _AXIS_RANGE_KEYS = ("range_x_um", "range_y_um", "range_z_um")
+
+    def _param_var(self, spec):
+        return getattr(self, self._PARAM_VARIABLES[spec.ui_key])
 
     def _dip_in_value_vars(self):
         return {
@@ -765,7 +859,7 @@ class PSFSimulatorApp:
                     raise ValueError("Invalid previous dip-in medium values.")
                 previous[key] = value
             previous["aberration_model"] = str(previous.get("aberration_model", "")).strip().lower()
-            if previous["aberration_model"] not in {"legacy", "gibson_lanni"}:
+            if previous["aberration_model"] not in ABERRATION_MODELS:
                 raise ValueError("Invalid previous dip-in aberration model.")
         self._dip_in_previous_values = previous if flag else None
         self.dip_in_enabled_var.set(bool(flag))
@@ -783,8 +877,28 @@ class PSFSimulatorApp:
             if entry is not None:
                 entry.configure(state=state)
 
+    # The preview only needs screen resolution; the simulation grid can be far larger.
+    _PREVIEW_MAX_PIXELS = 512
+    _PREVIEW_DELAY_MS = 150
+
     def _on_mask_preview_param_change(self, *_args):
-        self._refresh_mask_input_preview()
+        # Coalesce bursts of writes (typing, config loads) into one redraw.
+        self._cancel_mask_preview_job()
+        self._mask_preview_job = self.root.after(self._PREVIEW_DELAY_MS, self._refresh_mask_input_preview)
+
+    def _cancel_mask_preview_job(self):
+        job = getattr(self, "_mask_preview_job", None)
+        if job is not None:
+            try:
+                self.root.after_cancel(job)
+            except Exception:
+                pass
+        self._mask_preview_job = None
+
+    @classmethod
+    def _preview_shape(cls, nx, ny):
+        scale = min(1.0, cls._PREVIEW_MAX_PIXELS / max(nx, ny))
+        return max(1, round(nx * scale)), max(1, round(ny * scale))
 
     def _mask_rotation_quadrants_mod(self):
         return int(self.mask_rotation_quadrants) % 4
@@ -819,7 +933,7 @@ class PSFSimulatorApp:
         offset_x = float(self.mask_offset_x_mm_var.get()) * 1e-3
         offset_y = float(self.mask_offset_y_mm_var.get()) * 1e-3
         mask = self._get_input_mask(
-            (nx, ny),
+            self._preview_shape(nx, ny),
             size_x=size_x_m,
             size_y=size_y_m,
             offset_x=offset_x,
@@ -831,16 +945,17 @@ class PSFSimulatorApp:
             -0.5 * size_y_m * 1e3,
             0.5 * size_y_m * 1e3,
         ]
-        return np.asarray(mask, dtype=float), extent
+        return np.asarray(mask, dtype=float), extent, (nx, ny)
 
     def _refresh_mask_input_preview(self):
+        self._cancel_mask_preview_job()
         if not hasattr(self, "fig_mask_input") or not hasattr(self, "canvas_mask_input"):
             return
 
         self.fig_mask_input.clear()
         ax = self.fig_mask_input.add_subplot(111)
         try:
-            mask, extent = self._mask_for_current_preview()
+            mask, extent, (nx, ny) = self._mask_for_current_preview()
             im = ax.imshow(
                 mask.T,
                 origin="lower",
@@ -853,7 +968,7 @@ class PSFSimulatorApp:
             )
             style_image_axis(
                 ax,
-                title=f"Effective mask ({mask.shape[0]} x {mask.shape[1]})",
+                title=f"Effective mask ({nx} x {ny})",
                 xlabel="x (mm)",
                 ylabel="y (mm)",
             )
@@ -872,7 +987,7 @@ class PSFSimulatorApp:
         except Exception as exc:
             ax.text(0.5, 0.5, f"Mask preview unavailable\n{exc}", ha="center", va="center")
             ax.axis("off")
-        self.canvas_mask_input.draw()
+        self.canvas_mask_input.draw_idle()
 
     def _update_sampling_info(self):
         try:
@@ -1656,6 +1771,7 @@ class PSFSimulatorApp:
             title="Load mask into builder",
             initialdir=self.mask_load_dir,
             filetypes=[
+                ("Mask files", "*.npy *.csv *.txt *.png *.jpg *.jpeg *.bmp *.tif *.tiff"),
                 ("All files", "*.*"),
                 ("NumPy array", "*.npy"),
                 ("CSV/TXT", "*.csv *.txt"),
@@ -1830,6 +1946,7 @@ class PSFSimulatorApp:
             title="Load mask",
             initialdir=self.mask_load_dir,
             filetypes=[
+                ("Mask files", "*.npy *.csv *.txt *.png *.jpg *.jpeg *.bmp *.tif *.tiff"),
                 ("All files", "*.*"),
                 ("NumPy array", "*.npy"),
                 ("CSV/TXT", "*.csv *.txt"),
@@ -2187,58 +2304,12 @@ class PSFSimulatorApp:
         return message
 
     def _collect_objective_lens_values(self):
-        return {
-            "NA": float(self.na_var.get()),
-            "pupil_d_mm": float(self.pupil_d_mm_var.get()),
-            "n_id": float(self.design_immersion_ri_var.get()),
-            "t_id_um": float(self.design_immersion_gap_um_var.get()),
-            "n_gd": float(self.design_coverslip_ri_var.get()),
-            "t_gd_um": float(self.design_coverslip_thickness_um_var.get()),
-            "n_sd": float(self.design_resin_ri_var.get()),
-        }
+        return {spec.ui_key: float(self._param_var(spec).get()) for spec in OBJECTIVE_SPECS}
 
     def _apply_objective_lens_values(self, values):
-        if not isinstance(values, dict):
-            raise ValueError("Objective lens values must be a dictionary.")
-
-        required = ("NA", "pupil_d_mm", "n_id", "n_gd", "t_gd_um", "n_sd")
-        missing = [k for k in required if k not in values]
-        if missing:
-            raise ValueError(f"Objective lens preset missing keys: {', '.join(missing)}.")
-
-        try:
-            na = float(values["NA"])
-            pupil_d_mm = float(values["pupil_d_mm"])
-            n_id = float(values["n_id"])
-            t_id_um = float(values.get("t_id_um", 90.0))
-            n_gd = float(values["n_gd"])
-            t_gd_um = float(values["t_gd_um"])
-            n_sd = float(values["n_sd"])
-        except Exception as exc:
-            raise ValueError("Objective lens preset contains non-numeric values.") from exc
-
-        if (not np.isfinite(na)) or na <= 0.0:
-            raise ValueError("NA must be finite and > 0.")
-        if (not np.isfinite(pupil_d_mm)) or pupil_d_mm <= 0.0:
-            raise ValueError("Entrance pupil diameter must be finite and > 0 mm.")
-        if (not np.isfinite(n_id)) or n_id <= 0.0:
-            raise ValueError("Design immersion RI must be finite and > 0.")
-        if (not np.isfinite(n_gd)) or n_gd <= 0.0:
-            raise ValueError("Design coverslip RI must be finite and > 0.")
-        if (not np.isfinite(n_sd)) or n_sd <= 0.0:
-            raise ValueError("Design resin RI must be finite and > 0.")
-        if (not np.isfinite(t_gd_um)) or t_gd_um < 0.0:
-            raise ValueError("Design coverslip thickness must be finite and >= 0 um.")
-        if (not np.isfinite(t_id_um)) or t_id_um < 0.0:
-            raise ValueError("Design immersion gap must be finite and >= 0 um.")
-
-        self.na_var.set(na)
-        self.pupil_d_mm_var.set(pupil_d_mm)
-        self.design_immersion_ri_var.set(n_id)
-        self.design_immersion_gap_um_var.set(t_id_um)
-        self.design_coverslip_ri_var.set(n_gd)
-        self.design_coverslip_thickness_um_var.set(t_gd_um)
-        self.design_resin_ri_var.set(n_sd)
+        validated = objective_ui_values(values)
+        for spec in OBJECTIVE_SPECS:
+            self._param_var(spec).set(validated[spec.ui_key])
         self._refresh_mask_input_preview()
 
     def _save_objective_lens_to_path(self, path):
@@ -2298,44 +2369,13 @@ class PSFSimulatorApp:
 
     def _collect_control_values(self):
         self._sync_dip_in_media()
-        return {
+        values = {
             "dip_in_enabled": bool(self.dip_in_enabled_var.get()),
             "dip_in_previous_values": self._clone_payload(getattr(self, "_dip_in_previous_values", None)),
-            "wavelength_nm": float(self.wavelength_nm_var.get()),
-            "NA": float(self.na_var.get()),
-            "theta_samples": int(self.theta_samples_var.get()),
-            "phi_samples": int(self.phi_samples_var.get()),
-            "integration_mode": str(self.integration_mode_var.get()).strip().lower(),
-            "aberration_model": str(self.aberration_model_var.get()).strip().lower(),
-            "torch_device": str(self.torch_device_var.get()).strip().lower(),
-            "nx": int(self.nx_var.get()),
-            "ny": int(self.ny_var.get()),
-            "size_x_mm": float(self.size_x_mm_var.get()),
-            "size_y_mm": float(self.size_y_mm_var.get()),
-            "pupil_d_mm": float(self.pupil_d_mm_var.get()),
-            "fresnel_z_m": float(self.fresnel_z_m_var.get()),
-            "range_x_um": float(self.range_x_um_var.get()),
-            "range_y_um": float(self.range_y_um_var.get()),
-            "range_z_um": float(self.range_z_um_var.get()),
-            "points_2d": int(self.points_2d_var.get()),
-            "points_3d": int(self.points_3d_var.get()),
-            "z_chunk": int(self.z_chunk_var.get()),
-            "n_i": float(self.exp_immersion_ri_var.get()),
-            "n_g": float(self.exp_coverslip_ri_var.get()),
-            "t_g_um": float(self.exp_coverslip_thickness_um_var.get()),
-            "n_s": float(self.exp_resin_ri_var.get()),
-            "t_s_um": float(self.exp_resin_thickness_um_var.get()),
-            "n_id": float(self.design_immersion_ri_var.get()),
-            "t_id_um": float(self.design_immersion_gap_um_var.get()),
-            "n_gd": float(self.design_coverslip_ri_var.get()),
-            "t_gd_um": float(self.design_coverslip_thickness_um_var.get()),
-            "n_sd": float(self.design_resin_ri_var.get()),
-            "use_gaussian": bool(self.use_gaussian_var.get()),
-            "gauss_wx_mm": float(self.gauss_wx_mm_var.get()),
-            "gauss_wy_mm": float(self.gauss_wy_mm_var.get()),
-            "mask_offset_x_mm": float(self.mask_offset_x_mm_var.get()),
-            "mask_offset_y_mm": float(self.mask_offset_y_mm_var.get()),
         }
+        for spec in PARAM_SPECS:
+            values[spec.ui_key] = spec.ui_value(self._param_var(spec).get())
+        return values
 
     def _collect_optimizer_control_values(self):
         if not hasattr(self, "opt_optimizer_var"):
@@ -2364,62 +2404,7 @@ class PSFSimulatorApp:
             raise ValueError("values must be a dictionary.")
         with self._control_transaction():
             self.dip_in_enabled_var.set(False)
-            self.aberration_model_var.set("legacy")
-            self.design_immersion_gap_um_var.set(90.0)
-
-            self._apply_value_specs(
-                values,
-                (
-                    ("wavelength_nm", self.wavelength_nm_var, float, 1.0),
-                    ("NA", self.na_var, float, 1.0),
-                    ("theta_samples", self.theta_samples_var, int, 1.0),
-                    ("phi_samples", self.phi_samples_var, int, 1.0),
-                    ("nx", self.nx_var, int, 1.0),
-                    ("ny", self.ny_var, int, 1.0),
-                    ("size_x_mm", self.size_x_mm_var, float, 1.0),
-                    ("size_y_mm", self.size_y_mm_var, float, 1.0),
-                    ("pupil_d_mm", self.pupil_d_mm_var, float, 1.0),
-                    ("fresnel_z_m", self.fresnel_z_m_var, float, 1.0),
-                    ("points_2d", self.points_2d_var, int, 1.0),
-                    ("points_3d", self.points_3d_var, int, 1.0),
-                    ("z_chunk", self.z_chunk_var, int, 1.0),
-                    ("n_i", self.exp_immersion_ri_var, float, 1.0),
-                    ("n_g", self.exp_coverslip_ri_var, float, 1.0),
-                    ("t_g_um", self.exp_coverslip_thickness_um_var, float, 1.0),
-                    ("n_s", self.exp_resin_ri_var, float, 1.0),
-                    ("t_s_um", self.exp_resin_thickness_um_var, float, 1.0),
-                    ("n_id", self.design_immersion_ri_var, float, 1.0),
-                    ("t_id_um", self.design_immersion_gap_um_var, float, 1.0),
-                    ("n_gd", self.design_coverslip_ri_var, float, 1.0),
-                    ("t_gd_um", self.design_coverslip_thickness_um_var, float, 1.0),
-                    ("n_sd", self.design_resin_ri_var, float, 1.0),
-                    ("gauss_wx_mm", self.gauss_wx_mm_var, float, 1.0),
-                    ("gauss_wy_mm", self.gauss_wy_mm_var, float, 1.0),
-                    ("mask_offset_x_mm", self.mask_offset_x_mm_var, float, 1.0),
-                    ("mask_offset_y_mm", self.mask_offset_y_mm_var, float, 1.0),
-                ),
-            )
-            self._set_choice_var_if_valid(
-                values,
-                "torch_device",
-                self.torch_device_var,
-                {"auto", "cpu", "cuda"},
-                lowercase=True,
-            )
-            self._set_choice_var_if_valid(
-                values,
-                "integration_mode",
-                self.integration_mode_var,
-                {"cartesian_jacobian", "polar_interp"},
-                lowercase=True,
-            )
-            self._on_integration_mode_change()
-            self._set_choice_var_if_valid(
-                values, "aberration_model", self.aberration_model_var,
-                {"legacy", "gibson_lanni"}, lowercase=True,
-            )
-            self._apply_axis_range_values(values)
-            self._set_bool_var_if_present(values, "use_gaussian", self.use_gaussian_var)
+            self._apply_spec_values(values, si_units=False)
             self._restore_dip_in_control_state(values)
 
             self._update_sampling_info()
@@ -2494,66 +2479,37 @@ class PSFSimulatorApp:
             raise ValueError("params must be a dictionary.")
         with self._control_transaction():
             self.dip_in_enabled_var.set(False)
-            self.aberration_model_var.set("legacy")
-            self.design_immersion_gap_um_var.set(90.0)
-
-            self._apply_value_specs(
-                params,
-                (
-                    ("wavelength", self.wavelength_nm_var, float, 1e9),
-                    ("NA", self.na_var, float, 1.0),
-                    ("theta_samples", self.theta_samples_var, int, 1.0),
-                    ("phi_samples", self.phi_samples_var, int, 1.0),
-                    ("nx", self.nx_var, int, 1.0),
-                    ("ny", self.ny_var, int, 1.0),
-                    ("size_x", self.size_x_mm_var, float, 1e3),
-                    ("size_y", self.size_y_mm_var, float, 1e3),
-                    ("pupil_d", self.pupil_d_mm_var, float, 1e3),
-                    ("fresnel_z", self.fresnel_z_m_var, float, 1.0),
-                    ("points_2d", self.points_2d_var, int, 1.0),
-                    ("points_3d", self.points_3d_var, int, 1.0),
-                    ("z_chunk", self.z_chunk_var, int, 1.0),
-                    ("n_i", self.exp_immersion_ri_var, float, 1.0),
-                    ("n_g", self.exp_coverslip_ri_var, float, 1.0),
-                    ("t_g", self.exp_coverslip_thickness_um_var, float, 1e6),
-                    ("n_s", self.exp_resin_ri_var, float, 1.0),
-                    ("t_s", self.exp_resin_thickness_um_var, float, 1e6),
-                    ("n_id", self.design_immersion_ri_var, float, 1.0),
-                    ("t_id", self.design_immersion_gap_um_var, float, 1e6),
-                    ("n_gd", self.design_coverslip_ri_var, float, 1.0),
-                    ("t_gd", self.design_coverslip_thickness_um_var, float, 1e6),
-                    ("n_sd", self.design_resin_ri_var, float, 1.0),
-                    ("gauss_wx", self.gauss_wx_mm_var, float, 1e3),
-                    ("gauss_wy", self.gauss_wy_mm_var, float, 1e3),
-                    ("mask_offset_x", self.mask_offset_x_mm_var, float, 1e3),
-                    ("mask_offset_y", self.mask_offset_y_mm_var, float, 1e3),
-                ),
-            )
-            self._set_choice_var_if_valid(
-                params,
-                "torch_device",
-                self.torch_device_var,
-                {"auto", "cpu", "cuda"},
-                lowercase=True,
-            )
-            self._set_choice_var_if_valid(
-                params,
-                "integration_mode",
-                self.integration_mode_var,
-                {"cartesian_jacobian", "polar_interp"},
-                lowercase=True,
-            )
-            self._on_integration_mode_change()
-            self._set_choice_var_if_valid(
-                params, "aberration_model", self.aberration_model_var,
-                {"legacy", "gibson_lanni"}, lowercase=True,
-            )
-            self._apply_axis_range_values(params)
-            self._set_bool_var_if_present(params, "use_gaussian", self.use_gaussian_var)
+            self._apply_spec_values(params, si_units=True)
             self._restore_dip_in_control_state(params, core_units=True)
 
             self._update_sampling_info()
             self._refresh_mask_input_preview()
+
+    def _apply_spec_values(self, values, *, si_units):
+        """Set each GUI parameter found in SI ``params`` or display-unit ``ui_values``."""
+        converted = set()
+        if not si_units:
+            converted = {new for old, (new, _f) in LEGACY_UI_KEYS.items() if old in values and new not in values}
+            values = upgrade_ui_values(values)
+        for spec in PARAM_SPECS:
+            if spec.reset_on_load:
+                self._param_var(spec).set(spec.ui_default)
+        for spec in PARAM_SPECS:
+            if spec.ui_key in self._AXIS_RANGE_KEYS:
+                continue  # also accepts the legacy single "range_um" key
+            key = spec.key if si_units else spec.ui_key
+            var = self._param_var(spec)
+            if spec.choices:
+                self._set_choice_var_if_valid(values, key, var, set(spec.choices), lowercase=True)
+            elif spec.cast is bool:
+                self._set_bool_var_if_present(values, key, var)
+            else:
+                self._set_var_if_present(values, key, var, spec.cast, spec.from_si if si_units else 1.0)
+                if spec.display_digits and key in values and (si_units or key in converted):
+                    # e.g. a stored 1/e radius shown as FWHM: 7.49299, not 7.492991632690848
+                    var.set(float(f"{float(var.get()):.{spec.display_digits}g}"))
+        self._on_integration_mode_change()
+        self._apply_axis_range_values(values)
 
     def _save_last_used_config(self, params):
         if not isinstance(params, dict):
@@ -3162,43 +3118,9 @@ class PSFSimulatorApp:
 
     def _collect_params(self):
         self._sync_dip_in_media()
-        p = {
-            "dip_in_enabled": bool(self.dip_in_enabled_var.get()),
-            "wavelength": float(self.wavelength_nm_var.get()) * 1e-9,
-            "NA": float(self.na_var.get()),
-            "theta_samples": int(self.theta_samples_var.get()),
-            "phi_samples": int(self.phi_samples_var.get()),
-            "integration_mode": str(self.integration_mode_var.get()).strip().lower(),
-            "aberration_model": str(self.aberration_model_var.get()).strip().lower(),
-            "torch_device": str(self.torch_device_var.get()).strip().lower(),
-            "nx": int(self.nx_var.get()),
-            "ny": int(self.ny_var.get()),
-            "size_x": float(self.size_x_mm_var.get()) * 1e-3,
-            "size_y": float(self.size_y_mm_var.get()) * 1e-3,
-            "pupil_d": float(self.pupil_d_mm_var.get()) * 1e-3,
-            "fresnel_z": float(self.fresnel_z_m_var.get()),
-            "range_x_um": float(self.range_x_um_var.get()),
-            "range_y_um": float(self.range_y_um_var.get()),
-            "range_z_um": float(self.range_z_um_var.get()),
-            "points_2d": int(self.points_2d_var.get()),
-            "points_3d": int(self.points_3d_var.get()),
-            "z_chunk": int(self.z_chunk_var.get()),
-            "n_i": float(self.exp_immersion_ri_var.get()),
-            "n_g": float(self.exp_coverslip_ri_var.get()),
-            "t_g": float(self.exp_coverslip_thickness_um_var.get()) * 1e-6,
-            "n_s": float(self.exp_resin_ri_var.get()),
-            "t_s": float(self.exp_resin_thickness_um_var.get()) * 1e-6,
-            "n_id": float(self.design_immersion_ri_var.get()),
-            "t_id": float(self.design_immersion_gap_um_var.get()) * 1e-6,
-            "n_gd": float(self.design_coverslip_ri_var.get()),
-            "t_gd": float(self.design_coverslip_thickness_um_var.get()) * 1e-6,
-            "n_sd": float(self.design_resin_ri_var.get()),
-            "use_gaussian": bool(self.use_gaussian_var.get()),
-            "gauss_wx": float(self.gauss_wx_mm_var.get()) * 1e-3,
-            "gauss_wy": float(self.gauss_wy_mm_var.get()) * 1e-3,
-            "mask_offset_x": float(self.mask_offset_x_mm_var.get()) * 1e-3,
-            "mask_offset_y": float(self.mask_offset_y_mm_var.get()) * 1e-3,
-        }
+        p = {"dip_in_enabled": bool(self.dip_in_enabled_var.get())}
+        for spec in PARAM_SPECS:
+            p[spec.key] = spec.si_value(self._param_var(spec).get())
 
         if p["nx"] < 8 or p["ny"] < 8:
             raise ValueError("Nx and Ny must be >= 8.")
@@ -3227,14 +3149,14 @@ class PSFSimulatorApp:
             raise ValueError("Design RI values must be positive.")
         if p["t_g"] < 0 or p["t_s"] < 0 or p["t_gd"] < 0 or not np.isfinite(p["t_id"]) or p["t_id"] < 0:
             raise ValueError("Thickness values must be non-negative.")
-        if p["torch_device"] not in {"auto", "cpu", "cuda"}:
+        if p["torch_device"] not in TORCH_DEVICES:
             raise ValueError("Torch device must be one of: auto, cpu, cuda.")
-        if p["integration_mode"] not in {"cartesian_jacobian", "polar_interp"}:
+        if p["integration_mode"] not in INTEGRATION_MODES:
             raise ValueError("Integration mode must be cartesian_jacobian or polar_interp.")
-        if p["aberration_model"] not in {"legacy", "gibson_lanni"}:
+        if p["aberration_model"] not in ABERRATION_MODELS:
             raise ValueError("Aberration model must be legacy or gibson_lanni.")
         if p["use_gaussian"] and (p["gauss_wx"] <= 0 or p["gauss_wy"] <= 0):
-            raise ValueError("Gaussian wx/wy must be positive when Gaussian is enabled.")
+            raise ValueError("Gaussian FWHM x/y must be positive when Gaussian is enabled.")
         if not np.isfinite(p["mask_offset_x"]) or not np.isfinite(p["mask_offset_y"]):
             raise ValueError("Mask x/y offsets must be finite.")
 
@@ -4149,118 +4071,15 @@ class PSFSimulatorApp:
     def _worker_logic(self, run_3d, p, mask, post_fresnel_mask):
         try:
             simulator = self._create_simulator_from_params(p)
-            stop_cb = lambda: self.stop_requested
-
-            def queue_progress(percent, text):
-                self.root.after(0, lambda p=percent, t=text: self._set_progress(p, t))
-
-            if run_3d:
-                nx_in = int(p["nx"])
-                ny_in = int(p["ny"])
-                max_n = max(nx_in, ny_in, 2)
-                prep_est = float(nx_in * ny_in) * (
-                    1.0 if np.isclose(float(p["fresnel_z"]), 0.0) else np.log2(max_n)
-                )
-                if simulator.integration_mode == "cartesian_jacobian":
-                    pupil_radius = 0.5 * float(p["pupil_d"])
-                    area_ratio = np.pi * pupil_radius * pupil_radius / max(
-                        float(p["size_x"] * p["size_y"]), 1e-30
-                    )
-                    area_ratio = min(1.0, max(0.0, area_ratio))
-                    pint_est = max(1.0, area_ratio * nx_in * ny_in)
-                else:
-                    pint_est = float(max(1, simulator.theta_samples * simulator.phi_samples))
-                n3 = max(1, int(p["points_3d"]))
-                vol_est = float(n3 * n3 * n3) * pint_est
-                total_est = max(1.0, prep_est + vol_est)
-                prep_share = prep_est / total_est
-
-                prep = simulator.prepare_pupil_field_from_input(
-                    input_intensity=mask,
-                    size_x=p["size_x"],
-                    size_y=p["size_y"],
-                    entrance_pupil_diameter=p["pupil_d"],
-                    fresnel_distance=p["fresnel_z"],
-                    use_gaussian_profile=p["use_gaussian"],
-                    gaussian_waist_x=p["gauss_wx"] if p["use_gaussian"] else None,
-                    gaussian_waist_y=p["gauss_wy"] if p["use_gaussian"] else None,
-                    custom_mask=None,
-                    ring_inner_diameter=None,
-                    ring_outer_diameter=None,
-                    progress_callback=lambda stage, frac: queue_progress(
-                        100.0 * prep_share * float(frac), f"Pupil prep: {stage}"
-                    ),
-                    stop_callback=stop_cb,
-                    post_fresnel_mask=post_fresnel_mask,
-                )
-
-                res3d = simulator.simulate_psf_volume_from_pupil_field(
-                    pupil_field=prep.get(
-                        "_field_at_pupil_for_psf_torch",
-                        prep.get("field_at_pupil_for_psf", prep["field_at_pupil"]),
-                    ),
-                    size_x=float(prep.get("size_x_for_psf", p["size_x"])),
-                    size_y=float(prep.get("size_y_for_psf", p["size_y"])),
-                    entrance_pupil_diameter=p["pupil_d"],
-                    range_microns_x=p["range_x_um"],
-                    range_microns_y=p["range_y_um"],
-                    range_microns_z=p["range_z_um"],
-                    num_points=p["points_3d"],
-                    z_chunk_size=p["z_chunk"],
-                    verbose=False,
-                    progress_callback=lambda stage, frac: queue_progress(
-                        100.0 * (prep_share + (1.0 - prep_share) * float(frac)), f"3D: {stage}"
-                    ),
-                    stop_callback=stop_cb,
-                )
-                res2d = {
-                    "x_coords": res3d["x_coords"],
-                    "y_coords": res3d["y_coords"],
-                    "z_coords": res3d["z_coords"],
-                    "z_focus": res3d["z_focus"],
-                    "I_xz": res3d["I_xz"],
-                    "I_xy": res3d["I_xy"],
-                    "I_yz": res3d["I_yz"],
-                    "I_xz_norm": res3d["I_xz_norm"],
-                    "I_xy_norm": res3d["I_xy_norm"],
-                    "I_yz_norm": res3d["I_yz_norm"],
-                    "fwhm_x_m": res3d["fwhm_x_m"],
-                    "fwhm_y_m": res3d["fwhm_y_m"],
-                    "fwhm_z_m": res3d["fwhm_z_m"],
-                    "fwhm_x_um": res3d["fwhm_x_um"],
-                    "fwhm_y_um": res3d["fwhm_y_um"],
-                    "fwhm_z_um": res3d["fwhm_z_um"],
-                    "x_profile_at_y0": res3d["x_profile_at_y0"],
-                    "y_profile_at_x0": res3d["y_profile_at_x0"],
-                    "z_profile_at_x0": res3d["z_profile_at_x0"],
-                }
-                res2d.update({key: value for key, value in prep.items() if not key.startswith("_")})
-            else:
-                res2d = simulator.simulate_full_pipeline(
-                    input_intensity=mask,
-                    size_x=p["size_x"],
-                    size_y=p["size_y"],
-                    entrance_pupil_diameter=p["pupil_d"],
-                    fresnel_distance=p["fresnel_z"],
-                    use_gaussian_profile=p["use_gaussian"],
-                    gaussian_waist_x=p["gauss_wx"] if p["use_gaussian"] else None,
-                    gaussian_waist_y=p["gauss_wy"] if p["use_gaussian"] else None,
-                    custom_mask=None,
-                    ring_inner_diameter=None,
-                    ring_outer_diameter=None,
-                    range_microns_x=p["range_x_um"],
-                    range_microns_y=p["range_y_um"],
-                    range_microns_z=p["range_z_um"],
-                    num_points=p["points_2d"],
-                    verbose=False,
-                    progress_callback=lambda stage, frac: queue_progress(
-                        100.0 * float(frac), f"2D: {stage}"
-                    ),
-                    stop_callback=stop_cb,
-                    post_fresnel_mask=post_fresnel_mask,
-                )
-                res3d = None
-
+            _simulator, res2d, res3d = run_simulation(
+                p,
+                mask,
+                run_3d=run_3d,
+                progress=_QueuedProgress(self.root, self._set_progress),
+                post_fresnel_mask=post_fresnel_mask,
+                simulator=simulator,
+                stop_callback=lambda: self.stop_requested,
+            )
             self.root.after(0, lambda: self._on_run_success(simulator, p, res2d, res3d, run_3d))
         except SimulationStoppedError:
             self.root.after(0, self._on_run_stopped)
@@ -5024,6 +4843,7 @@ class PSFSimulatorApp:
         if event is not None and event.widget is not self.root:
             return
         self._cancel_width_entry_job()
+        self._cancel_mask_preview_job()
         if self._qt_pump_job is not None:
             try:
                 self.root.after_cancel(self._qt_pump_job)
@@ -5443,6 +5263,14 @@ class PSFSimulatorApp:
     def _on_3d_grid_toggle(self):
         self._refresh_3d_plot(show_window=False)
 
+    @staticmethod
+    def _side_view_xbins(lateral_lim, axial_lim):
+        # Equal-aspect XZ/YZ panels are narrow when z spans more than x; five
+        # tick labels then collide, so use fewer.
+        lateral = abs(lateral_lim[1] - lateral_lim[0])
+        axial = abs(axial_lim[1] - axial_lim[0])
+        return 3 if lateral < 0.6 * axial else 5
+
     def _refresh_plots(self):
         self._refresh_2d_plots()
         self._refresh_3d_plot(show_window=False)
@@ -5594,7 +5422,10 @@ class PSFSimulatorApp:
             vmax=psf_vmax,
             interpolation="nearest",
         )
-        style_image_axis(axes[1, 1], title="XZ", xlabel="x (um)", ylabel="z (um)")
+        style_image_axis(
+            axes[1, 1], title="XZ", xlabel="x (um)", ylabel="z (um)",
+            xbins=self._side_view_xbins(x_lim, z_lim),
+        )
         self._set_image_extent(axes[1, 1], x_lim, z_lim)
         cbar4 = add_compact_colorbar(self.fig_2d, im4, axes[1, 1], self._display_intensity_label())
 
@@ -5608,7 +5439,10 @@ class PSFSimulatorApp:
             vmax=psf_vmax,
             interpolation="nearest",
         )
-        style_image_axis(axes[1, 2], title="YZ", xlabel="y (um)", ylabel="z (um)")
+        style_image_axis(
+            axes[1, 2], title="YZ", xlabel="y (um)", ylabel="z (um)",
+            xbins=self._side_view_xbins(y_lim, z_lim),
+        )
         self._set_image_extent(axes[1, 2], y_lim, z_lim)
         cbar5 = add_compact_colorbar(self.fig_2d, im5, axes[1, 2], self._display_intensity_label())
 

@@ -162,9 +162,13 @@ prescription. It also omits the reflected field and other substrate effects
 at the resin–glass printing interface.
 
 Start with an all-pass pupil. Use the actual beam footprint or enable the
-Gaussian envelope to compare pupil filling. Here intensity is
-`exp(-(x/wx)^2-(y/wy)^2)`, so for a circular beam with **1/e² intensity diameter
-D**, set `wx = wy = D/(2*sqrt(2))`; a 5.6 mm beam gives `1.98` mm. A Gaussian
+Gaussian envelope to compare pupil filling. Enter the beam's **intensity FWHM**
+(GUI **Intensity FWHM x/y**, CLI `--gauss-fwhm-x-mm/--gauss-fwhm-y-mm`). For a
+beam specified by its 1/e² intensity diameter D, the FWHM is
+`D*sqrt(ln(2)/2) ≈ 0.589 D`; a 5.6 mm beam gives `3.30` mm. Internally the
+envelope is `exp(-(x/w)^2)` in intensity with `w = FWHM/(2*sqrt(ln 2))`. Configs
+store `w` as `gauss_wx`/`gauss_wy` in metres, so older configs load as the same
+beam, and the deprecated `--gauss-wx-mm` flag still takes `w`. A Gaussian
 does not impose a hard effective-NA cutoff. For polymerization, `I^2` is the
 two-photon excitation proxy, not a prediction of developed voxel size.
 

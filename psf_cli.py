@@ -16,6 +16,14 @@ from psf_io import (
     read_unsafe_legacy_pickle,
     write_safe_container,
 )
+from psf_models import (
+    ABERRATION_MODELS,
+    INTEGRATION_MODES,
+    PARAM_SPECS,
+    TORCH_DEVICES,
+    objective_params,
+    upgrade_ui_values,
+)
 from psf_runtime import (
     create_simulator,
     enforce_resource_limits,
@@ -75,42 +83,7 @@ CONFIG_FORMAT = "psf_sim_cli_config"
 CONFIG_VERSION = 2
 
 
-DEFAULT_PARAMS = {
-    "wavelength": 780.0e-9,
-    "NA": 1.4,
-    "theta_samples": 61,
-    "phi_samples": 120,
-    "integration_mode": "cartesian_jacobian",
-    "aberration_model": "legacy",
-    "torch_device": "cpu",
-    "nx": 256,
-    "ny": 256,
-    "size_x": 8.0e-3,
-    "size_y": 8.0e-3,
-    "pupil_d": 5.6e-3,
-    "fresnel_z": 0.30,
-    "range_x_um": 2.0,
-    "range_y_um": 2.0,
-    "range_z_um": 2.0,
-    "points_2d": 101,
-    "points_3d": 61,
-    "z_chunk": 8,
-    "n_i": 1.515,
-    "n_g": 1.515,
-    "t_g": 170.0e-6,
-    "n_s": 1.474,
-    "t_s": 1.0e-6,
-    "n_id": 1.515,
-    "t_id": 90.0e-6,
-    "n_gd": 1.515,
-    "t_gd": 170.0e-6,
-    "n_sd": 1.515,
-    "use_gaussian": False,
-    "gauss_wx": 1.6e-3,
-    "gauss_wy": 1.6e-3,
-    "mask_offset_x": 0.0,
-    "mask_offset_y": 0.0,
-}
+DEFAULT_PARAMS = {spec.key: spec.default for spec in PARAM_SPECS}
 
 
 DEFAULT_OPTIMIZER_SETTINGS = {
@@ -228,51 +201,18 @@ def load_json_file(path):
 
 
 def params_from_ui_values(values):
-    values = decode_precise_params(values)
+    values = upgrade_ui_values(decode_precise_params(values))
     params = {}
-    mapping = {
-        "wavelength_nm": ("wavelength", 1e-9, float),
-        "NA": ("NA", 1.0, float),
-        "theta_samples": ("theta_samples", 1.0, int),
-        "phi_samples": ("phi_samples", 1.0, int),
-        "integration_mode": ("integration_mode", 1.0, str),
-        "aberration_model": ("aberration_model", 1.0, str),
-        "torch_device": ("torch_device", 1.0, str),
-        "nx": ("nx", 1.0, int),
-        "ny": ("ny", 1.0, int),
-        "size_x_mm": ("size_x", 1e-3, float),
-        "size_y_mm": ("size_y", 1e-3, float),
-        "pupil_d_mm": ("pupil_d", 1e-3, float),
-        "fresnel_z_m": ("fresnel_z", 1.0, float),
-        "range_x_um": ("range_x_um", 1.0, float),
-        "range_y_um": ("range_y_um", 1.0, float),
-        "range_z_um": ("range_z_um", 1.0, float),
-        "points_2d": ("points_2d", 1.0, int),
-        "points_3d": ("points_3d", 1.0, int),
-        "z_chunk": ("z_chunk", 1.0, int),
-        "n_i": ("n_i", 1.0, float),
-        "n_g": ("n_g", 1.0, float),
-        "t_g_um": ("t_g", 1e-6, float),
-        "n_s": ("n_s", 1.0, float),
-        "t_s_um": ("t_s", 1e-6, float),
-        "n_id": ("n_id", 1.0, float),
-        "t_id_um": ("t_id", 1e-6, float),
-        "n_gd": ("n_gd", 1.0, float),
-        "t_gd_um": ("t_gd", 1e-6, float),
-        "n_sd": ("n_sd", 1.0, float),
-        "gauss_wx_mm": ("gauss_wx", 1e-3, float),
-        "gauss_wy_mm": ("gauss_wy", 1e-3, float),
-        "mask_offset_x_mm": ("mask_offset_x", 1e-3, float),
-        "mask_offset_y_mm": ("mask_offset_y", 1e-3, float),
-    }
-    for src, (dst, scale, cast) in mapping.items():
-        if src in values:
-            if cast is str:
-                params[dst] = str(values[src])
-            elif cast is int:
-                params[dst] = float(values[src]) * scale
-            else:
-                params[dst] = cast(values[src]) * scale
+    for spec in PARAM_SPECS:
+        if spec.ui_key not in values or spec.cast is bool:
+            continue
+        raw = values[spec.ui_key]
+        if spec.cast is str:
+            params[spec.key] = str(raw)
+        elif spec.cast is int:
+            params[spec.key] = float(raw) * spec.to_si
+        else:
+            params[spec.key] = spec.cast(raw) * spec.to_si
     if "use_gaussian" in values:
         if not isinstance(values["use_gaussian"], (bool, np.bool_)):
             raise ValueError("use_gaussian must be a JSON boolean.")
@@ -390,19 +330,7 @@ def load_objective_lens(path):
     values = payload.get("values", payload)
     if not isinstance(values, dict):
         raise ValueError("objective lens preset must contain a values object.")
-    required = ("NA", "pupil_d_mm", "n_id", "n_gd", "t_gd_um")
-    missing = [key for key in required if key not in values]
-    if missing:
-        raise ValueError(f"objective lens preset missing keys: {', '.join(missing)}.")
-    return {
-        "NA": float(values["NA"]),
-        "pupil_d": float(values["pupil_d_mm"]) * 1e-3,
-        "n_id": float(values["n_id"]),
-        "t_id": float(values.get("t_id_um", 90.0)) * 1e-6,
-        "n_gd": float(values["n_gd"]),
-        "t_gd": float(values["t_gd_um"]) * 1e-6,
-        "n_sd": float(values.get("n_sd", values["n_id"])),
-    }
+    return objective_params(values)
 
 
 def validate_params(params):
@@ -417,10 +345,10 @@ def validate_params(params):
         p[key] = finite_int(p[key], key)
 
     p["integration_mode"] = str(p.get("integration_mode", "cartesian_jacobian")).strip().lower()
-    if p["integration_mode"] not in {"cartesian_jacobian", "polar_interp"}:
+    if p["integration_mode"] not in INTEGRATION_MODES:
         raise ValueError("integration_mode must be cartesian_jacobian or polar_interp.")
     p["aberration_model"] = str(p.get("aberration_model", "legacy")).strip().lower()
-    if p["aberration_model"] not in {"legacy", "gibson_lanni"}:
+    if p["aberration_model"] not in ABERRATION_MODELS:
         raise ValueError("aberration_model must be legacy or gibson_lanni.")
     p.setdefault("t_id", DEFAULT_PARAMS["t_id"])
 
@@ -438,25 +366,25 @@ def validate_params(params):
         raise ValueError("2D/3D points must be >= 9.")
     if p["z_chunk"] < 1:
         raise ValueError("3D z chunk must be >= 1.")
-    if str(p["torch_device"]).strip().lower() not in {"auto", "cpu", "cuda"}:
+    if str(p["torch_device"]).strip().lower() not in TORCH_DEVICES:
         raise ValueError("Torch device must be one of: auto, cpu, cuda.")
     p["torch_device"] = str(p["torch_device"]).strip().lower()
 
-    for key in ("n_i", "n_g", "n_s", "n_id", "n_gd", "n_sd"):
-        p[key] = finite_float(p[key], key)
-        if p[key] <= 0.0:
-            raise ValueError(f"{key} must be > 0.")
-    for key in ("t_g", "t_s", "t_gd", "t_id"):
-        p[key] = finite_float(p[key], key)
-        if p[key] < 0.0:
-            raise ValueError(f"{key} must be >= 0.")
+    for spec in PARAM_SPECS:
+        if spec.bound is None:
+            continue
+        p[spec.key] = finite_float(p[spec.key], spec.key)
+        if spec.bound == "positive" and p[spec.key] <= 0.0:
+            raise ValueError(f"{spec.key} must be > 0.")
+        if spec.bound == "nonnegative" and p[spec.key] < 0.0:
+            raise ValueError(f"{spec.key} must be >= 0.")
     if not isinstance(p["use_gaussian"], (bool, np.bool_)):
         raise ValueError("use_gaussian must be a boolean.")
     p["use_gaussian"] = bool(p["use_gaussian"])
     p["gauss_wx"] = finite_float(p["gauss_wx"], "gauss_wx")
     p["gauss_wy"] = finite_float(p["gauss_wy"], "gauss_wy")
     if p["use_gaussian"] and (p["gauss_wx"] <= 0.0 or p["gauss_wy"] <= 0.0):
-        raise ValueError("Gaussian wx/wy must be positive when Gaussian is enabled.")
+        raise ValueError("Gaussian FWHM x/y must be positive when Gaussian is enabled.")
     p["mask_offset_x"] = finite_float(p["mask_offset_x"], "mask_offset_x")
     p["mask_offset_y"] = finite_float(p["mask_offset_y"], "mask_offset_y")
     return p
@@ -467,41 +395,6 @@ def apply_param_overrides(params, args):
     if getattr(args, "objective", None):
         p.update(load_objective_lens(args.objective))
 
-    unit_overrides = {
-        "wavelength_nm": ("wavelength", 1e-9, float),
-        "na": ("NA", 1.0, float),
-        "theta_samples": ("theta_samples", 1.0, int),
-        "phi_samples": ("phi_samples", 1.0, int),
-        "integration_mode": ("integration_mode", 1.0, str),
-        "aberration_model": ("aberration_model", 1.0, str),
-        "torch_device": ("torch_device", 1.0, str),
-        "nx": ("nx", 1.0, int),
-        "ny": ("ny", 1.0, int),
-        "size_x_mm": ("size_x", 1e-3, float),
-        "size_y_mm": ("size_y", 1e-3, float),
-        "pupil_d_mm": ("pupil_d", 1e-3, float),
-        "fresnel_z_m": ("fresnel_z", 1.0, float),
-        "range_x_um": ("range_x_um", 1.0, float),
-        "range_y_um": ("range_y_um", 1.0, float),
-        "range_z_um": ("range_z_um", 1.0, float),
-        "points_2d": ("points_2d", 1.0, int),
-        "points_3d": ("points_3d", 1.0, int),
-        "z_chunk": ("z_chunk", 1.0, int),
-        "n_i": ("n_i", 1.0, float),
-        "n_g": ("n_g", 1.0, float),
-        "t_g_um": ("t_g", 1e-6, float),
-        "n_s": ("n_s", 1.0, float),
-        "t_s_um": ("t_s", 1e-6, float),
-        "n_id": ("n_id", 1.0, float),
-        "t_id_um": ("t_id", 1e-6, float),
-        "n_gd": ("n_gd", 1.0, float),
-        "t_gd_um": ("t_gd", 1e-6, float),
-        "n_sd": ("n_sd", 1.0, float),
-        "gauss_wx_mm": ("gauss_wx", 1e-3, float),
-        "gauss_wy_mm": ("gauss_wy", 1e-3, float),
-        "mask_offset_x_mm": ("mask_offset_x", 1e-3, float),
-        "mask_offset_y_mm": ("mask_offset_y", 1e-3, float),
-    }
     if getattr(args, "range_um", None) is not None:
         p["range_x_um"] = float(args.range_um)
         p["range_y_um"] = float(args.range_um)
@@ -509,10 +402,15 @@ def apply_param_overrides(params, args):
     if getattr(args, "points", None) is not None:
         p["points_2d"] = int(args.points)
         p["points_3d"] = int(args.points)
-    for attr, (dst, scale, cast) in unit_overrides.items():
-        value = getattr(args, attr, None)
+    # Deprecated 1/e intensity radius flags; the FWHM flags below take precedence.
+    for dest, key in (("gauss_wx_mm", "gauss_wx"), ("gauss_wy_mm", "gauss_wy")):
+        value = getattr(args, dest, None)
         if value is not None:
-            p[dst] = cast(value) * scale if cast is not str else str(value)
+            p[key] = float(value) * 1e-3
+    for spec in PARAM_SPECS:
+        value = None if spec.cast is bool else getattr(args, spec.dest, None)
+        if value is not None:
+            p[spec.key] = str(value) if spec.cast is str else spec.cast(value) * spec.to_si
     use_gaussian = getattr(args, "use_gaussian", None)
     if use_gaussian is not None:
         p["use_gaussian"] = bool(use_gaussian)
@@ -854,8 +752,19 @@ class ProgressPrinter:
             self._last_time = now
 
 
-def run_simulation(params, mask, run_3d=False, progress=None, post_fresnel_mask=None):
-    simulator = create_simulator_from_params(params)
+def run_simulation(
+    params,
+    mask,
+    run_3d=False,
+    progress=None,
+    post_fresnel_mask=None,
+    *,
+    simulator=None,
+    stop_callback=None,
+):
+    """Pupil preparation plus 2D planes or the 3D volume; shared by the CLI and GUI."""
+    if simulator is None:
+        simulator = create_simulator_from_params(params)
 
     def emit(percent, text):
         if progress is not None:
@@ -897,6 +806,7 @@ def run_simulation(params, mask, run_3d=False, progress=None, post_fresnel_mask=
             progress_callback=lambda stage, frac: emit(
                 100.0 * prep_share * float(frac), f"Pupil prep: {stage}"
             ),
+            stop_callback=stop_callback,
             post_fresnel_mask=post_fresnel_mask,
         )
         res3d = simulator.simulate_psf_volume_from_pupil_field(
@@ -916,6 +826,7 @@ def run_simulation(params, mask, run_3d=False, progress=None, post_fresnel_mask=
             progress_callback=lambda stage, frac: emit(
                 100.0 * (prep_share + (1.0 - prep_share) * float(frac)), f"3D: {stage}"
             ),
+            stop_callback=stop_callback,
         )
         res2d = {
             "x_coords": res3d["x_coords"],
@@ -958,6 +869,7 @@ def run_simulation(params, mask, run_3d=False, progress=None, post_fresnel_mask=
             num_points=int(params["points_2d"]),
             verbose=False,
             progress_callback=lambda stage, frac: emit(100.0 * float(frac), f"2D: {stage}"),
+            stop_callback=stop_callback,
             post_fresnel_mask=post_fresnel_mask,
         )
         res3d = None
@@ -2308,11 +2220,11 @@ def add_common_param_options(parser):
     parser.add_argument("--phi-samples", type=int, help="Phi integration samples.")
     parser.add_argument(
         "--integration-mode",
-        choices=("cartesian_jacobian", "polar_interp"),
+        choices=INTEGRATION_MODES,
         help="PSF integration grid. Cartesian is the compatibility default.",
     )
-    parser.add_argument("--torch-device", choices=("auto", "cpu", "cuda"), help="Torch compute device.")
-    parser.add_argument("--aberration-model", choices=("legacy", "gibson_lanni"),
+    parser.add_argument("--torch-device", choices=TORCH_DEVICES, help="Torch compute device.")
+    parser.add_argument("--aberration-model", choices=ABERRATION_MODELS,
                         help="Use gibson_lanni for full design/experimental layer OPD, including changed immersion medium.")
     parser.add_argument("--nx", type=int, help="Input mask grid rows.")
     parser.add_argument("--ny", type=int, help="Input mask grid columns.")
@@ -2341,8 +2253,10 @@ def add_common_param_options(parser):
     gaussian = parser.add_mutually_exclusive_group()
     gaussian.add_argument("--gaussian", dest="use_gaussian", action="store_true", default=None, help="Apply Gaussian envelope.")
     gaussian.add_argument("--no-gaussian", dest="use_gaussian", action="store_false", help="Disable Gaussian envelope.")
-    parser.add_argument("--gauss-wx-mm", type=float, help="Gaussian wx, mm.")
-    parser.add_argument("--gauss-wy-mm", type=float, help="Gaussian wy, mm.")
+    parser.add_argument("--gauss-fwhm-x-mm", type=float, help="Gaussian envelope intensity FWHM in x, mm.")
+    parser.add_argument("--gauss-fwhm-y-mm", type=float, help="Gaussian envelope intensity FWHM in y, mm.")
+    parser.add_argument("--gauss-wx-mm", type=float, help="Deprecated: Gaussian 1/e intensity radius in x, mm; use --gauss-fwhm-x-mm.")
+    parser.add_argument("--gauss-wy-mm", type=float, help="Deprecated: Gaussian 1/e intensity radius in y, mm; use --gauss-fwhm-y-mm.")
     parser.add_argument("--mask-offset-x-mm", type=float, help="Mask x offset, mm.")
     parser.add_argument("--mask-offset-y-mm", type=float, help="Mask y offset, mm.")
     parser.add_argument("--allow-expensive", action="store_true", help="Confirm requests above the advisory resource threshold.")

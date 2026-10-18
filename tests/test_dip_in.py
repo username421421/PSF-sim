@@ -447,8 +447,10 @@ def test_simulation_worker_runs_on_the_main_thread_snapshot():
             seen.update(kwargs)
             return {"ok": True}
 
+    progress = []
     app.root = Root()
     app.stop_requested = False
+    app._set_progress = lambda percent, text: progress.append((percent, text))
     app._create_simulator_from_params = lambda _params: FakeSimulator()
     app._on_run_success = lambda _sim, p, res2d, _res3d, _ran_3d: successes.append((p, res2d))
     app._on_run_error = lambda detail: pytest.fail(detail)
@@ -460,3 +462,94 @@ def test_simulation_worker_runs_on_the_main_thread_snapshot():
     assert successes == [(params, {"ok": True})]
     assert seen["input_intensity"] is mask
     assert seen["post_fresnel_mask"] is post_mask
+    # The GUI runs the same pipeline as the CLI, including stop and progress hooks.
+    assert seen["stop_callback"]() is False
+    assert progress[-1] == (100.0, "Done")
+
+
+@pytest.mark.gui
+def test_gui_has_a_variable_for_every_parameter_with_the_table_default():
+    from psf_models import PARAM_SPECS
+
+    app = _gui_control_app()
+    for spec in PARAM_SPECS:
+        var = app._param_var(spec)
+        assert var.get() == pytest.approx(spec.ui_default) if spec.cast is float else var.get() == spec.ui_default
+
+
+@pytest.mark.gui
+def test_gui_params_match_the_cli_conversion_of_its_ui_values():
+    app = _gui_control_app()
+    app._apply_params_to_controls({**psf_cli.DEFAULT_PARAMS, "wavelength": 800e-9, "t_id": 120e-6})
+    params = app._collect_params()
+    params.pop("dip_in_enabled")
+    converted = psf_cli.params_from_ui_values(app._collect_control_values())
+    assert set(converted) == set(params)
+    for key, value in params.items():
+        assert converted[key] == pytest.approx(value), key
+
+
+@pytest.mark.gui
+def test_mask_preview_is_debounced_and_resolution_capped():
+    from psf_gui import PSFSimulatorApp
+
+    assert PSFSimulatorApp._preview_shape(51200, 51200) == (512, 512)
+    assert PSFSimulatorApp._preview_shape(300, 200) == (300, 200)
+    assert PSFSimulatorApp._preview_shape(1000, 10) == (512, 5)
+
+    app = _gui_control_app()
+    del app._refresh_mask_input_preview  # real method; without a figure it only cancels
+
+    class Root:
+        def __init__(self):
+            self.pending = {}
+
+        def after(self, _delay, callback):
+            job = len(self.pending) + 100
+            self.pending[job] = callback
+            return job
+
+        def after_cancel(self, job):
+            self.pending.pop(job, None)
+
+    app.root = Root()
+    for _ in range(5):  # e.g. typing "51200" into Grid Nx
+        app._on_mask_preview_param_change()
+    assert list(app.root.pending.values()) == [app._refresh_mask_input_preview]
+    app._refresh_mask_input_preview()
+    assert app.root.pending == {}
+
+
+@pytest.mark.gui
+def test_entry_labels_split_their_unit():
+    from psf_gui import PSFSimulatorApp
+
+    assert PSFSimulatorApp._split_unit("Mask size X (mm)") == ("Mask size X", "mm")
+    assert PSFSimulatorApp._split_unit("Theta samples (polar mode)") == ("Theta samples (polar mode)", "")
+    assert PSFSimulatorApp._split_unit("NA") == ("NA", "")
+
+
+@pytest.mark.gui
+def test_narrow_side_views_use_fewer_ticks():
+    from psf_gui import PSFSimulatorApp
+
+    assert PSFSimulatorApp._side_view_xbins((-3, 3), (-10, 10)) == 3
+    assert PSFSimulatorApp._side_view_xbins((-3, 3), (-3, 3)) == 5
+
+
+@pytest.mark.gui
+def test_gui_shows_gaussian_fwhm_and_converts_old_radius_configs():
+    from psf_models import FWHM_PER_1E_RADIUS
+
+    app = _gui_control_app()
+    app._apply_control_values({"use_gaussian": True, "gauss_wx_mm": 4.5, "gauss_wy_mm": 4.5})
+    assert app.gauss_fwhm_x_mm_var.get() == pytest.approx(4.5 * FWHM_PER_1E_RADIUS)
+    assert app.gauss_fwhm_x_mm_var.get() == 7.49299  # converted values show 6 digits
+    assert app._collect_params()["gauss_wx"] == pytest.approx(4.5e-3)
+    app._apply_params_to_controls({**psf_cli.DEFAULT_PARAMS, "gauss_wy": 1e-3})
+    assert app.gauss_fwhm_y_mm_var.get() == 1.66511
+    app._apply_control_values({"gauss_fwhm_y_mm": 2.123456789})
+    assert app.gauss_fwhm_y_mm_var.get() == 2.123456789  # typed values stay exact
+    app.gauss_fwhm_x_mm_var.set(3.0)
+    assert app._collect_control_values()["gauss_fwhm_x_mm"] == 3.0
+    assert app._collect_params()["gauss_wx"] == pytest.approx(3e-3 / FWHM_PER_1E_RADIUS)
