@@ -3488,7 +3488,7 @@ class PSFSimulatorApp:
                     raise
                 if not messagebox.askyesno(
                     "Expensive optimization",
-                    f"{exc}\n\nEstimated peak RAM: {estimate.peak_ram_bytes / 1024**3:.2f} GiB. Continue?",
+                    f"{exc}\n\nContinue?",
                 ):
                     return
                 enforce_resource_limits(estimate, allow_expensive=True)
@@ -4017,17 +4017,7 @@ class PSFSimulatorApp:
         try:
             params = self._collect_params()
             estimate = estimate_resources(params, run_3d=bool(run_3d))
-            try:
-                enforce_resource_limits(estimate, allow_expensive=False)
-            except ValueError as exc:
-                if "Request is expensive" not in str(exc):
-                    raise
-                if not messagebox.askyesno(
-                    "Expensive simulation",
-                    f"{exc}\n\nEstimated peak RAM: {estimate.peak_ram_bytes / 1024**3:.2f} GiB. Continue?",
-                ):
-                    return
-                enforce_resource_limits(estimate, allow_expensive=True)
+            enforce_resource_limits(estimate)
             # Snapshot everything the worker needs here: Tk variables and the
             # loaded masks must not be read or written from the worker thread.
             mask = self._get_input_mask(

@@ -2252,7 +2252,7 @@ def add_common_param_options(parser):
     parser.add_argument("--gauss-wy-mm", type=float, help="Deprecated: Gaussian 1/e intensity radius in y, mm; use --gauss-fwhm-y-mm.")
     parser.add_argument("--mask-offset-x-mm", type=float, help="Mask x offset, mm.")
     parser.add_argument("--mask-offset-y-mm", type=float, help="Mask y offset, mm.")
-    parser.add_argument("--allow-expensive", action="store_true", help="Confirm requests above the advisory resource threshold.")
+    parser.add_argument("--allow-expensive", action="store_true", help="Confirm optimizer requests above 1000 objective evaluations per iteration.")
     parser.add_argument("--auto-z-chunk", action="store_true", help="Choose a conservative 3D z chunk from available memory.")
     parser.add_argument("--debug", action="store_true", help="Show a traceback for expected command errors.")
 

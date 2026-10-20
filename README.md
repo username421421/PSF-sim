@@ -214,9 +214,10 @@ The references are in `Literature/`.
 - New `.psfres` files are safe version-2 ZIP/NPZ containers with JSON metadata
   and no object arrays. Trusted legacy pickle results require the explicit
   `--allow-unsafe-legacy-pickle` flag or a GUI confirmation.
-- Requests estimated above 25% of available RAM/VRAM require
-  `--allow-expensive`; requests above 70% are rejected. `--auto-z-chunk`
-  selects a conservative 3D chunk.
+- Memory use is not limited or prompted for, so check the estimate yourself
+  for large grids. Optimizer runs above 1000 objective evaluations per
+  iteration still need `--allow-expensive`. `--auto-z-chunk` selects a
+  conservative 3D chunk.
 
 ## Audited performance
 

@@ -137,21 +137,9 @@ def enforce_resource_limits(
     estimate: ResourceEstimate,
     *,
     allow_expensive: bool = False,
-    hard_fraction: float = 0.70,
-    confirm_fraction: float = 0.25,
 ) -> None:
-    ratios = []
-    if estimate.available_ram_bytes > 0:
-        ratios.append(("RAM", estimate.peak_ram_bytes / estimate.available_ram_bytes))
-    if estimate.peak_vram_bytes > 0 and estimate.available_vram_bytes > 0:
-        ratios.append(("VRAM", estimate.peak_vram_bytes / estimate.available_vram_bytes))
-    worst_name, worst_ratio = max(ratios, key=lambda item: item[1], default=("memory", 0.0))
-    if worst_ratio > hard_fraction:
+    """Memory is not limited here; only very long optimizer runs need confirmation."""
+    if estimate.predicted_objective_evals_per_iteration > 1000 and not allow_expensive:
         raise ValueError(
-            f"Estimated peak {worst_name} use is {worst_ratio:.1%}, above the {hard_fraction:.0%} safety limit."
-        )
-    expensive = worst_ratio > confirm_fraction or estimate.predicted_objective_evals_per_iteration > 1000
-    if expensive and not allow_expensive:
-        raise ValueError(
-            "Request is expensive; rerun with --allow-expensive after reviewing the resource estimate."
+            "Request is expensive (over 1000 objective evaluations per iteration); rerun with --allow-expensive."
         )
