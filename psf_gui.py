@@ -48,8 +48,6 @@ from psf_runtime import (
     create_simulator,
     enforce_resource_limits,
     estimate_resources,
-    pupil_sampling_report,
-    sampling_warning,
 )
 from plot_style import (
     add_compact_colorbar,
@@ -3494,8 +3492,6 @@ class PSFSimulatorApp:
                 ):
                     return
                 enforce_resource_limits(estimate, allow_expensive=True)
-            if not self._confirm_pupil_sampling(params, "Under-resolved pupil phase"):
-                return
         except Exception as exc:
             messagebox.showerror("Mask optimization", str(exc))
             return
@@ -4032,8 +4028,6 @@ class PSFSimulatorApp:
                 ):
                     return
                 enforce_resource_limits(estimate, allow_expensive=True)
-            if not self._confirm_pupil_sampling(params, "Under-resolved pupil phase"):
-                return
             # Snapshot everything the worker needs here: Tk variables and the
             # loaded masks must not be read or written from the worker thread.
             mask = self._get_input_mask(
@@ -4055,12 +4049,6 @@ class PSFSimulatorApp:
             daemon=True,
         )
         thread.start()
-
-    def _confirm_pupil_sampling(self, params, title):
-        message = sampling_warning(pupil_sampling_report(params))
-        if message is None:
-            return True
-        return messagebox.askyesno(title, f"{message}\n\nRun anyway?", icon="warning")
 
     def _stop_simulation(self):
         if not self.is_running:

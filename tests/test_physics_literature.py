@@ -1,6 +1,5 @@
 """Checks against Nasse & Woehl (2010) and Torok & Varga (1997) in Literature/."""
 
-import argparse
 from math import pi
 
 import numpy as np
@@ -10,7 +9,7 @@ import torch
 import psf_cli
 import psf_mask_optimizer as pmo
 from PSF_simulator import CartesianPSFSimulator
-from psf_runtime import pupil_sampling_report, sampling_warning
+from psf_runtime import pupil_sampling_report
 
 
 def _profile(sim, *, axis, n=128, size=8e-3, diameter=5e-3, extent=1.5, points=121):
@@ -183,16 +182,8 @@ def test_sampling_check_flags_the_default_theta_samples_for_dip_in():
     assert report["aberration_waves"] == pytest.approx(20.8, abs=0.5)
     assert report["undersampled"]
     assert report["suggested"]["theta_samples"] >= 401
-    assert "theta samples" in sampling_warning(report)
     fine = pupil_sampling_report(_dip_in_params(integration_mode="polar_interp", theta_samples=801))
     assert not fine["undersampled"]
-    assert sampling_warning(fine) is None
-
-
-def test_sampling_check_points_cartesian_dip_in_to_polar_integration():
-    report = pupil_sampling_report(_dip_in_params(integration_mode="cartesian_jacobian"))
-    assert report["undersampled"]
-    assert "polar_interp" in sampling_warning(report)
 
 
 @pytest.mark.parametrize("mode", ["cartesian_jacobian", "polar_interp"])
@@ -200,8 +191,3 @@ def test_sampling_check_accepts_the_default_configuration(mode):
     params = psf_cli.validate_params({**psf_cli.DEFAULT_PARAMS, "integration_mode": mode})
     assert not pupil_sampling_report(params)["undersampled"]
 
-
-def test_cli_preflight_warns_about_undersampling(capsys):
-    params = _dip_in_params(integration_mode="polar_interp", theta_samples=61)
-    psf_cli.preflight_request(params, argparse.Namespace(allow_expensive=True))
-    assert "warning: The pupil phase changes" in capsys.readouterr().err

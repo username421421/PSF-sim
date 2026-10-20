@@ -174,13 +174,10 @@ two-photon excitation proxy, not a prediction of developed voxel size.
 
 The example uses finer polar integration and a ±25 µm axial range because
 immersion mismatch can create rapid pupil phase variation and a large focus
-shift: about 21 waves across the pupil here. Before each run the GUI and CLI
-compare the largest phase change between neighbouring integration samples
-(θ steps in polar mode, pupil pixels in Cartesian mode, including defocus over
-the requested z range) with the Nyquist limit π, and warn with a suggested
-sample count when it is exceeded. With the default 61 θ samples this example
-gives an axial FWHM of 0.72 µm instead of the converged 3.04 µm. CLI summaries
-include the check as a `sampling` block. Also check that the peak and both
+shift: about 21 waves across the pupil here. In polar mode too few θ samples
+alias that phase: the default 61 θ samples give an axial FWHM of 0.72 µm
+instead of the converged 3.04 µm, so keep about 400 or more. Cartesian mode at
+512 px was within about 1% for this example. Also check that the peak and both
 width crossings lie inside the axial range.
 
 ### Optical model and literature

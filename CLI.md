@@ -32,10 +32,6 @@ conventions, and model limits.
 Profile summaries report the width of the selected `I` or `I2` signal in
 `width_um`; `intensity_width_um` always retains the width of the unsquared
 optical intensity.
-Every simulate/profile/sweep/optimize run first checks that the integration
-grid resolves the pupil phase. If it does not, a `warning:` line on stderr
-gives the phase step per sample and a suggested `--theta-samples` (or grid
-size); JSON summaries include the same check as `sampling`.
 
 Run a 2D simulation and save app-compatible, CSV, NPZ, and PNG outputs:
 
